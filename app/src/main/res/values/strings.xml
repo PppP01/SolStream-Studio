@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">SolStream Studio</string>
+    <string name="accessibility_service_description">SolStream Studio game-streaming overlay and microphone-sharing helper. Displays compact floating live controls during broadcasts and never reads screen text or personal content.</string>
+</resources>
