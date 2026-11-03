@@ -14,29 +14,33 @@ jobs:
 
     steps:
       - name: Checkout SolStream Studio Source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Set up Temurin JDK 21
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: 'temurin'
           java-version: '21'
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: Update SDK Manager & Preload Android Platforms
+      - name: Configure Pre-Installed Android SDK & Platforms
         run: |
-          sdkmanager --update || true
-          yes | sdkmanager --licenses > /dev/null || true
-          sdkmanager "platform-tools" "build-tools;35.0.0" "platforms;android-36" || true
-          sdkmanager "platforms;android-37" || true
-          yes | sdkmanager --licenses > /dev/null || true
+          SDK_ROOT="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          echo "ANDROID_HOME=$SDK_ROOT" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
+          SDKMANAGER="$(ls -d "$SDK_ROOT"/cmdline-tools/*/bin | sort -V | tail -1)/sdkmanager"
+          yes | "$SDKMANAGER" --licenses > /dev/null || true
+          "$SDKMANAGER" --install "platform-tools" "build-tools;35.0.0" "platforms;android-36" > /dev/null || true
+          "$SDKMANAGER" --install "platforms;android-37.0" "build-tools;36.0.0" > /dev/null || "$SDKMANAGER" --install "platforms;android-37" > /dev/null || true
+          if [ -d "$SDK_ROOT/platforms/android-37.0" ] && [ ! -d "$SDK_ROOT/platforms/android-37" ]; then
+            ln -s "$SDK_ROOT/platforms/android-37.0" "$SDK_ROOT/platforms/android-37"
+            sed -i 's/AndroidVersion.ApiLevel=37.0/AndroidVersion.ApiLevel=37/' "$SDK_ROOT/platforms/android-37.0/source.properties" || true
+          fi
+          yes | "$SDKMANAGER" --licenses > /dev/null || true
 
-      - name: Set up Official Gradle 8.11.1
-        uses: gradle/actions/setup-gradle@v4
+      - name: Set up Official Gradle 8.14
+        uses: gradle/actions/setup-gradle@v6
         with:
-          gradle-version: '8.11.1'
+          gradle-version: '8.14'
 
       - name: Compile Signed Release (R8 Shrunk) & Debug APKs
         env:
