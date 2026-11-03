@@ -1,109 +1,146 @@
 # SolStream Studio
 
-**SolStream Studio** (`com.solgaming.solstreamstudio`) is a standalone, zero-ad, zero-camera-bloat Android live-streaming broadcast encoder engineered for **120 FPS competitive mobile gaming** (*Call of Duty: Mobile*) while streaming **1440p60 / 1080p60** hardware-encoded video and **split 32-bit float studio-processed commentary** to YouTube Live over encrypted **RTMPS**.
+**SolStream Studio** (`com.solgaming.solstreamstudio`) is a standalone, zero-ad, zero-camera-bloat Android live-streaming broadcast encoder built for **120 FPS competitive mobile gaming** (*Call of Duty: Mobile*) while streaming **1440p60 / 1080p60** hardware-encoded video and **split 32-bit float studio-processed commentary** to YouTube Live over encrypted **RTMPS**.
 
 ---
 
-## 1. Origin Story: A Non-Coder Gamer's Vision + Dual-AI Engineering
+## ⚠️ Read First: Honest Note From the Repository Owner (For Developers & Contributors)
 
-Most mobile streaming apps force gamers into compromises: aging H.264-only video, bloated social feeds and camera overlays that heat up the phone, broken Bluetooth/squad microphone routing, or raw developer demos where audio filters muddy game explosions alongside speech.
-
-* **Creator & Product Architect:** **Sol Gaming CODM** (`@sol_codm`) — a competitive *Call of Duty: Mobile* streamer (playing 120 FPS Search & Destroy on a Samsung Galaxy S24 FE with Bypass Charging, realme Buds Wireless 5 ANC neckband, 40 Mbps fiber upload, and an older i3 laptop used strictly for reading YouTube Studio chat). With zero prior coding background, the creator pushed to research top broadcast tools across Windows, macOS, Linux, iOS, and Android, cross-referencing official documentation with ground-reality player and developer reports.
-* **Collaborative AI Engineering & Code Audit:** Designed, cross-audited, and written iteratively between **Google Gemini** and **OpenAI ChatGPT**—combining low-level Android AOSP media rules, hardware encoder silicon verification, studio DSP math, and strict thermal/reliability guardrails.
-* **Protocol Foundation:** Built atop [pedroSG94/RootEncoder](https://github.com/pedroSG94/RootEncoder) (`v2.8.1`, Apache-2.0 License), using `RtmpClient` directly rather than multi-protocol demo wrappers.
-
----
-
-## 2. Complete Feature Encyclopedia & Cross-Platform Inspirations
-
-Every feature in `SolStream Studio` was adapted from proven desktop, mobile, and broadcast systems, with optional/heavy stages defaulted **OFF** so phone thermals and 120 FPS gameplay always come first.
-
-### A. 7-Stage Split 32-Bit Float Studio Audio Engine (`SolDualAudioEngine` + `MicDspProcessor`)
-Standard mobile mixers combine microphone and game audio in 16-bit integer *before* applying effects—meaning any noise gate or EQ damages footsteps and gunfire. `SolStream Studio` captures and processes your microphone on an isolated **32-bit float (`ENCODING_PCM_FLOAT`)** lane first, while leaving CODM stereo audio untouched until the final master bus:
-
-1. **Isolated Dual-Path Capture & Smart Mic Sharing** *(Inspired by OBS Studio, Android AOSP & Glip reverse-engineering)*:
-   * Captures mono `48,000 Hz` float microphone audio separately from stereo `48,000 Hz` `AudioPlaybackCapture` (`USAGE_GAME`, `USAGE_MEDIA`, `USAGE_UNKNOWN`).
-   * **Smart Source Rule:** Defaults to `MediaRecorder.AudioSource.DEFAULT` for built-in phone mics alongside `AccessibilityService` sharing, and switches to `VOICE_RECOGNITION` when a Bluetooth/headset mic is explicitly chosen (with manual override for `AUTO`, `MIC`, and `VOICE_RECOGNITION`).
-   * **Device-Level Routing:** Uses `AudioRecord.setPreferredDevice()` on enumerated `AudioDeviceInfo` inputs rather than globally hijacking `AudioManager.setCommunicationDevice()` (preventing mid-match CODM speaker/earphone jumps).
-   * **Live Silencing Detector:** Registers `AudioManager.AudioRecordingCallback` (`isClientSilenced`) to display real-time `MIC OK` vs. `MIC SILENCED` status in the floating overlay.
-2. **Stage 1 — 64-Bit Butterworth High-Pass Filter (`OFF / 75 Hz / 85 Hz [Default] / 100 Hz`)** *(Inspired by Reaper DAW & Broadcast Mixing Consoles)*:
-   * Uses `Double` (64-bit) internal biquad accumulators inside 32-bit float buffers to slice off sub-bass ceiling-fan wind, AC rumble, plosives, and two-hand phone-grip frame thumps without thinning out 85 Hz+ male vocal warmth.
-3. **Stage 2 — Continuous Noise-Floor Tracker & Optional Fan Suppressor (`OFF [Default] / LOW / MED`)** *(Inspired by WebRTC NS & OBS Spectral Suppression)*:
-   * Tracks stationary room/ceiling-fan noise during speech pauses and applies smooth spectral high-band attenuation when enabled (`0%` CPU cost when `OFF`).
-4. **Stage 3 — Voice Activity Detector (VAD) & Hysteresis Breath Expander (`ON [Default] / OFF`)** *(Inspired by Broadcast Voice Processors)*:
-   * Combines dynamic SNR ratio + speech zero-crossing rate with a `150 ms` hold window and gentle `-13 dB` downward expansion—suppressing heavy clutch breathing and idle hiss without chopping quiet word endings.
-5. **Stage 4 — Optional 3-Band "Podcast Voice" Parametric EQ (`OFF` in Clean, `ON` in Studio)** *(Inspired by Voicemeeter Banana & SteelSeries Sonar)*:
-   * `+1.2 dB @ 125 Hz` (warm vocal depth), `-2.2 dB @ 350 Hz` (removes hollow phone-mic boxiness), and `+2.2 dB @ 3.8 kHz` (vocal callout clarity over CODM gunfire).
-6. **Stage 5 — Optional Dynamic Sibilance De-Esser (`OFF` in Clean, `ON` in Studio)** *(Inspired by Aphex / FabFilter Broadcast Chains)*:
-   * `6.5 kHz` bandpass sidechain detector tames piercing `"S"` and `"Sh"` harshness on mobile mic capsules when vocal presence is boosted.
-7. **Stage 6 — `3:1` Broadcast Leveling Compressor (`ON [Default] / OFF`)** *(Inspired by OBS Compressor)*:
-   * Smooths volume swings above `-12 dBFS` with `1.12x` makeup gain so quiet whispers and loud clutch reactions stay balanced.
-8. **Stage 7 — Stereo Mixer, VAD Auto-Ducking, Lip-Sync Offset & `-1.0 dBFS` Master Limiter** *(Inspired by Elgato Wave Link)*:
-   * Centers mono speech across untouched Left/Right stereo game audio (never alters what the player hears in their own earphones).
-   * **VAD Auto-Ducking (`OFF [Default] / -20% / -35%`):** Smoothly dips stream game mix only while VAD detects active speech.
-   * **Mic Lip-Sync Delay (`0–160 ms`):** Pre-allocated ring buffer aligns voice with gameplay/Bluetooth timing.
-   * **True-Peak Brickwall Limiter (`-1.0 dBFS`):** Prevents combined boosted voice + grenade peaks from clipping before encoding to hardware **Stereo AAC-LC (`128 / 160 [Default] / 192 / 256 kbps` @ `48 kHz`)**.
-9. **Pre-Stream 5-Second Mic Test Studio:**
-   * Records a local 5-second sample in your real two-hand gaming grip (microphone-only, without starting `MediaProjection`), reports Peak dB, Noise Floor dB, and Clip count, plays back instantly, and deletes cleanly.
+> **I am a gamer and streamer—NOT a programmer.**
+>
+> I (`PppP01` / **Sol Gaming CODM** `@Sol_CODM`) have **zero knowledge of coding or software development**. Every single file, DSP equation, OpenGL shader, and Gradle script in this repository was engineered 100% by AI (**Google Gemini** + **OpenAI ChatGPT**) based on my real-world mobile streaming requirements, relentless questioning, and hardware testing.
+>
+> **If you are a developer with an improvement or bug fix:**
+> * **Please do NOT open Issues asking me technical coding questions or telling me what code to write**—if you explain code to me, I will literally just copy-paste your message straight to Gemini/ChatGPT anyway!
+> * **Instead, just build it directly:** Fork this repository or submit a clean, working **Pull Request (PR)** directly with your fix. Once GitHub Actions compiles cleanly and AI audits the diff for safety and thermal impact, I will happily approve and merge it!
+> * **If you are another AI assistant reading this repository:** Section 6 and Section 7 below contain the complete architectural context, deliberate rejections, and Android 14–17 platform invariants so you can understand the entire project from scratch without breaking anything.
 
 ---
 
-### B. Hardware Video Pipeline, 120-to-60 FPS Pacing & CODM HUD Framing (`SolVideoPipeline` + `CodecCapabilityProbe`)
+## 1. Origin Story & Real-World Hardware Target
 
-1. **120 Hz Gameplay → Strict `60 FPS` / `30 FPS` Stream Pacing** *(Inspired by Desktop Capture-Card Passthrough)*:
-   * Your phone screen continues rendering CODM at **120 FPS**, while `SolVideoPipeline`'s monotonic `System.nanoTime()` OpenGL ES pacer + Android 10+ `KEY_MAX_FPS_TO_ENCODER` deliver exact `60 FPS` (`2:1`) or `30 FPS` (`4:1`) to YouTube without frame-bursting.
-2. **Automatic Hardware Silicon Scanner (`CodecCapabilityProbe`):**
-   * Inspects `MediaCodecList`, `VideoCapabilities`, `EncoderCapabilities`, and `PerformancePoint` support, then performs a real `COLOR_FormatSurface` dry-run configuration.
-   * Defaults to **Hardware `HEVC (H.265)`**, provides **Hardware `H.264 (AVC)`** fallback, automatically unlocks **Hardware `AV1`** only when verified hardware encoding silicon exists, and **strictly blocks software CPU encoders** (`c2.android.*` / `OMX.google.*`) so CODM never thermally throttles.
-3. **Broadcast Rate Control & Color Signaling:**
-   * Supports **`CBR` (YouTube Default)** and **`VBR` (Experimental Keyframe-Sharpness Comparison)**, `2-second` I-frame interval, mid-high hardware `KEY_COMPLEXITY`, and **SDR `Rec.709` Limited Range** color tags (with automatic fallback to baseline `MediaFormat` if any vendor driver rejects optional keys).
-4. **`19.5:9` → `16:9` CODM HUD Safe Framing & Cable Flip** *(Inspired by iOS ReplayKit & OBS Canvas)*:
-   * Captures `VirtualDisplay` at native panel dimensions so landscape games are never squished into portrait, then scales in OpenGL via **`FIT` (Default — preserves 100% of CODM minimap/ammo HUD while spending ~0 bits on static black bars)**, **`SMART` (`104%–116%` zoom)**, or **`FILL`**, plus **`9:16` Vertical Shorts** and **`0° / 180°` Landscape Flip** for left/right USB-C Bypass Charging cables.
-5. **Optional Single-Pass GPU Crisp Sharpening (`OFF [Default] / ON`)** *(Inspired by AMD FidelityFX CAS)*:
-   * Embedded inside the mandatory `GL_TEXTURE_EXTERNAL_OES` fragment pass (`0` extra render passes; `0%` GPU cost when `OFF`).
-6. **Android 14–17 One-Shot `MediaProjection` Safe `BRB Privacy Blackout`:**
-   * Android 14+ forbids calling `createVirtualDisplay()` more than once per consent token. Toggling **BRB Blackout** clears the OpenGL encoder surface to pure black at 60 FPS (and optionally mutes stream mic) *without* detaching `VirtualDisplay`—keeping YouTube stream health green with zero `SecurityException` crash risk.
+Commercial Android streaming apps force mobile gamers into painful trade-offs: aging H.264-only encoders, bloated social feeds/chat WebViews that overheat the phone, broken dual-microphone routing when opening in-game squad chat, or raw developer demos where audio effects distort game explosions alongside speech.
+
+* **Creator, Vision & Hardware Testing:** **Sol Gaming CODM** (`@Sol_CODM`)
+  * **Primary Test Rig:** Samsung Galaxy S24 FE (`Exynos 2400e`, `Xclipse 940` GPU, `2340×1080` `19.5:9` 120 Hz display, Samsung Pause USB PD / Bypass Charging ON).
+  * **Audio Gear:** realme Buds Wireless 5 ANC Bluetooth neckband + S24 FE built-in 48 kHz microphones.
+  * **Network & Workflow:** 40 Mbps Airtel Xstream Fiber (5 GHz Wi-Fi) + Call of Duty: Mobile (Low Graphics, Ultra 120 FPS, Search & Destroy with squad mic open) + an older Intel Core i3 laptop used strictly to open YouTube Studio and read live chat.
+* **Collaborative AI Engineering & Dual Audit:** Architected, audited line-by-line, and coded iteratively between **Google Gemini** and **OpenAI ChatGPT**.
+* **Streaming Protocol Core:** Powered by [pedroSG94/RootEncoder](https://github.com/pedroSG94/RootEncoder) (`v2.8.1`, Apache-2.0 License), calling `RtmpClient` directly without camera or multi-protocol demo bloat.
 
 ---
 
-### C. Network Armor, Security, Floating Live Pill & Self-Diagnostics
+## 2. Global Broadcast Inspirations Adapted for Android
 
-1. **Hardware Keystore Vault & RTMPS Jitter Probe (`KeystoreVault`):**
-   * Encrypts your YouTube RTMPS URL (`rtmps://[a.rtmp.youtube.com:443/live2](https://a.rtmp.youtube.com:443/live2)`) and Stream Key on-device using `AndroidKeyStore` (`AES/GCM/NoPadding` 256-bit). Stream keys are redacted from all logs and stripped from Release Logcat via ProGuard. Includes a 1-tap **YouTube RTMPS TLS RTT & Jitter Tester** to recommend safe bitrates before going live.
-2. **Queue-Aware Adaptive Bitrate & `SolStream Health & Recovery` (`SolStreamService`):**
-   * Polls outgoing RTMP send-queue bytes and throughput with hysteresis: steps video bitrate down via `PARAMETER_KEY_VIDEO_BITRATE` when upload queues grow (preventing router bufferbloat ping spikes in CODM) and climbs back smoothly once stable.
-   * Monitors `PowerManager` thermal status: automatically disables optional GPU sharpening at `Moderate` warmth and optional noise suppression at `Severe` warmth before OS throttling hits CODM.
-   * Handles Android 15 QPR1+ lock-screen `MediaProjection.Callback.onStop()` gracefully—pausing video without crash-looping and showing an orange re-approval banner.
-3. **`0-Hz` Sleeping Floating Accessibility Pill:**
-   * Uses `TYPE_ACCESSIBILITY_OVERLAY` (requiring zero `SYSTEM_ALERT_WINDOW` permission). Collapses to a static `38%`-opacity Ghost Pill with **0 UI redraws per second** so Android's `SurfaceFlinger` wastes zero composition power, requiring a **Double-Tap or `0.4s` Hold** to expand so fast thumb flicks never open the menu accidentally.
-4. **Automatic Plain-English Session Notes & Glip Benchmark (`DiagnosticsLogger`):**
-   * Records chronological plain-English explanations alongside technical metrics (encoder chip, real FPS, Mbps, queue KB, battery °C, thermal headroom, PSS RAM, A/V drift ms, active `AudioRecordingConfiguration` states) plus a passive **Glip Baseline Benchmark** mode for fair A/B thermal/RAM testing.
+Every subsystem in `SolStream Studio` adapts proven engineering from Windows, macOS, Linux, and iOS broadcast software while keeping heavy/experimental stages **OFF by default** to protect 120 FPS gameplay thermals:
 
----
-
-## 3. Deliberate Architectural Rejections (For Future Developers & AIs)
-
-To keep the app crash-free and cool over 3–5 hour sessions, the following approaches were **intentionally rejected** during design audits—do not re-introduce them:
-* **No `GenericStream` or `extra-sources`:** Pulls RTSP/SRT/UDP/CameraX bloat; `RtmpClient` + R8 shrinking keeps the APK tiny.
-* **No `MixAudioSource` Post-Mix Effects:** Filters game explosions alongside speech; always process mic float buffers *before* mixing.
-* **No `AudioManager.setCommunicationDevice()`:** Globally alters call routing and breaks CODM audio output; use `AudioRecord.setPreferredDevice()`.
-* **No Mid-Stream `VirtualDisplay` Recreation or `NoVideoSource` Swapping:** Crashes on Android 14–17 single-use `MediaProjection` tokens.
-* **No `KEY_ALLOW_FRAME_DROP = 0`:** Prevents Surface input from dropping excess 120 Hz frames down to 60 FPS.
-* **No Software AV1, Cloud AI Voice APIs, 64-Bit Sample Buffers, or 45/48 FPS Modes:** Software AV1 overheats CPUs; cloud AI adds 200–600 ms voice lag; 64-bit sample buffers waste memory bandwidth; YouTube's Live API standardizes on `30fps` and `60fps`.
+| SolStream Studio Subsystem | Inspired By (Windows / Mac / iOS / Web) | What It Solves on Android |
+|---|---|---|
+| **Split Mic-vs-Game 32-Bit Float Audio Bus** | **OBS Studio**, **Reaper DAW** & **Elgato Wave Link** | Processes noise suppression, High-Pass, Gate, EQ, De-Esser, and Compression **strictly on your mic** before mixing with stereo game audio—never muddies footsteps or alters what you hear in your earphones. |
+| **64-Bit Internal Biquad Filter Precision** | **Pro Tools / Reaper DAW** Low-Frequency Math | Uses 64-bit `Double` accumulators inside recursive `75–100 Hz` High-Pass and vocal EQ filters so bass filtering introduces zero rounding noise while keeping stream buffers fast in 32-bit float. |
+| **Podcast Vocal Curve + Dynamic De-Esser** | **Voicemeeter Banana**, **SteelSeries Sonar** & **Aphex** | Adds `125 Hz` chest warmth, cuts `350 Hz` phone-mic boxiness, boosts `3.8 kHz` callout clarity over gunfire, and tames harsh `6.5 kHz` `"S/Sh"` sibilance. |
+| **Smart Mic Sharing & Silencing Watchdog** | **Android AOSP**, **WebRTC** & **Glip** analysis | Combines a `0-Hz` sleeping `TYPE_ACCESSIBILITY_OVERLAY` pill with `AudioSource.DEFAULT` / `VOICE_RECOGNITION` selection and `AudioRecordingCallback` (`MIC OK` vs `MIC SILENCED` live badge). |
+| **120 Hz Gameplay → 60/30 FPS Stream Pacer** | **Desktop Capture-Card Passthrough** | Keeps CODM running at native 120 FPS on your screen while pacing encoder output cleanly at `60 FPS` (`2:1`) or `30 FPS` (`4:1`). |
+| **CODM HUD Framing (`Fit` / `Smart` / `Fill`)** | **Apple iOS ReplayKit** & **OBS Canvas** | Fits `19.5:9` / `20:9` phones into `16:9` YouTube without stretching aim or cutting off your Search & Destroy minimap/ammo HUD—while concentrating 100% of bitrate onto active pixels in `Fit` mode. |
+| **Optional Single-Pass GPU Crisp Shader** | **AMD FidelityFX CAS** | Optional subtle contrast-adaptive sharpening inside the mandatory single `OES` texture pass (`OFF` by default; auto-disables if phone warms up). |
+| **Queue-Aware Bitrate & Health Recovery** | **RootEncoder 2.8.1** & **SQM Bufferbloat** | Watches real outgoing send-queue bytes and drops bitrate smoothly *before* router queues spike in-game CODM ping, with automatic backoff reconnects. |
 
 ---
 
-## 4. Gamer Quick-Start Setup (Samsung One UI / Android 13–17)
+## 3. Complete Feature & Control Encyclopedia
 
-1. **Unlock Restricted Accessibility Once:** Open **Settings → Apps → SolStream Studio → `⋮` (top right) → Allow restricted settings**, then enable **SolStream Studio** in **Settings → Accessibility → Installed apps**. *(Keep Google's extreme 'Advanced Protection' OFF if it blocks sideloaded Accessibility services.)*
-2. **Preserve Stereo Footsteps + 45ms Game Mode on Bluetooth Neckbands:** If using the phone's 48 kHz mic while listening on Bluetooth earphones, open **Bluetooth Settings → Earphones Gear Icon → toggle Calls OFF (keep Audio ON)**, and lock *Call of Duty* to Bluetooth via Samsung **Separate App Sound**.
-3. **Hide Notifications With Single-App Capture:** Choose **"A single app" → Call of Duty** on Android's screen-capture prompt so WhatsApp/OTP popups never appear on stream.
+### A. Pre-Stream Studio Dashboard (`MainActivity.kt`)
+1. **Card 1 — Pre-Flight Readiness & Samsung One UI Guide:**
+   * Live `READY / NEEDED` checklights for Microphone, Android 13+ Notifications, Unrestricted Battery (anti-Deep-Sleep), and Accessibility Service, plus a built-in step-by-step Samsung One UI *Restricted Settings* & Bluetooth setup popup.
+2. **Card 2 — Encrypted YouTube RTMPS & Hardware Keystore Vault (`KeystoreVault.kt`):**
+   * Pre-filled `rtmps://[a.rtmp.youtube.com:443/live2](https://a.rtmp.youtube.com:443/live2)` TLS port-443 ingest URL (editable for custom RTMP/RTMPS servers).
+   * **AES-256-GCM Hardware Keystore Encryption:** Encrypts your YouTube Stream Key inside Android's hardware keystore (`SolStreamMasterAesKey_v1`), with 1-tap Clipboard Paste and Show/Hide toggle.
+   * **1-Tap Airtel / Wi-Fi RTMPS Ping & Jitter Probe:** Runs 4 encrypted TLS handshakes to `a.rtmp.youtube.com:443`, measures average RTT + jitter in milliseconds, and recommends tonight's safest Mbps target.
+3. **Card 3 — Video Encoder, 120→60 FPS Pacing & HUD Framing (`SolVideoPipeline.kt` + `CodecCapabilityProbe.kt`):**
+   * **Auto Hardware Silicon Scanner:** Probes `MediaCodecList`, `VideoCapabilities`, `EncoderCapabilities`, and `PerformancePoint` on first launch and runs a real `COLOR_FormatSurface` dry-run check.
+   * **Video Codecs:** Hardware **`HEVC (H.265)`** (default), Hardware **`H.264 (AVC)`** (universal compatibility), and Hardware **`AV1`** (unlocks automatically *only* on chips with verified hardware AV1 encoding; CPU software encoders are strictly blocked).
+   * **Resolutions & Frame Rates:** **`1440p` (`2560×1440`)** or **`1080p` (`1920×1080`)** at **`60 FPS`** (normal `2:1` cadence from 120 Hz) or **`30 FPS`** (low-bandwidth `4:1` saver).
+   * **Orientation & Cable-Side Flip:** **`16:9 Landscape (0°)`**, **`16:9 Landscape Flipped (180°)`** (so flipping your phone to plug in a Bypass Charging cable never turns the stream upside down), and **`9:16 Vertical Shorts`**.
+   * **Bitrate & Rate Control:** Presets for **`12 / 16 / 18 / 20 [Default] / 22 / 24 Mbps`**, **`CBR` (Recommended)** vs **`VBR` (Keyframe Quality Test)**, **`2-second` keyframes**, **`Rec.709` SDR Limited color signaling**, and **Queue-Aware Adaptive Bitrate (`ON / OFF`)**.
+   * **Aspect-Ratio Framing & Visuals:** **`FIT` (Default — full CODM HUD safe)**, **`SMART` (`104% / 108% / 112% / 116%` zoom)**, **`FILL` (full 16:9 crop)**, and **Optional GPU Crisp Sharpen (`OFF [Default] / ON`)**.
+4. **Card 4 — 7-Stage 32-Bit Float Studio Audio & 5-Second Mic Test Studio (`SolDualAudioEngine.kt` + `MicDspProcessor.kt`):**
+   * **Enumerated Mic Input Picker:** Auto-lists Built-in Phone Mics, Bluetooth SCO/BLE Headsets, Wired Headsets, and USB-C Mics via `AudioDeviceInfo` + `AudioRecord.setPreferredDevice()`.
+   * **Audio Source Selector:** `AUTO (Glip Smart: DEFAULT on Phone Mic / VOICE_RECOGNITION on BT)`, `MIC (Raw)`, and `VOICE_RECOGNITION`.
+   * **Voice Presets:** `RAW` (bypass), `CLEAN` (default: 85 Hz HPF + Breath Gate + Compressor + Master Limiter), and `STUDIO` (enables full 3-Band Podcast EQ + Dynamic De-Esser + Gate + Compressor).
+   * **Individual DSP Toggles:**
+     * **Wind/Grip High-Pass Filter:** `OFF / 75 Hz / 85 Hz / 100 Hz`
+     * **Stationary Fan Noise Suppressor:** `OFF [Default] / LOW / MED`
+     * **Hysteresis Breath Gate (`150 ms` hold) & `3:1` Leveling Compressor:** Independently toggleable
+     * **3-Band Vocal EQ (`125 Hz / 350 Hz / 3.8 kHz`) & `6.5 kHz` De-Esser:** Independently toggleable
+     * **Mic Volume Boost (`75%–220%`) & Game Stream Mix Level (`0%–120%`)**
+     * **Speech-VAD Game Auto-Ducking:** `OFF [Default] / -20% / -35%`
+     * **Mic Lip-Sync Delay Buffer:** `0 / +40 / +80 / +120 / +160 ms`
+     * **Extra Safeguards:** `BRB Auto-Mute Mic (ON/OFF)` and Experimental `Wi-Fi Low-Latency Lock (OFF/ON)`
+   * **5-Second Mic Test Studio:** Records 5 seconds in your actual CODM hand grip (microphone-only, zero screen-capture prompt), displays Peak dB, Noise Floor dB, and Clip count, plays back on tap, and deletes cleanly.
+5. **Card 5 — Broadcast Launch, Automatic Session Notes, Glip Benchmark & Updater:**
+   * **Automatic Plain-English Session Report (`DiagnosticsLogger.kt`):** Copyable/shareable report recording plain-English event explanations, encoder chip name, real FPS, live Mbps, send-queue KB, battery start/peak °C, Android thermal status & headroom %, app PSS RAM MB, A/V drift ms, and active Android recording states—**strictly redacting stream keys and never recording voice or notifications**.
+   * **Passive Glip Comparison Benchmark:** Measures start/peak °C, thermal status, and RAM while you stream in Glip so you can compare Glip vs. SolStream side by side under identical conditions.
+   * **1-Tap GitHub Release Update Checker:** Queries `PppP01/SolStream-Studio` Releases on demand (zero background polling during gameplay).
 
 ---
 
-## 5. Developer & AI Contributor Onboarding
+### B. In-Game Floating Live Studio Pill (`SolStreamService.kt`)
+* **0-Hz Sleeping Ghost Mode:** Collapses to a draggable `38%`-opacity translucent badge with **zero timer/text redraws per second** when closed, eliminating `SurfaceFlinger` composition overhead during 120 FPS CODM.
+* **Anti-Misclick Guard:** Ignores accidental single-tap grazes while aiming—requires a **Double-Tap (or `0.4s` Hold)** to expand.
+* **14 Crash-Free Mid-Stream Live Controls (Never Detaches Capture):**
+  1. Live Timer + Outgoing Mbps + Real Encoded FPS + Send-Queue KB Header
+  2. Connection State + `MIC OK / MIC SILENCED` Live Peak dB + `GAME OK / MIC-ONLY` Status Row
+  3. **1-Tap Stream Mic Mute** (mutes your voice on YouTube while keeping your CODM squad voice chat active)
+  4. **1-Tap `GAME + SQUAD STREAM` Mute** (mutes captured game audio on stream while you keep hearing footsteps in your earphones)
+  5. **1-Tap `BRB Privacy Blackout` Shield** (sends pure black 60 FPS OpenGL frames + optional mic mute without detaching `MediaProjection`)
+  6. Live Voice Preset Cycler (`RAW ↔ CLEAN ↔ STUDIO`)
+  7. Live Fan Noise Suppressor Cycler (`OFF ↔ LOW ↔ MED`)
+  8. Live Wind/Grip High-Pass Cycler (`OFF ↔ 75 ↔ 85 ↔ 100 Hz`)
+  9. Live Gate / EQ / Compressor / De-Esser Combo Toggle
+  10. Live Mic Boost Cycler (`75%–220%`)
+  11. Live Game Mix Level Cycler (`30%–120%`)
+  12. Live VAD Auto-Ducking Cycler (`OFF ↔ -20% ↔ -35%`)
+  13. Live Framing (`FIT ↔ SMART ↔ FILL`), `0°/180°` Flip & GPU Crisp Sharpen Toggle
+  14. Live On-The-Fly Target Bitrate Nudge (`12M–24M`) + **2-Tap Confirm Stop Stream**
 
-### Source Layout
+---
+
+## 4. Recommended YouTube Studio & Samsung One UI Setup
+
+1. **YouTube Studio (On Laptop/Desktop Browser):**
+   * Create a **Custom Stream Key** → check **"Turn on manual settings" → `1440p` (`60 fps`)** so YouTube pre-allocates high-efficiency transcoding.
+   * Set **Latency = Low-latency**, **Auto-start = ON**, **Auto-stop = OFF** (prevents YouTube from ending your stream during brief Wi-Fi reconnects), and enable YouTube's server-side **Auto Dual-Format** if dual horizontal + vertical Shorts streaming is desired.
+2. **Samsung One UI / Android 13–17 Sideloaded APK Unlock:**
+   * If Samsung **Auto Blocker** blocks installing the GitHub APK, toggle *Settings → Security and privacy → Auto Blocker → OFF*, install the APK, and turn Auto Blocker back ON.
+   * Unlock Accessibility once: **Settings → Apps → SolStream Studio → tap `⋮` (top right) → Allow restricted settings**, then enable **SolStream Studio** in **Settings → Accessibility → Installed apps**.
+3. **realme Neckband Stereo + 45ms Game Mode Tip:**
+   * To prevent Bluetooth from dropping into mono Hands-Free (`HFP`) call audio when CODM's mic opens, open **Bluetooth Settings → Earphones Gear Icon → toggle Calls OFF (keep Audio ON)** so CODM and SolStream share your phone's 48 kHz built-in mic while your neckband stays locked in crisp Stereo + 45ms Game Mode. Lock *Call of Duty* to Bluetooth in Samsung **Separate App Sound** so match transitions never jump to the phone speaker.
+4. **Notification Privacy:**
+   * Select **"A single app" → Call of Duty** on Android's screen-capture prompt so WhatsApp messages, calls, and OTPs never appear on stream.
+
+---
+
+## 5. Known Android Platform Realities (Honest Boundaries)
+
+* **CODM Squad Teammate Voice Capture:** Android's `AudioPlaybackCapture` captures `USAGE_GAME`, `USAGE_MEDIA`, and `USAGE_UNKNOWN`, while blocking `USAGE_VOICE_COMMUNICATION` for system privacy. Gunfire and footsteps capture cleanly; teammate voices appear on stream only when the game outputs squad audio on a capturable game/media track. Similarly, `GAME + SQUAD STREAM MUTE` mutes the combined internal playback mix rather than isolating teammates from gunfire.
+* **Lock-Screen Capture Rule (Android 15 QPR1+):** Modern Android automatically stops `MediaProjection` if you physically lock the phone screen. Use the floating **BRB Privacy Blackout** button instead of locking the phone during breaks; if locked accidentally, `SolStream Health & Recovery` pauses safely and shows a 1-tap orange re-approval button.
+
+---
+
+## 6. Deliberate Architectural Rejections (Do Not Re-Introduce in PRs)
+
+* **Rejected `GenericStream` & `extra-sources`:** Avoids bundling RTSP, SRT, UDP, CameraX, and UVC dependencies; `RtmpClient` + R8 shrinking keeps the APK ~4–8 MB.
+* **Rejected Post-Mix `CustomAudioEffect`:** `RootEncoder`'s built-in `MixAudioSource` applies effects *after* mixing mic and game PCM16; keep mic DSP strictly upstream in `SolDualAudioEngine`.
+* **Rejected `AudioManager.setCommunicationDevice()`:** Globally alters Android call routing and disrupts CODM audio output; keep input selection scoped to `AudioRecord.setPreferredDevice()`.
+* **Rejected Mid-Stream `VirtualDisplay` Recreation / `NoVideoSource` Swapping:** Violates Android 14–17 single-use `MediaProjection` token rules (`SecurityException`).
+* **Rejected `KEY_ALLOW_FRAME_DROP = 0`:** Prevents Surface input from discarding excess 120 Hz frames down to 60 FPS.
+* **Rejected Software AV1, Cloud Voice AI, 64-Bit Sample Buffers & 45/48 FPS Modes:** Protects CPU thermals, avoids 200–600 ms cloud audio lag, avoids wasted RAM bandwidth, and matches YouTube Live's documented `30fps` / `60fps` ingest modes.
+
+---
+
+## 7. Developer & AI Technical Reference
+
+### Source Architecture
 ```text
 app/src/main/
 ├── AndroidManifest.xml                  # Minimal permissions (INTERNET, RECORD_AUDIO, FGS mediaProjection|microphone)
@@ -119,15 +156,20 @@ app/src/main/
     └── DiagnosticsLogger.kt             # Redacted plain-English session report & Glip comparison benchmark
 ```
 
-### Extending Audio DSP (`480`-Sample `10 ms` Native Hook) & Shaders
-* **Audio / Native JNI `RNNoise`:** `MicDspProcessor.processMonoFrameInPlace(buffer: FloatArray, count: Int)` processes exact `480`-sample (`10 ms` @ `48 kHz`) mono float frames *before* game mixing. Any native C++/JNI `.so` added later must be compiled with **Android NDK r28+** (`-Wl,-z,max-page-size=16384`) for Android 15+ 16 KB page alignment (`useLegacyPackaging = false` is already configured).
-* **Video Shader:** `GlShaderHelper.FRAGMENT_SHADER` in `SolVideoPipeline.kt` runs a single OES pass; avoid multi-pass FBO chains to protect mobile GPU thermals.
+### Code Hooks for Contributors
+* **Native JNI Audio Hook (`480` samples = `10 ms` @ `48 kHz`):** `MicDspProcessor.processMonoFrameInPlace(buffer: FloatArray, count: Int)` processes normalized `[-1.0f, 1.0f]` mono float frames of exact `RNNoise` frame length (`480` samples) with zero heap allocations. Any native `.so` added in a PR must compile against **Android NDK r28+** (`-Wl,-z,max-page-size=16384`) for Android 15–17 16 KB page compatibility (`useLegacyPackaging = false` is enabled).
+* **OpenGL Single-Pass Shader:** `GlShaderHelper.FRAGMENT_SHADER` in `SolVideoPipeline.kt` samples `samplerExternalOES` directly into the hardware encoder `EGLSurface`. Do not introduce multi-pass FBO chains unless gated OFF by default and thermally benchmarked.
 
-### Local Build & GitHub Actions Persistent Signing
+### Build Commands & GitHub Actions Signing Secrets
 ```bash
 gradle assembleDebug assembleRelease -x lint -x lintVitalRelease -Pandroid.suppressUnsupportedCompileSdk=36,37
 ```
-To preserve update signatures across GitHub Actions releases without uninstalling, generate a `.jks` once (`keytool -genkeypair -v -keystore release.jks -keyalg RSA -keysize 2048 -validity 10000 -alias solstream`), Base64-encode it (`base64 -w 0 release.jks`), and store `SIGNING_KEY_BASE64`, `SIGNING_STORE_PASSWORD`, `SIGNING_KEY_ALIAS`, and `SIGNING_KEY_PASSWORD` under **GitHub Settings → Secrets and variables → Actions** (falls back to debug signing automatically if unset).
+To preserve update signatures across GitHub Actions builds without uninstalling:
+```bash
+keytool -genkeypair -v -keystore release.jks -keyalg RSA -keysize 2048 -validity 10000 -alias solstream
+base64 -w 0 release.jks > release_base64.txt
+```
+Add `SIGNING_KEY_BASE64`, `SIGNING_STORE_PASSWORD`, `SIGNING_KEY_ALIAS`, and `SIGNING_KEY_PASSWORD` under **GitHub Settings → Secrets and variables → Actions** (automatically falls back to debug signing when unset so every build produces an installable APK).
 
 ---
 
