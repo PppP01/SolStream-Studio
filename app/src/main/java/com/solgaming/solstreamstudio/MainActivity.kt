@@ -733,7 +733,7 @@ class MainActivity : AppCompatActivity() {
                     val ms = (System.nanoTime() - t0) / 1_000_000L
                     samples.add(ms)
                 }
-                val avg = samples.average().toInt()
+                val avg = samples.average().toLong()
                 val jitter = (samples.maxOrNull() ?: avg) - (samples.minOrNull() ?: avg)
                 val advice = when {
                     avg < 85 && jitter < 30 -> "Excellent headroom! Safe to run 20–22 Mbps 1440p60."
