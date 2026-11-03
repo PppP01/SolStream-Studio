@@ -647,7 +647,7 @@ class SolVideoPipeline(private val context: Context) {
             "H264" -> {
                 val csd1 = format.getByteBuffer("csd-1")?.duplicate()
                 if (csd1 != null) {
-                    onVideoConfig(copyBuffer(csd0), copyBuffer(csd1), null)
+                    onVideoConfig(stripStartCode(csd0), stripStartCode(csd1), null)
                 } else {
                     parseAnnexBNalsAndSend(csd0, isHevc = false, onVideoConfig)
                 }
@@ -673,6 +673,17 @@ class SolVideoPipeline(private val context: Context) {
         }
     }
 
+    private fun stripStartCode(src: ByteBuffer): ByteBuffer {
+        val arr = ByteArray(src.remaining())
+        src.get(arr)
+        val offset = when {
+            arr.size >= 4 && arr[0].toInt() == 0 && arr[1].toInt() == 0 && arr[2].toInt() == 0 && arr[3].toInt() == 1 -> 4
+            arr.size >= 3 && arr[0].toInt() == 0 && arr[1].toInt() == 0 && arr[2].toInt() == 1 -> 3
+            else -> 0
+        }
+        return ByteBuffer.wrap(arr.copyOfRange(offset, arr.size))
+    }
+
     private fun parseAnnexBNalsAndSend(
         source: ByteBuffer,
         isHevc: Boolean,
@@ -689,17 +700,18 @@ class SolVideoPipeline(private val context: Context) {
         for (nal in nals) {
             val scLen = if (nal.size >= 4 && nal[0].toInt() == 0 && nal[1].toInt() == 0 && nal[2].toInt() == 0 && nal[3].toInt() == 1) 4 else 3
             if (nal.size <= scLen) continue
-            val headerByte = nal[scLen].toInt() and 0xFF
+            val rawNal = nal.copyOfRange(scLen, nal.size)
+            val headerByte = rawNal[0].toInt() and 0xFF
             if (isHevc) {
                 when ((headerByte shr 1) and 0x3F) {
-                    32 -> vps = ByteBuffer.wrap(nal)
-                    33 -> sps = ByteBuffer.wrap(nal)
-                    34 -> pps = ByteBuffer.wrap(nal)
+                    32 -> vps = ByteBuffer.wrap(rawNal)
+                    33 -> sps = ByteBuffer.wrap(rawNal)
+                    34 -> pps = ByteBuffer.wrap(rawNal)
                 }
             } else {
                 when (headerByte and 0x1F) {
-                    7 -> sps = ByteBuffer.wrap(nal)
-                    8 -> pps = ByteBuffer.wrap(nal)
+                    7 -> sps = ByteBuffer.wrap(rawNal)
+                    8 -> pps = ByteBuffer.wrap(rawNal)
                 }
             }
         }
@@ -771,7 +783,8 @@ class SolVideoPipeline(private val context: Context) {
                     vec3 w = texture2D(sTexture, vTexCoord - vec2(uTexelStep.x, 0.0)).rgb;
                     vec3 avg = 0.25 * (n + s + e + w);
                     vec3 sharp = clamp(center.rgb + (center.rgb - avg) * uSharpen, 0.0, 1.0);
-                    gl_FragColor = vec4(sharp, center.a);
+                    vec3 sharpClamped = clamp(sharp, 0.0, 1.0);
+                    gl_FragColor = vec4(sharpClamped, center.a);
                 }
             }
         """
