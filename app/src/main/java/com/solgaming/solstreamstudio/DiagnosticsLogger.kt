@@ -3,6 +3,7 @@ package com.solgaming.solstreamstudio
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.media.AudioDeviceInfo
 import android.media.AudioManager
 import android.media.MediaRecorder
 import android.os.BatteryManager
@@ -35,34 +36,106 @@ data class BenchmarkSummary(
 )
 
 object DiagnosticsLogger {
-    private const val MAX_EVENTS = 240
+    private const val MAX_EVENTS = 260
     private const val BENCH_PREFS = "solstream_benchmarks"
+    private const val KEY_LAST_CRASH = "last_privacy_safe_crash"
     private val events = ArrayDeque<DiagnosticEvent>(MAX_EVENTS)
     private val timeFmt = SimpleDateFormat("HH:mm:ss", Locale.US)
 
+    @Volatile private var crashHandlerInstalled: Boolean = false
+
     @Volatile var sessionStartMs: Long = 0L
-    @Volatile var startBatteryTempC: Float = 0f
-    @Volatile var peakBatteryTempC: Float = 0f
+    @Volatile var startBatteryTempC: Float = -1f
+    @Volatile var peakBatteryTempC: Float = -1f
     @Volatile var worstThermalStatus: Int = 0
     @Volatile var ramSampleSumMb: Long = 0L
     @Volatile var ramSampleCount: Int = 0
     @Volatile var droppedVideoFrames: Int = 0
     @Volatile var reconnectAttempts: Int = 0
     @Volatile var activeEncoderDesc: String = "Idle"
-    @Volatile var lastQueueBytes: Long = 0L
+    @Volatile var lastQueueBytes: Long = -1L
+    @Volatile var lastQueueFrames: Int = -1
+    @Volatile var lastQueueCapacity: Int = -1
+    @Volatile var lastRttMs: Long = -1L
     @Volatile var lastEncodedFps: Int = 0
+    @Volatile var freshCaptureFps: Int = -1
+    @Volatile var repeatedFramesCount: Long = 0L
+    @Volatile var lastAverageQp: Int = -1
     @Volatile var lastBitrateKbps: Int = 0
     @Volatile var avDriftMs: Long = 0L
     @Volatile var micStatusLabel: String = "IDLE"
 
     private fun redactSecrets(input: String): String {
         return input
-            .replace(Regex("(rtmps?://[^/\\s]+/[^/\\s]+/)([^\\s]+)", RegexOption.IGNORE_CASE), "$1[REDACTED_KEY]")
-            .replace(Regex("([a-z0-9]{4}-[a-z0-9]{4}-[a-z0-9]{4}-[a-z0-9]{4,})", RegexOption.IGNORE_CASE), "[REDACTED_KEY]")
+            .replace(
+                Regex("(rtmps?://[^/\\s]+/[^/\\s?]+/)([^?\\s]+)", RegexOption.IGNORE_CASE),
+                "$1[REDACTED_KEY]"
+            )
+            .replace(
+                Regex("([a-z0-9]{4}-[a-z0-9]{4}-[a-z0-9]{4}-[a-z0-9]{4,})", RegexOption.IGNORE_CASE),
+                "[REDACTED_KEY]"
+            )
+            .replace(
+                Regex("(live_[0-9]+_[a-z0-9A-Z_]+)", RegexOption.IGNORE_CASE),
+                "[REDACTED_KEY]"
+            )
+    }
+
+    fun formatTempC(tempC: Float): String {
+        return if (tempC > 0f && !tempC.isNaN()) {
+            String.format(Locale.US, "%.1f°C", tempC)
+        } else {
+            "N/A"
+        }
+    }
+
+    fun installPrivacySafeCrashHandler(context: Context) {
+        if (crashHandlerInstalled) return
+        val appCtx = context.applicationContext
+        val previous = Thread.getDefaultUncaughtExceptionHandler()
+        Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
+            try {
+                val topFrame = throwable.stackTrace.firstOrNull {
+                    it.className.startsWith("com.solgaming.solstreamstudio")
+                } ?: throwable.stackTrace.firstOrNull()
+                val summary = redactSecrets(
+                    buildString {
+                        append(SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date()))
+                        append(" | thread=").append(thread.name)
+                        append(" | ex=").append(throwable.javaClass.simpleName)
+                        append(": ").append(throwable.message ?: "no-msg")
+                        if (topFrame != null) {
+                            append(" @ ").append(topFrame.fileName ?: topFrame.className)
+                            append(":").append(topFrame.lineNumber)
+                        }
+                        append(" | pipe=").append(activeEncoderDesc)
+                        append(" | therm=").append(thermalStatusName(readThermalStatus(appCtx)))
+                        append(" | pss=").append(readAppMemoryMb()).append("MB")
+                    }
+                )
+                appCtx.getSharedPreferences(BENCH_PREFS, Context.MODE_PRIVATE)
+                    .edit()
+                    .putString(KEY_LAST_CRASH, summary)
+                    .commit()
+            } catch (_: Exception) {
+                // Never block default crash propagation
+            } finally {
+                previous?.uncaughtException(thread, throwable)
+            }
+        }
+        crashHandlerInstalled = true
+    }
+
+    fun clearSavedCrashNote(context: Context) {
+        context.applicationContext.getSharedPreferences(BENCH_PREFS, Context.MODE_PRIVATE)
+            .edit()
+            .remove(KEY_LAST_CRASH)
+            .apply()
     }
 
     @Synchronized
     fun startNewSession(context: Context, modeLabel: String, encoderDesc: String) {
+        installPrivacySafeCrashHandler(context)
         events.clear()
         sessionStartMs = System.currentTimeMillis()
         val temp = readBatteryTempC(context)
@@ -74,12 +147,18 @@ object DiagnosticsLogger {
         droppedVideoFrames = 0
         reconnectAttempts = 0
         activeEncoderDesc = encoderDesc
-        lastQueueBytes = 0L
+        lastQueueBytes = -1L
+        lastQueueFrames = -1
+        lastQueueCapacity = -1
+        lastRttMs = -1L
+        freshCaptureFps = -1
+        repeatedFramesCount = 0L
+        lastAverageQp = -1
         avDriftMs = 0L
         log(
             "SESSION",
             "$modeLabel started ($encoderDesc).",
-            "startTemp=${temp}C thermal=${thermalStatusName(worstThermalStatus)}"
+            "startTemp=${formatTempC(temp)} thermal=${thermalStatusName(worstThermalStatus)}"
         )
     }
 
@@ -103,7 +182,12 @@ object DiagnosticsLogger {
         val thermal = readThermalStatus(context)
         val ramMb = readAppMemoryMb()
         synchronized(this) {
-            if (tempC > peakBatteryTempC) peakBatteryTempC = tempC
+            if (tempC > 0f && (peakBatteryTempC <= 0f || tempC > peakBatteryTempC)) {
+                peakBatteryTempC = tempC
+            }
+            if (tempC > 0f && startBatteryTempC <= 0f) {
+                startBatteryTempC = tempC
+            }
             if (thermal > worstThermalStatus) worstThermalStatus = thermal
             ramSampleSumMb += ramMb
             ramSampleCount++
@@ -111,16 +195,19 @@ object DiagnosticsLogger {
         return tempC to thermal
     }
 
+    /**
+     * Reads sticky ACTION_BATTERY_CHANGED immediately; returns -1f (N/A) instead of fake 0.0°C.
+     */
     fun readBatteryTempC(context: Context): Float {
         return try {
             val intent = context.applicationContext.registerReceiver(
                 null,
                 IntentFilter(Intent.ACTION_BATTERY_CHANGED)
             )
-            val tenths = intent?.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, 0) ?: 0
-            tenths / 10.0f
+            val tenths = intent?.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, -1) ?: -1
+            if (tenths > 0) tenths / 10.0f else -1f
         } catch (_: Exception) {
-            0f
+            -1f
         }
     }
 
@@ -137,7 +224,8 @@ object DiagnosticsLogger {
         return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             try {
                 val pm = context.getSystemService(Context.POWER_SERVICE) as PowerManager
-                pm.getThermalHeadroom(10)
+                val h = pm.getThermalHeadroom(10)
+                if (h.isNaN() || h <= 0f) -1f else h
             } catch (_: Exception) {
                 -1f
             }
@@ -149,10 +237,26 @@ object DiagnosticsLogger {
     fun readAppMemoryMb(): Int {
         return try {
             val pssKb = Debug.getPss()
-            (pssKb / 1024L).toInt()
+            if (pssKb > 0L) {
+                (pssKb / 1024L).toInt()
+            } else {
+                val rt = Runtime.getRuntime()
+                ((rt.totalMemory() - rt.freeMemory()) / (1024L * 1024L)).toInt()
+            }
         } catch (_: Exception) {
             val rt = Runtime.getRuntime()
             ((rt.totalMemory() - rt.freeMemory()) / (1024L * 1024L)).toInt()
+        }
+    }
+
+    fun describeDetailedMemory(avgPssMb: Int): String {
+        return try {
+            val rt = Runtime.getRuntime()
+            val javaHeapMb = ((rt.totalMemory() - rt.freeMemory()) / (1024L * 1024L)).toInt()
+            val nativeHeapMb = (Debug.getNativeHeapAllocatedSize() / (1024L * 1024L)).toInt()
+            "App Process PSS: ${avgPssMb} MB (Java Heap: ${javaHeapMb} MB | Native Heap: ${nativeHeapMb} MB)"
+        } catch (_: Exception) {
+            "App Process PSS: ${avgPssMb} MB"
         }
     }
 
@@ -164,6 +268,18 @@ object DiagnosticsLogger {
         PowerManager.THERMAL_STATUS_CRITICAL -> "Critical"
         PowerManager.THERMAL_STATUS_EMERGENCY -> "Emergency"
         else -> "Status $status"
+    }
+
+    fun audioDeviceTypeName(type: Int): String = when (type) {
+        AudioDeviceInfo.TYPE_BUILTIN_MIC -> "Built-in Mic"
+        AudioDeviceInfo.TYPE_WIRED_HEADSET -> "Wired Headset Mic"
+        AudioDeviceInfo.TYPE_BLUETOOTH_SCO -> "Bluetooth HFP (Call-Mode)"
+        AudioDeviceInfo.TYPE_BLUETOOTH_A2DP -> "Bluetooth A2DP"
+        AudioDeviceInfo.TYPE_USB_DEVICE -> "USB Audio Mic"
+        AudioDeviceInfo.TYPE_USB_HEADSET -> "USB-C Headset Mic"
+        AudioDeviceInfo.TYPE_TELEPHONY -> "Telephony"
+        26 -> "Bluetooth LE Audio Headset"
+        else -> "Type-$type"
     }
 
     fun inspectActiveAudioRecordings(context: Context): String {
@@ -185,7 +301,13 @@ object DiagnosticsLogger {
                     MediaRecorder.AudioSource.REMOTE_SUBMIX -> "INTERNAL_PLAYBACK"
                     else -> "SRC_${c.clientAudioSource}"
                 }
-                "#$idx src=$srcName silenced=$silenced rate=${c.format.sampleRate}Hz ch=${c.format.channelCount} dev=${c.audioDevice?.type ?: "none"}"
+                val dev = c.audioDevice
+                val devDesc = if (dev != null) {
+                    "${audioDeviceTypeName(dev.type)}(${dev.productName})"
+                } else {
+                    "none"
+                }
+                "#$idx src=$srcName silenced=$silenced rate=${c.format.sampleRate}Hz ch=${c.format.channelCount} dev=$devDesc"
             }.joinToString(" | ")
         } catch (e: Exception) {
             "Audio config query unavailable (${e.javaClass.simpleName})"
@@ -199,12 +321,15 @@ object DiagnosticsLogger {
             1
         }
         val avgRam = if (ramSampleCount > 0) (ramSampleSumMb / ramSampleCount).toInt() else readAppMemoryMb()
+        val liveTemp = readBatteryTempC(context)
+        val sTemp = if (startBatteryTempC > 0f) startBatteryTempC else liveTemp
+        val pTemp = if (peakBatteryTempC > 0f) peakBatteryTempC else liveTemp
         val prefix = if (isGlipBaseline) "glip" else "sol"
         context.applicationContext.getSharedPreferences(BENCH_PREFS, Context.MODE_PRIVATE).edit()
             .putBoolean("${prefix}_exists", true)
             .putInt("${prefix}_mins", mins)
-            .putFloat("${prefix}_start_temp", startBatteryTempC)
-            .putFloat("${prefix}_peak_temp", peakBatteryTempC)
+            .putFloat("${prefix}_start_temp", sTemp)
+            .putFloat("${prefix}_peak_temp", pTemp)
             .putInt("${prefix}_ram", avgRam)
             .putInt("${prefix}_thermal", worstThermalStatus)
             .putInt("${prefix}_drops", droppedVideoFrames)
@@ -218,8 +343,8 @@ object DiagnosticsLogger {
         return BenchmarkSummary(
             label = label,
             durationMinutes = p.getInt("${prefix}_mins", 0),
-            startTempC = p.getFloat("${prefix}_start_temp", 0f),
-            peakTempC = p.getFloat("${prefix}_peak_temp", 0f),
+            startTempC = p.getFloat("${prefix}_start_temp", -1f),
+            peakTempC = p.getFloat("${prefix}_peak_temp", -1f),
             avgRamMb = p.getInt("${prefix}_ram", 0),
             worstThermalLevel = p.getInt("${prefix}_thermal", 0),
             droppedFrames = p.getInt("${prefix}_drops", 0),
@@ -227,27 +352,56 @@ object DiagnosticsLogger {
         )
     }
 
+    private fun formatQueueSummary(): String {
+        return when {
+            lastQueueFrames >= 0 && lastQueueCapacity > 0 -> {
+                "$lastQueueFrames/$lastQueueCapacity frames" +
+                    if (lastQueueBytes >= 0L) " (${lastQueueBytes / 1024} KB)" else ""
+            }
+            lastQueueFrames >= 0 -> "$lastQueueFrames frames"
+            lastQueueBytes >= 0L -> "${lastQueueBytes / 1024} KB"
+            else -> "N/A"
+        }
+    }
+
     @Synchronized
     fun buildShareableReport(context: Context): String {
         val scan = CodecCapabilityProbe.scanDevice(context)
         val avgRam = if (ramSampleCount > 0) (ramSampleSumMb / ramSampleCount).toInt() else readAppMemoryMb()
         val headroom = readThermalHeadroom(context)
-        val sb = StringBuilder()
+        val liveTemp = readBatteryTempC(context)
+        val displayStartTemp = if (sessionStartMs > 0L) startBatteryTempC else liveTemp
+        val displayPeakTemp = if (sessionStartMs > 0L) peakBatteryTempC else liveTemp
+        val savedCrash = context.applicationContext
+            .getSharedPreferences(BENCH_PREFS, Context.MODE_PRIVATE)
+            .getString(KEY_LAST_CRASH, null)
 
+        val sb = StringBuilder()
         sb.appendLine("=== SOLSTREAM STUDIO — AUTOMATIC SESSION REPORT ===")
         sb.appendLine("Privacy Guarantee: Stream keys, notifications, and voice audio are NEVER included.")
         sb.appendLine("Device: ${scan.deviceModel} (${scan.socModel}) | Android ${scan.androidRelease} (API ${scan.sdkInt})")
+        sb.appendLine("Vault Security: ${KeystoreVault.getKeySecurityDescription()}")
         sb.appendLine("Active Pipeline: $activeEncoderDesc")
+
+        val freshStr = if (freshCaptureFps >= 0) "$freshCaptureFps" else "N/A"
+        val qpStr = if (lastAverageQp >= 0) "$lastAverageQp" else "N/A"
+        val rttStr = if (lastRttMs >= 0L) "${lastRttMs} ms" else "N/A"
         sb.appendLine(
-            "Latest Live Metrics: ${lastBitrateKbps / 1000.0} Mbps | Out FPS: $lastEncodedFps | " +
-                "Send Queue: ${lastQueueBytes / 1024} KB | A/V Drift: ${avDriftMs} ms | Mic: $micStatusLabel"
+            "Latest Live Metrics: ${String.format(Locale.US, "%.2f", lastBitrateKbps / 1000.0)} Mbps | " +
+                "Out FPS: $lastEncodedFps (Fresh Capture FPS: $freshStr, Avg QP: $qpStr) | " +
+                "Send Queue: ${formatQueueSummary()} | RTMP Ping: $rttStr | " +
+                "A/V Drift: ${avDriftMs} ms | Mic: $micStatusLabel"
         )
         sb.appendLine(
-            "Thermal & Memory: Start ${startBatteryTempC}°C -> Peak ${peakBatteryTempC}°C | " +
+            "Thermal & Memory: Start ${formatTempC(displayStartTemp)} -> Peak ${formatTempC(displayPeakTemp)} | " +
                 "Worst Thermal: ${thermalStatusName(worstThermalStatus)} | " +
-                "Headroom: ${if (headroom >= 0f) "${(headroom * 100).roundToInt()}%" else "N/A"} | Avg RAM: ${avgRam} MB"
+                "Headroom: ${if (headroom >= 0f) "${(headroom * 100).roundToInt()}%" else "N/A"} | " +
+                describeDetailedMemory(avgRam)
         )
         sb.appendLine("Active Audio Policy: ${inspectActiveAudioRecordings(context)}")
+        if (!savedCrash.isNullOrBlank()) {
+            sb.appendLine("Last Recorded Crash: $savedCrash")
+        }
         sb.appendLine()
 
         val glip = loadBenchmark(context, "glip", "Glip Baseline")
@@ -256,14 +410,14 @@ object DiagnosticsLogger {
             sb.appendLine("--- GLIP vs. SOLSTREAM BENCHMARK COMPARISON ---")
             glip?.let {
                 sb.appendLine(
-                    "• Glip (${it.durationMinutes}m): Start ${it.startTempC}°C -> Peak ${it.peakTempC}°C | " +
-                        "Worst Thermal: ${thermalStatusName(it.worstThermalLevel)} | App RAM: ${it.avgRamMb} MB"
+                    "• Glip (${it.durationMinutes}m): Start ${formatTempC(it.startTempC)} -> Peak ${formatTempC(it.peakTempC)} | " +
+                        "Worst Thermal: ${thermalStatusName(it.worstThermalLevel)} | App PSS: ${it.avgRamMb} MB"
                 )
             }
             sol?.let {
                 sb.appendLine(
-                    "• SolStream (${it.durationMinutes}m): Start ${it.startTempC}°C -> Peak ${it.peakTempC}°C | " +
-                        "Worst Thermal: ${thermalStatusName(it.worstThermalLevel)} | App RAM: ${it.avgRamMb} MB | " +
+                    "• SolStream (${it.durationMinutes}m): Start ${formatTempC(it.startTempC)} -> Peak ${formatTempC(it.peakTempC)} | " +
+                        "Worst Thermal: ${thermalStatusName(it.worstThermalLevel)} | App PSS: ${it.avgRamMb} MB | " +
                         "Drops: ${it.droppedFrames} | Reconnects: ${it.reconnectCount}"
                 )
             }
