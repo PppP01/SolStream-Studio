@@ -235,7 +235,6 @@ class SolDualAudioEngine(private val context: Context) {
         val clampedReq = requestedBps.coerceIn(96_000, 320_000)
         val candidates = listOf(clampedReq, 256_000, 192_000, 160_000, 128_000).distinct()
 
-        // Inspect available AAC encoders so hardware-accelerated implementations take priority if present
         val preferredCodecName: String? = try {
             val list = MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos
             val aacEncoders = list.filter { info ->
@@ -257,15 +256,16 @@ class SolDualAudioEngine(private val context: Context) {
                     setInteger(MediaFormat.KEY_BIT_RATE, bps)
                     setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, 16384)
                 }
-                codec = if (!preferredCodecName.isNullOrBlank()) {
+                val createdCodec: MediaCodec = if (preferredCodecName != null && preferredCodecName.isNotBlank()) {
                     MediaCodec.createByCodecName(preferredCodecName)
                 } else {
                     MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_AUDIO_AAC)
                 }
-                codec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
-                codec.start()
+                codec = createdCodec
+                createdCodec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+                createdCodec.start()
 
-                val info = codec.codecInfo
+                val info = createdCodec.codecInfo
                 val accelTag = if (info.isHardwareAccelerated && !info.isSoftwareOnly) "HW" else "Platform"
                 aacEncoderSummary = "${info.name} ($accelTag • ${bps / 1000}kbps)"
                 DiagnosticsLogger.log(
@@ -273,7 +273,7 @@ class SolDualAudioEngine(private val context: Context) {
                     "Stereo 48 kHz AAC-LC encoder started: $aacEncoderSummary.",
                     "hw=${info.isHardwareAccelerated} swOnly=${info.isSoftwareOnly}"
                 )
-                return codec
+                return createdCodec
             } catch (_: Exception) {
                 try { codec?.release() } catch (_: Exception) {}
             }
@@ -382,8 +382,6 @@ class SolDualAudioEngine(private val context: Context) {
         var lastOutR = 0.0f
             private set
 
-        fun bufferedFrames(): Int = (writeFrame - readFrame).coerceAtLeast(0L).toInt()
-
         fun pushInterleaved(interleaved: FloatArray, stereoFrames: Int) {
             if (stereoFrames <= 0) return
             val currentAvail = writeFrame - readFrame
@@ -425,7 +423,6 @@ class SolDualAudioEngine(private val context: Context) {
                 }
             }
 
-            // If a major OS stall accumulated >100 ms of old game audio, crossfade smoothly back to 30 ms
             if (availNow > 4800.0) {
                 crossfadeFromL = lastOutL
                 crossfadeFromR = lastOutR
@@ -437,7 +434,6 @@ class SolDualAudioEngine(private val context: Context) {
                 smoothedFill += 0.04 * (availNow - smoothedFill)
             }
 
-            // Gentle proportional rate trim (max +-0.15%) keeps multi-hour clock drift locked at ~0 ms
             val fillErr = smoothedFill - targetFillFrames
             val step = (1.0 + (fillErr * 0.000003).coerceIn(-0.0015, 0.0015))
 
@@ -471,7 +467,6 @@ class SolDualAudioEngine(private val context: Context) {
                     lastOutL = sL
                     lastOutR = sR
                 } else {
-                    // Graceful 2 ms release to silence instead of snapping vertically ("crick!")
                     primed = false
                     lastOutL *= 0.96f
                     lastOutR *= 0.96f
@@ -496,7 +491,7 @@ class SolDualAudioEngine(private val context: Context) {
         var gameRecord: AudioRecord? = initialGameRecord
 
         val frameSamples = 480 // 10 ms @ 48,000 Hz
-        val maxOutSamples = frameSamples + 2 // Supports +-1 sample wall-clock lip-sync slew
+        val maxOutSamples = frameSamples + 2
         val micFloat = FloatArray(frameSamples)
         val resampledMic = FloatArray(maxOutSamples)
         val delayedMicFloat = FloatArray(maxOutSamples)
@@ -508,7 +503,6 @@ class SolDualAudioEngine(private val context: Context) {
 
         val outPcmBytes = ByteArray((maxOutSamples + 4) * 4)
 
-        // Pre-allocated ring buffer for 0..200 ms Mic Lip-Sync Delay
         val maxDelaySamples = (sampleRate * 220) / 1000
         val delayRing = FloatArray(maxDelaySamples + maxOutSamples + 8)
         var delayWritePos = 0
@@ -525,7 +519,6 @@ class SolDualAudioEngine(private val context: Context) {
         var prevInMixR = 0.0f
         var limiterGain = 1.0f
 
-        // Zero-allocation output ring for AAC frames
         val packetPool = Array(32) { ByteBuffer.allocateDirect(4096) }
         val infoPool = Array(32) { MediaCodec.BufferInfo() }
         var poolIndex = 0
@@ -537,12 +530,11 @@ class SolDualAudioEngine(private val context: Context) {
 
         var duckSmoothGain = 1.0f
         var gameMuteSmooth = 1.0f
-        var micStartupFade = 0.0f // 30 ms anti-pop startup/switch ramp
+        var micStartupFade = 0.0f
         var wasStreamMicMuted = micDsp.streamMicMuted
         var prevUnmutedMicSample = 0.0f
         var micUnmuteRamp = 1.0f
 
-        // Sample-accurate AAC PTS timeline + 6-hour wall-clock lip-sync lock
         var audioAnchorInitialized = false
         var audioStartOffsetUs = 0L
         var totalSamplesQueued = 0L
@@ -564,7 +556,6 @@ class SolDualAudioEngine(private val context: Context) {
             onStatusChanged?.invoke(micStatusText)
 
             while (isRunning) {
-                // Handle live mic input switch or self-healing AudioRecord recreation
                 if (pendingMicRecreate) {
                     pendingMicRecreate = false
                     val rebuilt = recreateMicRecordSafely(micRecord, onStatusChanged)
@@ -575,7 +566,7 @@ class SolDualAudioEngine(private val context: Context) {
                     }
                 }
 
-                val curMic = micRecord
+                val curMic: AudioRecord? = micRecord
                 val readMic = curMic?.read(micFloat, 0, frameSamples, AudioRecord.READ_BLOCKING)
                     ?: AudioRecord.ERROR_INVALID_OPERATION
 
@@ -589,7 +580,6 @@ class SolDualAudioEngine(private val context: Context) {
                     }
                 } else {
                     consecutiveMicErrors++
-                    // Keep AAC & game audio uninterrupted for YouTube while mic recovers
                     try { Thread.sleep(10) } catch (_: Exception) {}
                     if (!audioAnchorInitialized) {
                         audioStartOffsetUs = max(0L, (System.nanoTime() / 1000L) - streamOriginUs)
@@ -613,11 +603,11 @@ class SolDualAudioEngine(private val context: Context) {
                 }
 
                 // Drain all pending non-blocking stereo game bursts into the drift-locked ring buffer
-                var curGame = gameRecord
-                if (curGame != null) {
+                if (gameRecord != null) {
                     var safetyReads = 0
                     while (safetyReads < 4) {
-                        val rg = curGame.read(gameStaging, 0, gameStaging.size, AudioRecord.READ_NON_BLOCKING)
+                        val activeGame: AudioRecord = gameRecord ?: break
+                        val rg = activeGame.read(gameStaging, 0, gameStaging.size, AudioRecord.READ_NON_BLOCKING)
                         if (rg > 0) {
                             gameRing.pushInterleaved(gameStaging, rg / 2)
                             safetyReads++
@@ -627,8 +617,7 @@ class SolDualAudioEngine(private val context: Context) {
                                 val nowGMs = System.currentTimeMillis()
                                 if (nowGMs - lastGameRecreateAttemptMs > 2000L) {
                                     lastGameRecreateAttemptMs = nowGMs
-                                    curGame = recreateGameRecordSafely(curGame, mediaProjection)
-                                    gameRecord = curGame
+                                    gameRecord = recreateGameRecordSafely(activeGame, mediaProjection)
                                 }
                             }
                             break
@@ -640,7 +629,6 @@ class SolDualAudioEngine(private val context: Context) {
                 val currentlyMuted = micDsp.streamMicMuted
                 micDsp.processMonoFrameInPlace(micFloat, validMicSamples)
 
-                // Guard against NaN/Inf & apply 5 ms clickless mute/unmute + 30 ms startup fade
                 if (!wasStreamMicMuted && currentlyMuted) {
                     var tail = prevUnmutedMicSample
                     val fadeLen = min(validMicSamples, 240)
@@ -672,7 +660,6 @@ class SolDualAudioEngine(private val context: Context) {
                     prevUnmutedMicSample = 0f
                 }
 
-                // Check multi-hour audio-to-video wall-clock alignment (slew +-1 sample only if drift >30 ms)
                 val wallElapsedUs = max(0L, (System.nanoTime() / 1000L) - streamOriginUs)
                 val samplePtsUs = audioStartOffsetUs + (totalSamplesQueued * 1_000_000L) / sampleRate
                 val wallDriftUs = wallElapsedUs - samplePtsUs
@@ -721,8 +708,7 @@ class SolDualAudioEngine(private val context: Context) {
                     delayedMicFloat
                 }
 
-                // Pull synchronized stereo game audio block
-                if (curGame != null && gameAudioActive) {
+                if (gameRecord != null && gameAudioActive) {
                     gameRing.pullSynchronizedBlock(gameBlockL, gameBlockR, outSamples)
                 } else {
                     gameBlockL.fill(0f, 0, outSamples)
@@ -737,7 +723,7 @@ class SolDualAudioEngine(private val context: Context) {
                 }
                 val targetGameMute = if (gameStreamMuted) 0.0f else 1.0f
                 val gLinear = gameGainLinear
-                val ceiling = 0.880f // -1.11 dBTP broadcast-safe ceiling
+                val ceiling = 0.880f
 
                 var blockGamePeak = 1e-5f
                 var blockMixTruePeak = 1e-5f
@@ -757,7 +743,6 @@ class SolDualAudioEngine(private val context: Context) {
                     val inMixL = gL + mCenter
                     val inMixR = gR + mCenter
 
-                    // Estimate inter-sample midpoint peak alongside sample peak
                     val midL = 0.5f * (inMixL + prevInMixL)
                     val midR = 0.5f * (inMixR + prevInMixR)
                     prevInMixL = inMixL
@@ -767,7 +752,6 @@ class SolDualAudioEngine(private val context: Context) {
                     if (estTruePeak > blockMixTruePeak) blockMixTruePeak = estTruePeak
                     val reqGain = if (estTruePeak > ceiling) ceiling / estTruePeak else 1.0f
 
-                    // Push incoming sample into 64-sample look-ahead delay line and pull delayed sample
                     lookBufL[lookIdx] = inMixL
                     lookBufR[lookIdx] = inMixR
                     lookReqGain[lookIdx] = reqGain
@@ -783,21 +767,18 @@ class SolDualAudioEngine(private val context: Context) {
                     }
 
                     if (minWindowGain < limiterGain) {
-                        // Smooth 1.33 ms look-ahead attack so gain reaches target right as peak arrives
                         limiterGain += 0.075f * (minWindowGain - limiterGain)
                         val delPeak = max(abs(delayedL), abs(delayedR))
                         if (delPeak * limiterGain > ceiling) {
                             limiterGain = ceiling / delPeak
                         }
                     } else {
-                        // Smooth ~85 ms transparent release
                         limiterGain += 0.0005f * (minWindowGain - limiterGain)
                     }
 
                     val outL = (delayedL * limiterGain).coerceIn(-0.99f, 0.99f)
                     val outR = (delayedR * limiterGain).coerceIn(-0.99f, 0.99f)
 
-                    // Tiny TPDF dither (+/- 0.5 LSB) prevents 16-bit quantization buzz on quiet fades
                     prngState = prngState xor (prngState shl 13)
                     prngState = prngState xor (prngState ushr 17)
                     prngState = prngState xor (prngState shl 5)
@@ -833,15 +814,13 @@ class SolDualAudioEngine(private val context: Context) {
                             onStatusChanged?.invoke(micStatusText)
                         }
                     }
-                    if (curMic != null && curGame != null &&
-                        curMic.getTimestamp(micTs, AudioTimestamp.TIMEBASE_MONOTONIC) == AudioRecord.SUCCESS &&
-                        curGame.getTimestamp(gameTs, AudioTimestamp.TIMEBASE_MONOTONIC) == AudioRecord.SUCCESS
-                    ) {
-                        // Net A/V sync offset in ms after ring-buffer alignment
-                        DiagnosticsLogger.avDriftMs = (wallElapsedUs - samplePtsUs) / 1000L
-                    } else {
-                        DiagnosticsLogger.avDriftMs = (wallElapsedUs - samplePtsUs) / 1000L
+                    val snapMic = curMic
+                    val snapGame = gameRecord
+                    if (snapMic != null && snapGame != null) {
+                        snapMic.getTimestamp(micTs, AudioTimestamp.TIMEBASE_MONOTONIC)
+                        snapGame.getTimestamp(gameTs, AudioTimestamp.TIMEBASE_MONOTONIC)
                     }
+                    DiagnosticsLogger.avDriftMs = (wallElapsedUs - samplePtsUs) / 1000L
                 }
 
                 // 5. Feed sample-accurate monotonic PCM into AAC Encoder
@@ -971,7 +950,6 @@ class SolDualAudioEngine(private val context: Context) {
         return null
     }
 
-    // === PRE-STREAM MIC TEST STUDIO (MICROPHONE-ONLY, NO MEDIAPROJECTION) ===
     companion object {
         private const val TEST_PCM_FILE = "solstream_mic_test.pcm"
 
@@ -1009,7 +987,7 @@ class SolDualAudioEngine(private val context: Context) {
                     FileOutputStream(outFile).use { fos ->
                         rec.startRecording()
                         val devName = engine.describeRoutedMic(rec.routedDevice)
-                        val totalFrames = 500 // 5.0 seconds (upgraded to 10s advisor in v1.1)
+                        val totalFrames = 500
                         for (step in 0 until totalFrames) {
                             val r = rec.read(frame, 0, frame.size, AudioRecord.READ_BLOCKING)
                             if (r <= 0) continue
@@ -1057,7 +1035,7 @@ class SolDualAudioEngine(private val context: Context) {
                 try {
                     val data = FileInputStream(file).use { it.readBytes() }
                     val durationMs = ((data.size / 2L) * 1000L) / 48000L
-                    track = AudioTrack.Builder()
+                    val builtTrack = AudioTrack.Builder()
                         .setAudioAttributes(
                             AudioAttributes.Builder()
                                 .setUsage(AudioAttributes.USAGE_MEDIA)
@@ -1074,8 +1052,9 @@ class SolDualAudioEngine(private val context: Context) {
                         .setBufferSizeInBytes(max(data.size, 9600))
                         .setTransferMode(AudioTrack.MODE_STATIC)
                         .build()
-                    track.write(data, 0, data.size)
-                    track.play()
+                    track = builtTrack
+                    builtTrack.write(data, 0, data.size)
+                    builtTrack.play()
                     Thread.sleep(durationMs + 150L)
                     onFinished("Playback finished.")
                 } catch (e: Exception) {
