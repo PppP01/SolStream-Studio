@@ -2,21 +2,24 @@ package com.solgaming.solstreamstudio
 
 import android.content.Context
 import android.content.SharedPreferences
+import android.os.Build
 import android.security.keystore.KeyGenParameterSpec
+import android.security.keystore.KeyInfo
 import android.security.keystore.KeyProperties
 import android.util.Base64
 import java.security.KeyStore
 import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
+import javax.crypto.SecretKeyFactory
 import javax.crypto.spec.GCMParameterSpec
 
 data class StreamSettings(
     val codec: String = "HEVC",          // "HEVC", "H264", "AV1"
-    val width: Int = 2560,               // 2560 or 1920
-    val height: Int = 1440,              // 1440 or 1080
+    val width: Int = 2560,               // 2560 or 1920 (3840 in v1.1 Ultra)
+    val height: Int = 1440,              // 1440 or 1080 (2160 in v1.1 Ultra)
     val fps: Int = 60,                   // 60 or 30
-    val targetBitrateKbps: Int = 20000,  // 12000..24000
+    val targetBitrateKbps: Int = 20000,  // 12000..24000 (up to 50000 for 4K)
     val adaptiveBitrate: Boolean = true,
     val useVbr: Boolean = false,         // false = CBR (default), true = VBR test
     val isVertical: Boolean = false,     // false = 16:9, true = 9:16
@@ -24,12 +27,12 @@ data class StreamSettings(
     val framingMode: String = "FIT",     // "FIT" (HUD safe), "FILL", "SMART"
     val smartZoomPercent: Int = 108,     // 100..122%
     val gpuSharpen: Boolean = false,     // Off by default for thermal budget
-    val audioBitrateKbps: Int = 160,     // 128, 160, 192, 256
+    val audioBitrateKbps: Int = 160,     // 128, 160, 192, 256, 320
     val micDeviceId: Int = -1,           // -1 = Auto / Built-in Phone Mic
     val micAudioSource: Int = 0,         // 0 = DEFAULT, 1 = MIC, 6 = VOICE_RECOGNITION
     val micSyncDelayMs: Int = 0,         // 0..200 ms lip-sync offset
     val voicePreset: String = "CLEAN",   // "RAW", "CLEAN", "STUDIO"
-    val hpfCutoffHz: Int = 85,           // 0 = Off, 75, 85, 100
+    val hpfCutoffHz: Int = 85,           // 0 = Off, 75, 85, 100, 125
     val noiseGateEnabled: Boolean = true,
     val rnnoiseLevel: Int = 0,           // 0 = Off (default), 1 = Low, 2 = Medium
     val voiceEqEnabled: Boolean = false,
@@ -50,7 +53,9 @@ object KeystoreVault {
 
     private const val KEY_ENC_URL = "enc_rtmps_url"
     private const val KEY_ENC_STREAM = "enc_stream_key"
-    const val DEFAULT_YOUTUBE_RTMPS = "rtmps://a.rtmp.youtube.com:443/live2"
+
+    const val DEFAULT_YOUTUBE_RTMPS = "rtmps://a.rtmps.youtube.com:443/live2"
+    const val BACKUP_YOUTUBE_RTMPS = "rtmps://b.rtmps.youtube.com:443/live2?backup=1"
 
     private fun prefs(context: Context): SharedPreferences =
         context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
@@ -71,6 +76,74 @@ object KeystoreVault {
             .build()
         keyGen.init(spec)
         return keyGen.generateKey()
+    }
+
+    /**
+     * Inspects Android Keystore KeyInfo to report verified backing rather than assuming hardware.
+     */
+    fun getKeySecurityDescription(): String {
+        return try {
+            val secretKey = getOrCreateSecretKey()
+            val factory = SecretKeyFactory.getInstance(secretKey.algorithm, ANDROID_KEYSTORE)
+            val keyInfo = factory.getKeySpec(secretKey, KeyInfo::class.java) as KeyInfo
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                when (keyInfo.securityLevel) {
+                    KeyProperties.SECURITY_LEVEL_STRONGBOX -> "StrongBox Hardware-Backed"
+                    KeyProperties.SECURITY_LEVEL_TRUSTED_ENVIRONMENT -> "Hardware-Backed (TEE)"
+                    KeyProperties.SECURITY_LEVEL_UNKNOWN_SECURE -> "Hardware-Backed (Secure)"
+                    KeyProperties.SECURITY_LEVEL_SOFTWARE -> "Software-Backed Keystore"
+                    else -> "Unknown Keystore Level"
+                }
+            } else {
+                @Suppress("DEPRECATION")
+                if (keyInfo.isInsideSecureHardware) {
+                    "Hardware-Backed (TEE)"
+                } else {
+                    "Software-Backed Keystore"
+                }
+            }
+        } catch (_: Exception) {
+            "Unknown Keystore Level"
+        }
+    }
+
+    /**
+     * Auto-corrects the v1.0.0 'rtmps://a.rtmp.youtube.com' hostname mismatch while keeping
+     * URLs with or without explicit ':443' intact.
+     */
+    fun normalizeIngestUrl(rawUrl: String): String {
+        val trimmed = rawUrl.trim().trimEnd('/')
+        if (trimmed.isEmpty()) return DEFAULT_YOUTUBE_RTMPS
+        return when {
+            trimmed.startsWith("rtmps://a.rtmp.youtube.com", ignoreCase = true) -> {
+                "rtmps://a.rtmps.youtube.com" + trimmed.substring("rtmps://a.rtmp.youtube.com".length)
+            }
+            trimmed.startsWith("rtmps://b.rtmp.youtube.com", ignoreCase = true) -> {
+                "rtmps://b.rtmps.youtube.com" + trimmed.substring("rtmps://b.rtmp.youtube.com".length)
+            }
+            else -> trimmed
+        }
+    }
+
+    /**
+     * Safely joins base RTMP/RTMPS URL and Stream Key even when query flags like '?backup=1' exist.
+     */
+    fun joinEndpointAndKey(baseUrl: String, streamKey: String): String {
+        val cleanKey = streamKey.trim().trimStart('/')
+        if (cleanKey.startsWith("rtmps://", ignoreCase = true) ||
+            cleanKey.startsWith("rtmp://", ignoreCase = true)
+        ) {
+            return normalizeIngestUrl(cleanKey)
+        }
+        val normalizedBase = normalizeIngestUrl(baseUrl)
+        val queryIdx = normalizedBase.indexOf('?')
+        return if (queryIdx >= 0) {
+            val pathPart = normalizedBase.substring(0, queryIdx).trimEnd('/')
+            val queryPart = normalizedBase.substring(queryIdx)
+            "$pathPart/$cleanKey$queryPart"
+        } else {
+            "${normalizedBase.trimEnd('/')}/$cleanKey"
+        }
     }
 
     private fun encrypt(plainText: String): String {
@@ -100,7 +173,7 @@ object KeystoreVault {
     }
 
     fun saveEndpointAndKey(context: Context, rtmpsUrl: String, streamKey: String) {
-        val cleanUrl = rtmpsUrl.trim().trimEnd('/').ifEmpty { DEFAULT_YOUTUBE_RTMPS }
+        val cleanUrl = normalizeIngestUrl(rtmpsUrl)
         val cleanKey = streamKey.trim().trimStart('/')
         prefs(context).edit()
             .putString(KEY_ENC_URL, encrypt(cleanUrl))
@@ -108,9 +181,19 @@ object KeystoreVault {
             .apply()
     }
 
+    fun clearStreamKey(context: Context) {
+        prefs(context).edit().remove(KEY_ENC_STREAM).apply()
+    }
+
     fun getRtmpsUrl(context: Context): String {
         val raw = prefs(context).getString(KEY_ENC_URL, null) ?: return DEFAULT_YOUTUBE_RTMPS
-        return decrypt(raw).ifBlank { DEFAULT_YOUTUBE_RTMPS }
+        val decrypted = decrypt(raw)
+        if (decrypted.isBlank()) return DEFAULT_YOUTUBE_RTMPS
+        val normalized = normalizeIngestUrl(decrypted)
+        if (normalized != decrypted) {
+            prefs(context).edit().putString(KEY_ENC_URL, encrypt(normalized)).apply()
+        }
+        return normalized
     }
 
     fun getStreamKey(context: Context): String {
@@ -121,11 +204,27 @@ object KeystoreVault {
     fun buildFullStreamEndpoint(context: Context): String? {
         val key = getStreamKey(context).trim()
         if (key.isEmpty()) return null
-        if (key.startsWith("rtmps://", ignoreCase = true) || key.startsWith("rtmp://", ignoreCase = true)) {
-            return key
+        return joinEndpointAndKey(getRtmpsUrl(context), key)
+    }
+
+    fun buildBackupStreamEndpoint(context: Context): String? {
+        val key = getStreamKey(context).trim()
+        if (key.isEmpty()) return null
+        if (key.startsWith("rtmps://", ignoreCase = true) ||
+            key.startsWith("rtmp://", ignoreCase = true)
+        ) {
+            return null
         }
-        val base = getRtmpsUrl(context).trimEnd('/')
-        return "$base/$key"
+        val primary = getRtmpsUrl(context)
+        return when {
+            primary.contains("a.rtmps.youtube.com", ignoreCase = true) -> {
+                joinEndpointAndKey(BACKUP_YOUTUBE_RTMPS, key)
+            }
+            primary.contains("a.rtmp.youtube.com", ignoreCase = true) -> {
+                joinEndpointAndKey("rtmp://b.rtmp.youtube.com/live2?backup=1", key)
+            }
+            else -> null
+        }
     }
 
     fun saveSettings(context: Context, s: StreamSettings) {
