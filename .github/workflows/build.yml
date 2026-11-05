@@ -42,29 +42,54 @@ jobs:
         with:
           gradle-version: '8.14'
 
-      - name: Compile Signed Release (R8 Shrunk) & Debug APKs
+      - name: Run Lint, Unit Tests & Compile Signed Release APK
         env:
           SIGNING_KEY_BASE64: ${{ secrets.SIGNING_KEY_BASE64 }}
           SIGNING_STORE_PASSWORD: ${{ secrets.SIGNING_STORE_PASSWORD }}
           SIGNING_KEY_ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
           SIGNING_KEY_PASSWORD: ${{ secrets.SIGNING_KEY_PASSWORD }}
         run: |
-          gradle assembleDebug assembleRelease -x lint -x lintVitalRelease -Pandroid.suppressUnsupportedCompileSdk=36,37 --no-daemon --stacktrace
+          gradle lintDebug testDebugUnitTest assembleDebug assembleRelease -Pandroid.suppressUnsupportedCompileSdk=36,37 --no-daemon --stacktrace
 
-      - name: Upload SolStream Studio Release APK
+      - name: Verify Permanent Release Signature & Stage Clean APK Names
+        run: |
+          SDK_ROOT="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          APKSIGNER="$(ls "$SDK_ROOT"/build-tools/*/apksigner | sort -V | tail -1)"
+          APP_VER="$(grep 'versionName =' app/build.gradle.kts | head -1 | cut -d'"' -f2)"
+          APP_VER="${APP_VER:-1.0.1}"
+          REL_APK="$(ls app/build/outputs/apk/release/*.apk | head -1)"
+          CERT_INFO="$("$APKSIGNER" verify --verbose --print-certs "$REL_APK")"
+          echo "$CERT_INFO"
+          if echo "$CERT_INFO" | grep -q "CN=Android Debug"; then
+            echo "::error::Release APK was signed with a Debug key! Check GitHub Secrets."
+            exit 1
+          fi
+          mkdir -p dist/release dist/debug
+          cp "$REL_APK" "dist/release/SolStream-Studio-v${APP_VER}.apk"
+          DBG_APK="$(ls app/build/outputs/apk/debug/*.apk | head -1)"
+          cp "$DBG_APK" "dist/debug/SolStream-Studio-v${APP_VER}-debug.apk"
+
+      - name: Upload SolStream Studio Signed Release APK
         uses: actions/upload-artifact@v4
         with:
           name: SolStream-Studio-Release-APK
-          path: app/build/outputs/apk/release/*.apk
+          path: dist/release/*.apk
 
       - name: Upload SolStream Studio Debug Fallback APK
         uses: actions/upload-artifact@v4
         with:
           name: SolStream-Studio-Debug-APK
-          path: app/build/outputs/apk/debug/*.apk
+          path: dist/debug/*.apk
+
+      - name: Upload Gradle Lint Report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: SolStream-Lint-Report
+          path: app/build/reports/lint-results-debug.html
 
       - name: Publish APK to GitHub Releases (When Tagged v*)
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: app/build/outputs/apk/release/*.apk
+          files: dist/release/*.apk
