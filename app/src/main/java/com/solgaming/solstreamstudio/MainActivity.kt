@@ -10,6 +10,7 @@ import android.content.pm.PackageManager
 import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
+import android.media.AudioManager
 import android.media.projection.MediaProjectionManager
 import android.net.Uri
 import android.os.Build
@@ -17,12 +18,12 @@ import android.os.Bundle
 import android.os.PowerManager
 import android.provider.Settings
 import android.text.InputType
+import android.text.method.PasswordTransformationMethod
 import android.util.TypedValue
 import android.view.Gravity
 import android.view.View
 import android.widget.Button
 import android.widget.EditText
-import android.widget.HorizontalScrollView
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
@@ -34,27 +35,38 @@ import androidx.core.content.ContextCompat
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
 import org.json.JSONObject
+import java.net.InetAddress
 import java.net.InetSocketAddress
+import java.net.Socket
+import java.net.URI
 import java.net.URL
+import java.util.Locale
+import java.util.concurrent.atomic.AtomicBoolean
 import javax.net.ssl.HttpsURLConnection
+import javax.net.ssl.SSLSocket
 import javax.net.ssl.SSLSocketFactory
 import kotlin.math.max
-import kotlin.math.min
 
 class MainActivity : AppCompatActivity() {
 
-    private val appVersionName = "1.0.0"
+    private lateinit var appVersionName: String
     private lateinit var settings: StreamSettings
     private lateinit var scanSummary: DeviceScanSummary
     private var micOptions: List<MicInputOption> = emptyList()
     private var showStreamKeyPlain = false
 
+    private val micTestBusy = AtomicBoolean(false)
+    private val netTestBusy = AtomicBoolean(false)
+
     // UI References for dynamic refresh
     private lateinit var tvLiveBanner: TextView
     private lateinit var btnReapproveCapture: Button
     private lateinit var tvPreflightStatus: TextView
+    private lateinit var tvVaultSecurityLabel: TextView
     private lateinit var etRtmpsUrl: EditText
     private lateinit var etStreamKey: EditText
+    private lateinit var btnShowHideKey: Button
+    private lateinit var btnNetTest: Button
     private lateinit var tvNetTestResult: TextView
 
     private lateinit var btnCodec: Button
@@ -109,11 +121,13 @@ class MainActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        DiagnosticsLogger.installPrivacySafeCrashHandler(this)
+        appVersionName = readAppVersionName()
 
         scanSummary = CodecCapabilityProbe.scanDevice(this)
         settings = KeystoreVault.loadSettings(this)
 
-        // First-launch Auto Hardware Scanner optimization
+        // First-launch Auto Hardware Scanner recommendation (user retains 100% manual control)
         if (!KeystoreVault.hasCompletedInitialAutoScan(this)) {
             settings = settings.copy(
                 codec = scanSummary.recommendedCodec,
@@ -139,6 +153,7 @@ class MainActivity : AppCompatActivity() {
         super.onResume()
         settings = KeystoreVault.loadSettings(this)
         micOptions = CodecCapabilityProbe.listAvailableMicInputs(this)
+        etRtmpsUrl.setText(KeystoreVault.getRtmpsUrl(this))
         refreshAllUi()
     }
 
@@ -147,6 +162,20 @@ class MainActivity : AppCompatActivity() {
             SolStreamService.onStateChangedListener = null
         }
         super.onDestroy()
+    }
+
+    private fun readAppVersionName(): String {
+        return try {
+            val info = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                packageManager.getPackageInfo(packageName, PackageManager.PackageInfoFlags.of(0))
+            } else {
+                @Suppress("DEPRECATION")
+                packageManager.getPackageInfo(packageName, 0)
+            }
+            info.versionName?.removeSuffix("-debug") ?: "1.0.1"
+        } catch (_: Exception) {
+            "1.0.1"
+        }
     }
 
     private fun buildDashboardUi(): View {
@@ -198,9 +227,14 @@ class MainActivity : AppCompatActivity() {
 
         btnReapproveCapture = actionButton("RE-APPROVE SCREEN CAPTURE TO RESUME VIDEO", "#E65100") {
             if (SolStreamService.isBroadcastLive) {
-                startService(Intent(this, SolStreamService::class.java).apply {
-                    action = SolStreamService.ACTION_STOP_STREAM
-                })
+                val liveSvc = SolStreamService.instance
+                if (liveSvc != null) {
+                    liveSvc.stopLiveBroadcast("Re-approving screen capture")
+                } else {
+                    startService(Intent(this, SolStreamService::class.java).apply {
+                        action = SolStreamService.ACTION_STOP_STREAM
+                    })
+                }
             }
             requestScreenCaptureAndGoLive()
         }.apply { visibility = View.GONE }
@@ -210,45 +244,60 @@ class MainActivity : AppCompatActivity() {
         container.addView(tvLiveBanner)
         container.addView(btnReapproveCapture)
 
-        // === CARD 1: PRE-FLIGHT PERMISSIONS & ONE UI HELPER ===
-        val cardPreflight = sectionCard("1. Pre-Flight Readiness & One UI Setup")
+        // === CARD 1: PRE-FLIGHT PERMISSIONS & DIRECT SETTINGS TELEPORTERS ===
+        val cardPreflight = sectionCard("1. Pre-Flight Readiness & Direct Settings Setup")
         tvPreflightStatus = bodyText("")
         cardPreflight.addView(tvPreflightStatus)
 
         val rowPerms = buttonRow(
-            actionButton("1. Grant Mic/Notif", "#1E3A5F") { requestRuntimePermissions() },
+            actionButton("1. Grant Mic & Notif", "#1E3A5F") { requestRuntimePermissions() },
             actionButton("2. Unrestricted Batt", "#1E3A5F") { openBatteryUnrestricted() }
         )
-        val rowAcc = buttonRow(
-            actionButton("3. Enable Accessibility", "#00695C") {
-                startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
-            },
-            actionButton("One UI Restricted Guide", "#37474F") { showSamsungSetupGuide() }
+        val rowRestrictedAndAcc = buttonRow(
+            actionButton("3. Unlock Restricted", "#283593") { openAppInfoForRestrictedSettings() },
+            actionButton("4. Enable Accessibility", "#00695C") { openAccessibilitySettingsDirect() }
         )
+        val btnSetupGuide = actionButton("Samsung One UI & Neckband Audio Setup Guide", "#37474F") {
+            showSamsungSetupGuide()
+        }
         cardPreflight.addView(rowPerms)
-        cardPreflight.addView(rowAcc)
+        cardPreflight.addView(rowRestrictedAndAcc)
+        cardPreflight.addView(btnSetupGuide)
         container.addView(cardPreflight)
 
-        // === CARD 2: YOUTUBE RTMPS & KEYSTORE VAULT ===
+        // === CARD 2: YOUTUBE RTMPS & ENCRYPTED STREAM KEY VAULT ===
         val cardStream = sectionCard("2. YouTube RTMPS & Encrypted Stream Key Vault")
-        cardStream.addView(labelText("RTMPS Ingest Server URL:"))
+        cardStream.addView(labelText("RTMPS Ingest Server URL (works with or without :443):"))
         etRtmpsUrl = styledEditText(KeystoreVault.getRtmpsUrl(this), isPassword = false)
         cardStream.addView(etRtmpsUrl)
 
-        cardStream.addView(labelText("Stream Key (AES-256 Encrypted in Hardware Keystore):"))
-        etStreamKey = styledEditText(KeystoreVault.getStreamKey(this), isPassword = true)
+        tvVaultSecurityLabel = labelText("Stream Key (AES-256-GCM • ${KeystoreVault.getKeySecurityDescription()}):")
+        cardStream.addView(tvVaultSecurityLabel)
+        etStreamKey = styledEditText(KeystoreVault.getStreamKey(this), isPassword = true).apply {
+            hint = "Paste or type your YouTube Stream Key"
+        }
         cardStream.addView(etStreamKey)
 
-        val rowKeyBtns = buttonRow(
+        btnShowHideKey = actionButton("Show Key", "#263238") { toggleKeyVisibility() }
+        val rowKeyBtnsTop = buttonRow(
             actionButton("Paste Key", "#263238") { pasteStreamKeyFromClipboard() },
-            actionButton("Show/Hide", "#263238") { toggleKeyVisibility() },
+            btnShowHideKey
+        )
+        val rowKeyBtnsBottom = buttonRow(
+            actionButton("Clear Key", "#455A64") { clearStreamKeyInput() },
             actionButton("Save Vault", "#00695C") { saveVaultInputs(showToast = true) }
         )
-        cardStream.addView(rowKeyBtns)
+        cardStream.addView(rowKeyBtnsTop)
+        cardStream.addView(rowKeyBtnsBottom)
 
-        tvNetTestResult = bodyText("Tip: Use a Custom 1440p60 Stream Key in YouTube Studio (Low-latency ON, Auto-stop OFF, Auto Dual-Format ON).")
+        tvNetTestResult = bodyText(
+            "Tip: Create a reusable Custom 1440p60 Stream Key in YouTube Studio (Low-latency ON, Auto-stop OFF, Auto Dual-Format ON)."
+        )
+        btnNetTest = actionButton("Test Internet RTMPS Ping & Upload", "#1565C0") {
+            runRtmpsNetworkCheck()
+        }
         val rowNetBtns = buttonRow(
-            actionButton("Test Airtel RTMPS Ping & Jitter", "#1565C0") { runRtmpsNetworkCheck() },
+            btnNetTest,
             actionButton("Reset Default URL", "#37474F") {
                 etRtmpsUrl.setText(KeystoreVault.DEFAULT_YOUTUBE_RTMPS)
                 saveVaultInputs(showToast = true)
@@ -260,17 +309,25 @@ class MainActivity : AppCompatActivity() {
 
         // === CARD 3: VIDEO, 120->60 FPS PACING & CODM HUD FRAMING ===
         val cardVideo = sectionCard("3. Video Encoder, Bitrate & CODM HUD Framing")
-        cardVideo.addView(bodyText("CODM stays at 120 FPS on your screen while the hardware encoder paces YouTube output cleanly at 60 or 30 FPS."))
+        cardVideo.addView(
+            bodyText("CODM stays at 120 FPS on your screen while the hardware encoder paces YouTube output cleanly at 60 or 30 FPS.")
+        )
 
         btnCodec = actionButton("", "#1C2836") { cycleCodec() }
         btnResolution = actionButton("", "#1C2836") { cycleResolution() }
         btnFps = actionButton("", "#1C2836") {
-            updateSetting(settings.copy(fps = if (settings.fps == 60) 30 else 60))
+            updateSetting(
+                settings.copy(fps = if (settings.fps == 60) 30 else 60),
+                requiresRestartIfLive = true
+            )
         }
         btnOrientationFlip = actionButton("", "#1C2836") { cycleOrientationAndFlip() }
         btnBitrate = actionButton("", "#1B5E20") { cycleBitrate() }
         btnRateControl = actionButton("", "#1C2836") {
-            updateSetting(settings.copy(useVbr = !settings.useVbr))
+            updateSetting(
+                settings.copy(useVbr = !settings.useVbr),
+                requiresRestartIfLive = true
+            )
         }
         btnAbr = actionButton("", "#1C2836") {
             updateSetting(settings.copy(adaptiveBitrate = !settings.adaptiveBitrate))
@@ -291,7 +348,9 @@ class MainActivity : AppCompatActivity() {
 
         // === CARD 4: 32-BIT FLOAT STUDIO AUDIO & MIC TEST STUDIO ===
         val cardAudio = sectionCard("4. 32-Bit Float Studio Audio & 5s Mic Test Studio")
-        cardAudio.addView(bodyText("Mic filters process ONLY your voice before mixing with stereo CODM gameplay. Nothing alters what you hear in your earphones."))
+        cardAudio.addView(
+            bodyText("Mic filters process ONLY your voice before mixing with stereo CODM gameplay. Nothing alters what you hear in your earphones.")
+        )
 
         btnMicDevice = actionButton("", "#1C2836") { cycleMicInputDevice() }
         btnMicSource = actionButton("", "#1C2836") { cycleMicSourceMode() }
@@ -318,13 +377,15 @@ class MainActivity : AppCompatActivity() {
         cardAudio.addView(buttonRow(btnDucking, btnMicDelay))
         cardAudio.addView(btnExtraToggles)
 
-        tvMicTestStatus = bodyText("Mic Test Studio: Hold phone in your normal 2-hand CODM grip with fan running & Bypass Charging plugged in.")
+        tvMicTestStatus = bodyText("Mic Test Studio: Hold phone in your normal 2-hand CODM grip to test voice clarity & noise floor.")
         val rowMicTest = buttonRow(
             actionButton("Record 5s Test", "#00695C") { runFiveSecMicTest() },
             actionButton("Play Test", "#1565C0") { playMicTestSample() },
             actionButton("Delete", "#37474F") {
-                SolDualAudioEngine.deleteMicTestFile(this)
-                tvMicTestStatus.text = "Saved test sample deleted."
+                if (!micTestBusy.get()) {
+                    SolDualAudioEngine.deleteMicTestFile(this)
+                    tvMicTestStatus.text = "Saved test sample deleted."
+                }
             }
         )
         cardAudio.addView(tvMicTestStatus)
@@ -343,7 +404,7 @@ class MainActivity : AppCompatActivity() {
         }
         cardLaunch.addView(btnGoLive)
 
-        btnGlipBench = actionButton("Start Glip Comparison Benchmark", "#37474F") {
+        btnGlipBench = actionButton("Start Glip Benchmark", "#37474F") {
             toggleGlipBenchmark()
         }
 
@@ -365,14 +426,30 @@ class MainActivity : AppCompatActivity() {
         cardLaunch.addView(rowUpdate)
         container.addView(cardLaunch)
 
+        // === FOOTER ===
+        val footer = TextView(this).apply {
+            text = "Made by Sol (@Sol_CODM) • Open-Source Zero-Ad Broadcast Studio"
+            setTextColor(Color.parseColor("#78909C"))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f)
+            gravity = Gravity.CENTER
+            setPadding(0, dp(16), 0, dp(8))
+        }
+        container.addView(footer)
+
         rootScroll.addView(container)
         return rootScroll
     }
 
     private fun refreshAllUi() {
-        val micGranted = ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+        val micGranted = ContextCompat.checkSelfPermission(
+            this,
+            Manifest.permission.RECORD_AUDIO
+        ) == PackageManager.PERMISSION_GRANTED
         val notifGranted = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
+            ContextCompat.checkSelfPermission(
+                this,
+                Manifest.permission.POST_NOTIFICATIONS
+            ) == PackageManager.PERMISSION_GRANTED
         } else true
         val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
         val battUnrestricted = pm.isIgnoringBatteryOptimizations(packageName)
@@ -392,7 +469,10 @@ class MainActivity : AppCompatActivity() {
 
         tvPreflightStatus.text =
             "• Mic Permission: ${okWait(micGranted)}   • Notifications: ${okWait(notifGranted)}\n" +
-            "• Battery Unrestricted: ${okWait(battUnrestricted)}   • Accessibility Service: ${okWait(accEnabled)}"
+                "• Battery Unrestricted: ${okWait(battUnrestricted)}   • Accessibility Service: ${okWait(accEnabled)}"
+
+        tvVaultSecurityLabel.text = "Stream Key (AES-256-GCM • ${KeystoreVault.getKeySecurityDescription()}):"
+        btnShowHideKey.text = if (showStreamKeyPlain) "Hide Key" else "Show Key"
 
         val av1Available = scanSummary.av1Hardware != null &&
             (scanSummary.av1Hardware?.supports1440p60 == true || scanSummary.av1Hardware?.supports1080p60 == true)
@@ -421,7 +501,7 @@ class MainActivity : AppCompatActivity() {
         btnVoicePreset.text = "Voice: ${settings.voicePreset}"
         btnHpf.text = if (settings.hpfCutoffHz == 0) "HPF Rumble: OFF" else "HPF: ${settings.hpfCutoffHz} Hz"
         val nsText = when (settings.rnnoiseLevel) { 1 -> "LOW"; 2 -> "MED"; else -> "OFF" }
-        btnNoiseSuppress.text = "Fan Suppress: $nsText"
+        btnNoiseSuppress.text = "Light Noise Cut: $nsText"
         btnGateComp.text = "Gate:${onOff(settings.noiseGateEnabled)} | Comp:${onOff(settings.compressorEnabled)}"
         btnEqDeEss.text = "Podcast Voice EQ: ${onOff(settings.voiceEqEnabled)} | De-Esser: ${onOff(settings.deEsserEnabled)}"
         btnMicGain.text = "Mic Boost: ${settings.micGainPercent}%"
@@ -445,10 +525,17 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun updateSetting(newSettings: StreamSettings) {
+    private fun updateSetting(newSettings: StreamSettings, requiresRestartIfLive: Boolean = false) {
         settings = newSettings
         KeystoreVault.saveSettings(this, settings)
         refreshAllUi()
+        if (SolStreamService.isBroadcastLive && requiresRestartIfLive) {
+            Toast.makeText(
+                this,
+                "Saved for next stream! Use the in-game Floating Pill for live adjustments.",
+                Toast.LENGTH_SHORT
+            ).show()
+        }
     }
 
     // === CYCLERS ===
@@ -457,16 +544,17 @@ class MainActivity : AppCompatActivity() {
             (scanSummary.av1Hardware?.supports1440p60 == true || scanSummary.av1Hardware?.supports1080p60 == true)
         val order = if (av1Ok) listOf("HEVC", "H264", "AV1") else listOf("HEVC", "H264")
         val next = order[(order.indexOf(settings.codec) + 1) % order.size]
-        updateSetting(settings.copy(codec = next))
+        updateSetting(settings.copy(codec = next), requiresRestartIfLive = true)
     }
 
     private fun cycleResolution() {
         val is1440 = max(settings.width, settings.height) >= 2560
-        if (is1440) {
-            updateSetting(settings.copy(width = 1920, height = 1080))
+        val updated = if (is1440) {
+            settings.copy(width = 1920, height = 1080)
         } else {
-            updateSetting(settings.copy(width = 2560, height = 1440))
+            settings.copy(width = 2560, height = 1440)
         }
+        updateSetting(updated, requiresRestartIfLive = true)
     }
 
     private fun cycleOrientationAndFlip() {
@@ -474,9 +562,9 @@ class MainActivity : AppCompatActivity() {
             !settings.isVertical && settings.landscapeFlip == 0 ->
                 updateSetting(settings.copy(isVertical = false, landscapeFlip = 180))
             !settings.isVertical && settings.landscapeFlip == 180 ->
-                updateSetting(settings.copy(isVertical = true, landscapeFlip = 0))
+                updateSetting(settings.copy(isVertical = true, landscapeFlip = 0), requiresRestartIfLive = true)
             else ->
-                updateSetting(settings.copy(isVertical = false, landscapeFlip = 0))
+                updateSetting(settings.copy(isVertical = false, landscapeFlip = 0), requiresRestartIfLive = true)
         }
     }
 
@@ -519,9 +607,9 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun cycleAudioBitrate() {
-        val rates = listOf(128, 160, 192, 256)
+        val rates = listOf(128, 160, 192, 256, 320)
         val next = rates[(rates.indexOf(settings.audioBitrateKbps) + 1) % rates.size]
-        updateSetting(settings.copy(audioBitrateKbps = next))
+        updateSetting(settings.copy(audioBitrateKbps = next), requiresRestartIfLive = true)
     }
 
     private fun cycleVoicePreset() {
@@ -601,16 +689,27 @@ class MainActivity : AppCompatActivity() {
         updateSetting(settings.copy(brbMuteMicToo = brbMute, wifiLowLatencyLock = wifiLow))
     }
 
-    // === ACTIONS ===
+    // === VAULT & KEY VISIBILITY ACTIONS ===
     private fun saveVaultInputs(showToast: Boolean) {
-        KeystoreVault.saveEndpointAndKey(
-            this,
-            etRtmpsUrl.text?.toString() ?: KeystoreVault.DEFAULT_YOUTUBE_RTMPS,
-            etStreamKey.text?.toString() ?: ""
-        )
+        val rawUrl = etRtmpsUrl.text?.toString() ?: KeystoreVault.DEFAULT_YOUTUBE_RTMPS
+        val normalizedUrl = KeystoreVault.normalizeIngestUrl(rawUrl)
+        val cleanKey = etStreamKey.text?.toString()?.trim()?.trimStart('/') ?: ""
+        etRtmpsUrl.setText(normalizedUrl)
+        KeystoreVault.saveEndpointAndKey(this, normalizedUrl, cleanKey)
         if (showToast) {
-            Toast.makeText(this, "RTMPS URL & Stream Key encrypted in Keystore!", Toast.LENGTH_SHORT).show()
+            val msg = if (cleanKey.isEmpty()) {
+                "Ingest URL saved (Stream Key box is currently empty)."
+            } else {
+                "RTMPS URL & Stream Key encrypted in Keystore!"
+            }
+            Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
         }
+    }
+
+    private fun clearStreamKeyInput() {
+        etStreamKey.setText("")
+        KeystoreVault.clearStreamKey(this)
+        Toast.makeText(this, "Saved Stream Key cleared. Ready to enter a new key.", Toast.LENGTH_SHORT).show()
     }
 
     private fun pasteStreamKeyFromClipboard() {
@@ -618,6 +717,7 @@ class MainActivity : AppCompatActivity() {
         val txt = cm.primaryClip?.getItemAt(0)?.coerceToText(this)?.toString()?.trim()
         if (!txt.isNullOrEmpty()) {
             etStreamKey.setText(txt)
+            etStreamKey.setSelection(etStreamKey.text?.length ?: 0)
             saveVaultInputs(showToast = true)
         } else {
             Toast.makeText(this, "Clipboard is empty.", Toast.LENGTH_SHORT).show()
@@ -626,25 +726,72 @@ class MainActivity : AppCompatActivity() {
 
     private fun toggleKeyVisibility() {
         showStreamKeyPlain = !showStreamKeyPlain
-        etStreamKey.inputType = if (showStreamKeyPlain) {
-            InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD
+        if (showStreamKeyPlain) {
+            etStreamKey.inputType = InputType.TYPE_CLASS_TEXT or
+                InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD or
+                InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+            etStreamKey.transformationMethod = null
+            btnShowHideKey.text = "Hide Key"
         } else {
-            InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+            etStreamKey.inputType = InputType.TYPE_CLASS_TEXT or
+                InputType.TYPE_TEXT_VARIATION_PASSWORD or
+                InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+            etStreamKey.transformationMethod = PasswordTransformationMethod.getInstance()
+            btnShowHideKey.text = "Show Key"
         }
         etStreamKey.setSelection(etStreamKey.text?.length ?: 0)
     }
 
+    // === DIRECT PERMISSION & SETTINGS TELEPORTERS ===
+    private fun openAppInfoForRestrictedSettings() {
+        try {
+            Toast.makeText(
+                this,
+                "Tap ⋮ (top-right) -> 'Allow restricted settings'!",
+                Toast.LENGTH_LONG
+            ).show()
+            startActivity(
+                Intent(
+                    Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                    Uri.parse("package:$packageName")
+                )
+            )
+        } catch (_: Exception) {
+            startActivity(Intent(Settings.ACTION_SETTINGS))
+        }
+    }
+
+    private fun openAccessibilitySettingsDirect() {
+        try {
+            if (!isAccessibilityServiceEnabled()) {
+                Toast.makeText(
+                    this,
+                    "Tap Installed apps -> SolStream Studio -> Turn ON",
+                    Toast.LENGTH_LONG
+                ).show()
+            }
+            startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+        } catch (_: Exception) {
+            startActivity(Intent(Settings.ACTION_SETTINGS))
+        }
+    }
+
     private fun onGoLiveClicked() {
         if (SolStreamService.isBroadcastLive) {
-            startService(Intent(this, SolStreamService::class.java).apply {
-                action = SolStreamService.ACTION_STOP_STREAM
-            })
+            val liveSvc = SolStreamService.instance
+            if (liveSvc != null) {
+                liveSvc.stopLiveBroadcast("Stopped from dashboard")
+            } else {
+                startService(Intent(this, SolStreamService::class.java).apply {
+                    action = SolStreamService.ACTION_STOP_STREAM
+                })
+            }
             return
         }
 
         saveVaultInputs(showToast = false)
         if (KeystoreVault.buildFullStreamEndpoint(this).isNullOrBlank()) {
-            Toast.makeText(this, "Please paste your YouTube Stream Key first!", Toast.LENGTH_LONG).show()
+            Toast.makeText(this, "Please paste or type your Stream Key first!", Toast.LENGTH_LONG).show()
             return
         }
 
@@ -654,18 +801,32 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
+        // Non-blocking Silent-Stream Launch Guard
+        try {
+            val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+            val mediaVol = am.getStreamVolume(AudioManager.STREAM_MUSIC)
+            if (mediaVol == 0 || settings.gameGainPercent == 0) {
+                Toast.makeText(
+                    this,
+                    "Heads up: Phone Media Volume or Game Mix is at 0% (game audio will be quiet).",
+                    Toast.LENGTH_LONG
+                ).show()
+            }
+        } catch (_: Exception) {
+        }
+
         if (!isAccessibilityServiceEnabled()) {
             AlertDialog.Builder(this)
                 .setTitle("Enable Accessibility Service First")
                 .setMessage(
                     "SolStream Studio uses Android's Accessibility Overlay to display your floating live pill in CODM and keep microphone sharing active alongside squad voice chat.\n\n" +
-                    "Enable SolStream Studio in Accessibility Settings now?"
+                        "Tip: If Android greys out the switch, tap SolStream Studio once in Accessibility, then tap '1. Unlock Restricted' below to jump straight to App Info (⋮ -> Allow restricted settings)."
                 )
-                .setPositiveButton("Open Accessibility") { _, _ ->
-                    startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+                .setPositiveButton("2. Open Accessibility") { _, _ ->
+                    openAccessibilitySettingsDirect()
                 }
-                .setNeutralButton("One UI Restricted Help") { _, _ ->
-                    showSamsungSetupGuide()
+                .setNeutralButton("1. Unlock Restricted") { _, _ ->
+                    openAppInfoForRestrictedSettings()
                 }
                 .setNegativeButton("Stream Without Overlay") { _, _ ->
                     requestScreenCaptureAndGoLive()
@@ -691,19 +852,33 @@ class MainActivity : AppCompatActivity() {
             requestRuntimePermissions()
             return
         }
+        if (!micTestBusy.compareAndSet(false, true)) {
+            Toast.makeText(this, "Mic test is already running...", Toast.LENGTH_SHORT).show()
+            return
+        }
         tvMicTestStatus.text = "Starting 5-second CODM grip mic recording..."
         SolDualAudioEngine.recordFiveSecondMicTest(
             context = this,
             settings = settings,
-            onProgress = { msg -> runOnUiThread { if (!isFinishing) tvMicTestStatus.text = msg } },
-            onComplete = { _, summary -> runOnUiThread { if (!isFinishing) tvMicTestStatus.text = summary } }
+            onProgress = { msg ->
+                runOnUiThread { if (!isFinishing && !isDestroyed) tvMicTestStatus.text = msg }
+            },
+            onComplete = { _, summary ->
+                micTestBusy.set(false)
+                runOnUiThread { if (!isFinishing && !isDestroyed) tvMicTestStatus.text = summary }
+            }
         )
     }
 
     private fun playMicTestSample() {
+        if (!micTestBusy.compareAndSet(false, true)) {
+            Toast.makeText(this, "Audio test busy...", Toast.LENGTH_SHORT).show()
+            return
+        }
         tvMicTestStatus.text = "Playing recorded 5s mic sample..."
         SolDualAudioEngine.playRecordedMicTest(this) { msg ->
-            runOnUiThread { if (!isFinishing) tvMicTestStatus.text = msg }
+            micTestBusy.set(false)
+            runOnUiThread { if (!isFinishing && !isDestroyed) tvMicTestStatus.text = msg }
         }
     }
 
@@ -720,35 +895,185 @@ class MainActivity : AppCompatActivity() {
         startService(Intent(this, SolStreamService::class.java).apply { action = act })
     }
 
+    // === REAL TLS + SNI HANDSHAKE & UPLOAD BUFFERBLOAT PRE-FLIGHT ===
+    private fun parseIngestHostPort(rawUrl: String): Triple<Boolean, String, Int> {
+        val clean = KeystoreVault.normalizeIngestUrl(rawUrl)
+        return try {
+            val uri = URI(clean)
+            val scheme = (uri.scheme ?: "rtmps").lowercase(Locale.US)
+            val isTls = scheme == "rtmps"
+            val host = uri.host?.takeIf { it.isNotBlank() } ?: "a.rtmps.youtube.com"
+            val port = if (uri.port > 0) uri.port else if (isTls) 443 else 1935
+            Triple(isTls, host, port)
+        } catch (_: Exception) {
+            Triple(true, "a.rtmps.youtube.com", 443)
+        }
+    }
+
+    private fun measureSingleTcpRttMs(addr: InetSocketAddress, timeoutMs: Int = 3000): Long {
+        val sock = Socket()
+        return try {
+            val t0 = System.nanoTime()
+            sock.connect(addr, timeoutMs)
+            (System.nanoTime() - t0) / 1_000_000L
+        } finally {
+            try { sock.close() } catch (_: Exception) {}
+        }
+    }
+
     private fun runRtmpsNetworkCheck() {
-        tvNetTestResult.text = "Testing TLS handshake & jitter to YouTube RTMPS (a.rtmp.youtube.com:443)..."
+        if (!netTestBusy.compareAndSet(false, true)) {
+            Toast.makeText(this, "Internet check already running...", Toast.LENGTH_SHORT).show()
+            return
+        }
+        saveVaultInputs(showToast = false)
+        val (isTls, host, port) = parseIngestHostPort(etRtmpsUrl.text?.toString() ?: KeystoreVault.DEFAULT_YOUTUBE_RTMPS)
+        btnNetTest.isEnabled = false
+        tvNetTestResult.text = "Step 1/3: Resolving DNS & verifying ${if (isTls) "TLS" else "TCP"} handshake to $host:$port..."
+
         Thread({
-            val samples = mutableListOf<Long>()
             try {
-                repeat(4) {
-                    val t0 = System.nanoTime()
-                    SSLSocketFactory.getDefault().createSocket().use { sock ->
-                        sock.connect(InetSocketAddress("a.rtmp.youtube.com", 443), 3000)
+                // 1. DNS Resolution
+                val dnsStartNs = System.nanoTime()
+                val resolvedIp = InetAddress.getByName(host)
+                val dnsMs = (System.nanoTime() - dnsStartNs) / 1_000_000L
+                val targetAddr = InetSocketAddress(resolvedIp, port)
+
+                // 2. Real TLS Handshake + Certificate & SNI Verification (if rtmps://)
+                var tlsInfo = "Plain RTMP (No TLS)"
+                if (isTls) {
+                    val rawSock = Socket()
+                    var sslSock: SSLSocket? = null
+                    try {
+                        val t0 = System.nanoTime()
+                        rawSock.connect(targetAddr, 3500)
+                        val factory = SSLSocketFactory.getDefault() as SSLSocketFactory
+                        val createdSsl = factory.createSocket(rawSock, host, port, true) as SSLSocket
+                        sslSock = createdSsl
+                        val params = createdSsl.sslParameters
+                        params.endpointIdentificationAlgorithm = "HTTPS"
+                        createdSsl.sslParameters = params
+                        createdSsl.soTimeout = 4500
+                        createdSsl.startHandshake()
+                        val hsMs = (System.nanoTime() - t0) / 1_000_000L
+                        tlsInfo = "${createdSsl.session.protocol} Verified (${hsMs}ms)"
+                    } finally {
+                        try { sslSock?.close() } catch (_: Exception) {}
+                        try { rawSock.close() } catch (_: Exception) {}
                     }
-                    val ms = (System.nanoTime() - t0) / 1_000_000L
-                    samples.add(ms)
                 }
-                val avg = samples.average().toLong()
-                val jitter = (samples.maxOrNull() ?: avg) - (samples.minOrNull() ?: avg)
-                val advice = when {
-                    avg < 85 && jitter < 30 -> "Excellent headroom! Safe to run 20–22 Mbps 1440p60."
-                    avg < 150 && jitter < 65 -> "Good stability. 18–20 Mbps with Queue ABR ON recommended."
-                    else -> "High Wi-Fi jitter detected (${jitter}ms). Use 16–18 Mbps Stable mode."
+
+                // 3. Idle 1-RTT Ping & Jitter (4 samples)
+                val idleSamples = mutableListOf<Long>()
+                repeat(4) {
+                    idleSamples.add(measureSingleTcpRttMs(targetAddr, 3000))
                 }
+                val idleAvgMs = idleSamples.average().toLong()
+                val idleJitterMs = (idleSamples.maxOrNull() ?: idleAvgMs) - (idleSamples.minOrNull() ?: idleAvgMs)
+
                 runOnUiThread {
-                    if (!isFinishing) {
-                        tvNetTestResult.text = "YouTube RTMPS TLS RTT: ${avg}ms avg | Jitter: ${jitter}ms — $advice"
+                    if (!isFinishing && !isDestroyed) {
+                        tvNetTestResult.text = "Step 2/3: $tlsInfo | Idle Ping ${idleAvgMs}ms — testing upload Mbps & bufferbloat..."
+                    }
+                }
+
+                // 4. Sustained Upload Capacity & Loaded RTT Bufferbloat Test (against speed-test endpoint)
+                var uploadMbps = -1.0
+                var loadedRttMs = -1L
+                val probeDone = AtomicBoolean(false)
+
+                val loadedPingThread = Thread({
+                    val loadedList = mutableListOf<Long>()
+                    try {
+                        Thread.sleep(220)
+                        while (!probeDone.get() && loadedList.size < 3) {
+                            loadedList.add(measureSingleTcpRttMs(targetAddr, 2500))
+                            Thread.sleep(200)
+                        }
+                    } catch (_: Exception) {
+                    }
+                    if (loadedList.isNotEmpty()) {
+                        loadedRttMs = loadedList.average().toLong()
+                    }
+                }, "SolBloatPing")
+
+                var upConn: HttpsURLConnection? = null
+                try {
+                    val totalBytes = 2 * 1024 * 1024 // 2.0 MB sustained upload burst
+                    val chunk = ByteArray(16 * 1024) { 0x5A.toByte() }
+                    upConn = (URL("https://speed.cloudflare.com/__up").openConnection() as HttpsURLConnection).apply {
+                        requestMethod = "POST"
+                        doOutput = true
+                        useCaches = false
+                        connectTimeout = 4000
+                        readTimeout = 8000
+                        setRequestProperty("Content-Type", "application/octet-stream")
+                        setFixedLengthStreamingMode(totalBytes)
+                    }
+                    loadedPingThread.start()
+                    val upStartNs = System.nanoTime()
+                    upConn.outputStream.use { os ->
+                        var sent = 0
+                        while (sent < totalBytes) {
+                            val toWrite = if (totalBytes - sent < chunk.size) totalBytes - sent else chunk.size
+                            os.write(chunk, 0, toWrite)
+                            sent += toWrite
+                        }
+                        os.flush()
+                    }
+                    val code = upConn.responseCode
+                    val upSec = max(0.05, (System.nanoTime() - upStartNs) / 1_000_000_000.0)
+                    if (code in 200..299) {
+                        uploadMbps = (totalBytes * 8.0) / (upSec * 1_000_000.0)
+                    }
+                } catch (_: Exception) {
+                    // Speed-test endpoint blocked/unreachable; still report verified YouTube TLS metrics
+                } finally {
+                    probeDone.set(true)
+                    try { loadedPingThread.join(1200) } catch (_: Exception) {}
+                    try { upConn?.disconnect() } catch (_: Exception) {}
+                }
+
+                val bloatDeltaMs = if (loadedRttMs > 0L) max(0L, loadedRttMs - idleAvgMs) else -1L
+                val advice = when {
+                    uploadMbps > 0.0 && uploadMbps < 14.0 ->
+                        "Upload measured ${String.format(Locale.US, "%.1f", uploadMbps)} Mbps: use 1080p60 @ 10–12 Mbps + ABR ON."
+                    bloatDeltaMs > 65L ->
+                        "Router bufferbloat +${bloatDeltaMs}ms under upload: set Bitrate 20–25% below max upload & keep Queue ABR ON."
+                    uploadMbps >= 26.0 && idleAvgMs < 95 && idleJitterMs < 35 ->
+                        "Excellent headroom! Safe for crisp 20–24 Mbps 1440p60."
+                    idleAvgMs < 150 && idleJitterMs < 65 ->
+                        "Solid connection! 18–20 Mbps 1440p60 with Queue ABR ON recommended."
+                    else ->
+                        "High Wi-Fi jitter (${idleJitterMs}ms): use 16 Mbps Stable + 5GHz Wi-Fi."
+                }
+
+                val summary = buildString {
+                    append("DNS: ${dnsMs}ms | $tlsInfo | Ping: ${idleAvgMs}ms (Jitter ${idleJitterMs}ms)")
+                    if (uploadMbps > 0.0) {
+                        append(" | Upload: ${String.format(Locale.US, "%.1f", uploadMbps)} Mbps")
+                    }
+                    if (bloatDeltaMs >= 0L) {
+                        append(" | Load Ping: +${bloatDeltaMs}ms")
+                    }
+                    append("\n-> $advice")
+                }
+
+                DiagnosticsLogger.log("NET_CHECK", summary.replace('\n', ' '))
+                runOnUiThread {
+                    netTestBusy.set(false)
+                    if (!isFinishing && !isDestroyed) {
+                        btnNetTest.isEnabled = true
+                        tvNetTestResult.text = summary
                     }
                 }
             } catch (e: Exception) {
                 runOnUiThread {
-                    if (!isFinishing) {
-                        tvNetTestResult.text = "RTMPS ping failed (${e.javaClass.simpleName}). Check 5GHz Wi-Fi."
+                    netTestBusy.set(false)
+                    if (!isFinishing && !isDestroyed) {
+                        btnNetTest.isEnabled = true
+                        tvNetTestResult.text =
+                            "Ingest check failed (${e.javaClass.simpleName}: ${e.message ?: "check internet"}). Verify URL & 5GHz Wi-Fi."
                     }
                 }
             }
@@ -775,7 +1100,7 @@ class MainActivity : AppCompatActivity() {
             .setPositiveButton("Copy Report") { _, _ ->
                 val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
                 cm.setPrimaryClip(ClipData.newPlainText("SolStream Report", report))
-                Toast.makeText(this, "Report copied! Safe to paste to Gemini or ChatGPT.", Toast.LENGTH_LONG).show()
+                Toast.makeText(this, "Report copied! Safe to paste anywhere.", Toast.LENGTH_LONG).show()
             }
             .setNeutralButton("Share") { _, _ ->
                 val send = Intent(Intent.ACTION_SEND).apply {
@@ -788,11 +1113,24 @@ class MainActivity : AppCompatActivity() {
             .show()
     }
 
+    private fun isRemoteVersionNewer(remoteRaw: String, localRaw: String): Boolean {
+        val rParts = remoteRaw.trim().removePrefix("v").substringBefore('-').split('.').map { it.toIntOrNull() ?: 0 }
+        val lParts = localRaw.trim().removePrefix("v").substringBefore('-').split('.').map { it.toIntOrNull() ?: 0 }
+        val count = max(rParts.size, lParts.size)
+        for (i in 0 until count) {
+            val rv = rParts.getOrElse(i) { 0 }
+            val lv = lParts.getOrElse(i) { 0 }
+            if (rv != lv) return rv > lv
+        }
+        return false
+    }
+
     private fun checkGitHubReleaseUpdate() {
         Toast.makeText(this, "Checking PppP01/SolStream-Studio releases...", Toast.LENGTH_SHORT).show()
         Thread({
+            var conn: HttpsURLConnection? = null
             try {
-                val conn = (URL("https://api.github.com/repos/PppP01/SolStream-Studio/releases/latest")
+                conn = (URL("https://api.github.com/repos/PppP01/SolStream-Studio/releases/latest")
                     .openConnection() as HttpsURLConnection).apply {
                     connectTimeout = 5000
                     readTimeout = 5000
@@ -800,7 +1138,13 @@ class MainActivity : AppCompatActivity() {
                 }
                 if (conn.responseCode != 200) {
                     runOnUiThread {
-                        if (!isFinishing) Toast.makeText(this, "No published GitHub Releases yet (running v$appVersionName).", Toast.LENGTH_LONG).show()
+                        if (!isFinishing && !isDestroyed) {
+                            Toast.makeText(
+                                this,
+                                "No published GitHub Releases yet (running v$appVersionName).",
+                                Toast.LENGTH_LONG
+                            ).show()
+                        }
                     }
                     return@Thread
                 }
@@ -810,11 +1154,21 @@ class MainActivity : AppCompatActivity() {
                 var downloadUrl = json.optString("html_url", "https://github.com/PppP01/SolStream-Studio/releases")
                 val assets = json.optJSONArray("assets")
                 if (assets != null && assets.length() > 0) {
-                    downloadUrl = assets.getJSONObject(0).optString("browser_download_url", downloadUrl)
+                    var chosenAssetUrl: String? = null
+                    for (i in 0 until assets.length()) {
+                        val obj = assets.getJSONObject(i)
+                        val name = obj.optString("name", "")
+                        if (name.endsWith(".apk", ignoreCase = true) && !name.contains("debug", ignoreCase = true)) {
+                            chosenAssetUrl = obj.optString("browser_download_url", "")
+                            break
+                        }
+                    }
+                    downloadUrl = chosenAssetUrl?.takeIf { it.isNotBlank() }
+                        ?: assets.getJSONObject(0).optString("browser_download_url", downloadUrl)
                 }
                 runOnUiThread {
-                    if (isFinishing) return@runOnUiThread
-                    if (latestTag.isNotBlank() && latestTag != appVersionName) {
+                    if (isFinishing || isDestroyed) return@runOnUiThread
+                    if (latestTag.isNotBlank() && isRemoteVersionNewer(latestTag, appVersionName)) {
                         AlertDialog.Builder(this)
                             .setTitle("Update Available: v$latestTag")
                             .setMessage("You are on v$appVersionName. Download signed update from your GitHub Releases?")
@@ -829,8 +1183,12 @@ class MainActivity : AppCompatActivity() {
                 }
             } catch (e: Exception) {
                 runOnUiThread {
-                    if (!isFinishing) Toast.makeText(this, "Update check failed: ${e.javaClass.simpleName}", Toast.LENGTH_SHORT).show()
+                    if (!isFinishing && !isDestroyed) {
+                        Toast.makeText(this, "Update check failed: ${e.javaClass.simpleName}", Toast.LENGTH_SHORT).show()
+                    }
                 }
+            } finally {
+                try { conn?.disconnect() } catch (_: Exception) {}
             }
         }, "SolUpdateCheck").start()
     }
@@ -838,10 +1196,9 @@ class MainActivity : AppCompatActivity() {
     private fun showSamsungSetupGuide() {
         val msg = """
             1. UNLOCK RESTRICTED ACCESSIBILITY (One-Time on Sideloaded APKs):
-            • Open Samsung Settings -> Apps -> SolStream Studio.
-            • Tap the 3-dot menu (⋮) in the top-right corner -> tap "Allow restricted settings" and confirm PIN/fingerprint.
-            • Now go to Settings -> Accessibility -> Installed apps -> turn SolStream Studio ON.
-            (Note: Keep Google's extreme 'Advanced Protection' OFF if it blocks non-Play-Store Accessibility tools.)
+            • On Android 13–17, first tap '4. Enable Accessibility' -> Installed apps -> tap greyed-out SolStream Studio once so Android registers the prompt.
+            • Return here and tap '3. Unlock Restricted' (teleports straight into SolStream App Info) -> tap ⋮ at top-right -> 'Allow restricted settings'.
+            • Now tap '4. Enable Accessibility' and toggle SolStream Studio ON!
 
             2. REALME NECKBAND STEREO + 45ms GAME MODE TIP:
             • If using Phone Mic for 48 kHz studio voice while keeping stereo footsteps in your neckband: open Bluetooth Settings -> realme Buds Wireless 5 ANC (Gear icon) -> toggle Calls OFF and keep Audio ON.
@@ -854,8 +1211,11 @@ class MainActivity : AppCompatActivity() {
         AlertDialog.Builder(this)
             .setTitle("Samsung One UI & CODM Pro Setup")
             .setMessage(msg)
-            .setPositiveButton("Open App Info") { _, _ ->
-                startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:$packageName")))
+            .setPositiveButton("Open App Info (⋮)") { _, _ ->
+                openAppInfoForRestrictedSettings()
+            }
+            .setNeutralButton("Open Accessibility") { _, _ ->
+                openAccessibilitySettingsDirect()
             }
             .setNegativeButton("Got It", null)
             .show()
@@ -930,12 +1290,18 @@ class MainActivity : AppCompatActivity() {
         setTextColor(Color.WHITE)
         setHintTextColor(Color.parseColor("#607D8B"))
         setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+        isSingleLine = true
         background = cardDrawable("#0B0F17", "#37474F")
         setPadding(dp(10), dp(9), dp(10), dp(9))
-        inputType = if (isPassword) {
-            InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+        if (isPassword) {
+            inputType = InputType.TYPE_CLASS_TEXT or
+                InputType.TYPE_TEXT_VARIATION_PASSWORD or
+                InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+            transformationMethod = PasswordTransformationMethod.getInstance()
         } else {
-            InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI
+            inputType = InputType.TYPE_CLASS_TEXT or
+                InputType.TYPE_TEXT_VARIATION_URI or
+                InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
         }
     }
 
