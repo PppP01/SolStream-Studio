@@ -64,6 +64,8 @@ class SolVideoPipeline(private val context: Context) {
         private set
     @Volatile var actualFreshCaptureFps = 0
         private set
+    @Volatile var lastSentVideoPtsUs: Long = -1L
+        private set
 
     /** Optional hook for SolStreamService to react if hardware encoder/GL dies mid-stream. */
     @Volatile var onFatalPipelineError: ((String) -> Unit)? = null
@@ -118,6 +120,10 @@ class SolVideoPipeline(private val context: Context) {
     ): ActiveVideoInfo? {
         if (isRunning) return null
         applyLiveVisualSettings(settings)
+        lastSentVideoPtsUs = -1L
+        actualEncodedFps = 0
+        actualEncodedBitrateBps = 0
+        actualFreshCaptureFps = 0
 
         val scan = CodecCapabilityProbe.scanDevice(context)
         val chosenReport = resolveSafeHardwareEncoder(scan, settings)
@@ -259,11 +265,11 @@ class SolVideoPipeline(private val context: Context) {
         try { videoCodecInstance?.release() } catch (_: Exception) {}
         videoCodecInstance = null
 
+        // Intentionally preserve DiagnosticsLogger.freshCaptureFps and lastAverageQp
+        // so post-stream Session Reports show final measured values instead of N/A.
         actualEncodedFps = 0
         actualEncodedBitrateBps = 0
         actualFreshCaptureFps = 0
-        DiagnosticsLogger.freshCaptureFps = -1
-        DiagnosticsLogger.lastAverageQp = -1
     }
 
     private fun evenDimension(value: Int): Int {
@@ -348,7 +354,8 @@ class SolVideoPipeline(private val context: Context) {
         for (attempt in 1..3) {
             var codec: MediaCodec? = null
             try {
-                codec = MediaCodec.createByCodecName(report.encoderName)
+                val created = MediaCodec.createByCodecName(report.encoderName)
+                codec = created
                 val requestedMode = when {
                     wantVbr && report.supportsVbr -> MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR
                     report.supportsCbr -> MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR
@@ -389,7 +396,7 @@ class SolVideoPipeline(private val context: Context) {
 
                     if (attempt == 1) {
                         selectSupportedHighProfile(
-                            codec = codec,
+                            codec = created,
                             mimeType = report.mimeType,
                             codecKey = report.codecKey,
                             width = width,
@@ -401,13 +408,13 @@ class SolVideoPipeline(private val context: Context) {
                     }
                 }
 
-                codec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
-                val inputSurface = codec.createInputSurface()
-                codec.start()
+                created.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+                val inputSurface = created.createInputSurface()
+                created.start()
 
                 val actualMode = try {
-                    if (codec.outputFormat.containsKey(MediaFormat.KEY_BITRATE_MODE)) {
-                        codec.outputFormat.getInteger(MediaFormat.KEY_BITRATE_MODE)
+                    if (created.outputFormat.containsKey(MediaFormat.KEY_BITRATE_MODE)) {
+                        created.outputFormat.getInteger(MediaFormat.KEY_BITRATE_MODE)
                     } else {
                         requestedMode
                     }
@@ -424,7 +431,7 @@ class SolVideoPipeline(private val context: Context) {
                     )
                 }
                 return ConfiguredEncoder(
-                    codec = codec,
+                    codec = created,
                     inputSurface = inputSurface,
                     actualIsVbr = isActualVbr
                 )
@@ -563,13 +570,11 @@ class SolVideoPipeline(private val context: Context) {
                     continue
                 }
 
-                // Advance target timestamp strictly at 60/30 FPS without burst catch-up
                 nextRenderNs += frameIntervalNs
                 if (nowNs - nextRenderNs > frameIntervalNs * 2) {
                     nextRenderNs = nowNs + frameIntervalNs
                 }
 
-                // Apply dynamic Android 14+ single-app capture resize without restarting encoder
                 val reqW = pendingCaptureWidth
                 val reqH = pendingCaptureHeight
                 if (reqW >= 128 && reqH >= 128 && (reqW != activeCapW || reqH != activeCapH)) {
@@ -719,7 +724,6 @@ class SolVideoPipeline(private val context: Context) {
                 scaleY = dstAspect / srcAspect
             }
         } else {
-            // "FIT" or "SMART"
             if (srcAspect > dstAspect) {
                 scaleY = dstAspect / srcAspect
             } else {
@@ -755,6 +759,10 @@ class SolVideoPipeline(private val context: Context) {
         var ptsBaseUs = 0L
         var lastSentPtsUs = 0L
 
+        // Deduplicate Exynos per-frame INFO_OUTPUT_FORMAT_CHANGED events (caused by QP statistics)
+        var lastLoggedFormatSig = ""
+        var lastSentConfigSig: ByteArray? = null
+
         var statsWindowStartMs = System.currentTimeMillis()
         var framesInWindow = 0
         var bytesInWindow = 0L
@@ -766,8 +774,28 @@ class SolVideoPipeline(private val context: Context) {
                 val outIdx = codec.dequeueOutputBuffer(bufferInfo, 15_000L)
                 if (outIdx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
                     val outFmt = codec.outputFormat
-                    logActualEncoderOutputFormat(outFmt, codecKey)
-                    extractAndSendCodecHeaders(outFmt, codecKey, onVideoConfig)
+                    // Capture QP statistics if vendor emits them inside outputFormat updates
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+                        outFmt.containsKey(MediaFormat.KEY_VIDEO_QP_AVERAGE)
+                    ) {
+                        val qp = outFmt.getInteger(MediaFormat.KEY_VIDEO_QP_AVERAGE)
+                        if (qp in 0..63) {
+                            qpSumInWindow += qp
+                            qpCountInWindow++
+                        }
+                    }
+
+                    val fmtSig = buildFormatSignature(outFmt)
+                    if (fmtSig != lastLoggedFormatSig) {
+                        lastLoggedFormatSig = fmtSig
+                        logActualEncoderOutputFormat(outFmt, codecKey)
+                    }
+
+                    val combinedCsd = combineCsdBuffers(outFmt)
+                    if (combinedCsd != null && (lastSentConfigSig == null || !combinedCsd.contentEquals(lastSentConfigSig))) {
+                        lastSentConfigSig = combinedCsd
+                        extractAndSendCodecHeaders(outFmt, codecKey, onVideoConfig)
+                    }
                     continue
                 }
                 if (outIdx < 0) continue
@@ -791,7 +819,15 @@ class SolVideoPipeline(private val context: Context) {
 
                 if (outBuf != null && bufferInfo.size > 0) {
                     if (isConfigFlag) {
-                        extractHeadersFromConfigBuffer(outBuf, bufferInfo, codecKey, onVideoConfig)
+                        val dup = outBuf.duplicate()
+                        dup.position(bufferInfo.offset)
+                        dup.limit(bufferInfo.offset + bufferInfo.size)
+                        val cfgBytes = ByteArray(dup.remaining())
+                        dup.get(cfgBytes)
+                        if (lastSentConfigSig == null || !cfgBytes.contentEquals(lastSentConfigSig)) {
+                            lastSentConfigSig = cfgBytes
+                            extractHeadersFromConfigBuffer(outBuf, bufferInfo, codecKey, onVideoConfig)
+                        }
                     } else {
                         val slot = poolIdx
                         poolIdx = (poolIdx + 1) % packetPool.size
@@ -808,7 +844,6 @@ class SolVideoPipeline(private val context: Context) {
                         targetBuf.put(outBuf)
                         targetBuf.flip()
 
-                        // Lock timestamp base ONCE on Frame 1 so 5-6+ hour streams never jump mid-broadcast
                         if (!ptsBaseLocked) {
                             ptsBaseUs = if (originTimeUs > 2_000_000L &&
                                 bufferInfo.presentationTimeUs >= originTimeUs - 500_000L
@@ -824,6 +859,7 @@ class SolVideoPipeline(private val context: Context) {
                             adjPtsUs = lastSentPtsUs + 1_000L
                         }
                         lastSentPtsUs = adjPtsUs
+                        lastSentVideoPtsUs = adjPtsUs
 
                         val outInfo = infoPool[slot].apply {
                             set(0, bufferInfo.size, adjPtsUs, bufferInfo.flags)
@@ -843,10 +879,8 @@ class SolVideoPipeline(private val context: Context) {
                     actualEncodedBitrateBps = ((bytesInWindow * 8000L) / elapsedMs).toInt()
                     DiagnosticsLogger.lastEncodedFps = actualEncodedFps
                     DiagnosticsLogger.lastBitrateKbps = actualEncodedBitrateBps / 1000
-                    DiagnosticsLogger.lastAverageQp = if (qpCountInWindow > 0) {
-                        (qpSumInWindow / qpCountInWindow).toInt()
-                    } else {
-                        -1
+                    if (qpCountInWindow > 0) {
+                        DiagnosticsLogger.lastAverageQp = (qpSumInWindow / qpCountInWindow).toInt()
                     }
                     statsWindowStartMs = nowMs
                     framesInWindow = 0
@@ -878,6 +912,38 @@ class SolVideoPipeline(private val context: Context) {
                 }
                 break
             }
+        }
+    }
+
+    private fun buildFormatSignature(format: MediaFormat): String {
+        return try {
+            val w = if (format.containsKey(MediaFormat.KEY_WIDTH)) format.getInteger(MediaFormat.KEY_WIDTH) else -1
+            val h = if (format.containsKey(MediaFormat.KEY_HEIGHT)) format.getInteger(MediaFormat.KEY_HEIGHT) else -1
+            val std = if (format.containsKey(MediaFormat.KEY_COLOR_STANDARD)) format.getInteger(MediaFormat.KEY_COLOR_STANDARD) else -1
+            val rng = if (format.containsKey(MediaFormat.KEY_COLOR_RANGE)) format.getInteger(MediaFormat.KEY_COLOR_RANGE) else -1
+            val prof = if (format.containsKey(MediaFormat.KEY_PROFILE)) format.getInteger(MediaFormat.KEY_PROFILE) else -1
+            "$w:$h:$prof:$std:$rng"
+        } catch (_: Exception) {
+            "unknown"
+        }
+    }
+
+    private fun combineCsdBuffers(format: MediaFormat): ByteArray? {
+        return try {
+            val b0 = format.getByteBuffer("csd-0")?.duplicate() ?: return null
+            val a0 = ByteArray(b0.remaining()).also { b0.get(it) }
+            val b1 = format.getByteBuffer("csd-1")?.duplicate()
+            if (b1 != null) {
+                val a1 = ByteArray(b1.remaining()).also { b1.get(it) }
+                val merged = ByteArray(a0.size + a1.size)
+                System.arraycopy(a0, 0, merged, 0, a0.size)
+                System.arraycopy(a1, 0, merged, a0.size, a1.size)
+                merged
+            } else {
+                a0
+            }
+        } catch (_: Exception) {
+            null
         }
     }
 
