@@ -43,10 +43,14 @@ else()
     )
 endif()
 
+# Standard IEEE-754 -O3 (without -ffast-math, which Xiph arch.h blocks)
 target_compile_options(sol_rnnoise PRIVATE
     -O3
-    -ffast-math
+    -std=gnu11
     -fvisibility=hidden
+    -Wno-unused-parameter
+    -Wno-unused-function
+    -Wno-sign-compare
 )
 
 # Enforce 16 KB ELF LOAD segment alignment for Android 15–17+ compliance
