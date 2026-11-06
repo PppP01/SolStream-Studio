@@ -1,16 +1,120 @@
 <?xml version="1.0" encoding="utf-8"?>
-<vector xmlns:android="http://schemas.android.com/apk/res/android"
-    android:width="108dp"
-    android:height="108dp"
-    android:viewportWidth="108"
-    android:viewportHeight="108">
-    <path
-        android:fillColor="#0B0F17"
-        android:pathData="M0,0h108v108h-108z" />
-    <path
-        android:fillColor="#00E5FF"
-        android:pathData="M54,18A36,36 0,1 1,18 54A36,36 0,0 1,54 18ZM54,26A28,28 0,1 0,82 54A28,28 0,0 0,54 26Z" />
-    <path
-        android:fillColor="#FF1744"
-        android:pathData="M45,39L71,54L45,69Z" />
-</vector>
+<!--
+  SolStream Studio — Ultra-Lightweight Mobile Gaming Broadcast Engine
+  Copyright (c) 2026 Sol (@Sol_CODM / github.com/PppP01). All rights reserved.
+  SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+-->
+<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <background>
+        <vector
+            android:width="108dp"
+            android:height="108dp"
+            android:viewportWidth="108"
+            android:viewportHeight="108">
+            <path
+                android:fillColor="#070B12"
+                android:pathData="M0,0h108v108h-108z" />
+            <path
+                android:fillColor="#0C1524"
+                android:pathData="M0,0 L108,0 L108,58 L0,92 Z" />
+            <path
+                android:fillColor="#112036"
+                android:pathData="M54,14 A40,40 0 1,1 53.99,14 Z" />
+            <path
+                android:fillColor="#080E18"
+                android:pathData="M54,22 A32,32 0 1,1 53.99,22 Z" />
+        </vector>
+    </background>
+
+    <foreground>
+        <vector
+            android:width="108dp"
+            android:height="108dp"
+            android:viewportWidth="108"
+            android:viewportHeight="108">
+            <!-- Outer Broadcast Wave Echoes (Strictly inside 66dp safe zone) -->
+            <path
+                android:fillColor="#00000000"
+                android:pathData="M34.4,30.6 A30.5,30.5 0 0,1 73.6,30.6"
+                android:strokeWidth="1.6"
+                android:strokeColor="#6600E5FF"
+                android:strokeLineCap="round" />
+            <path
+                android:fillColor="#00000000"
+                android:pathData="M73.6,77.4 A30.5,30.5 0 0,1 34.4,77.4"
+                android:strokeWidth="1.6"
+                android:strokeColor="#66FFB300"
+                android:strokeLineCap="round" />
+
+            <!-- Primary Studio Ring Arcs -->
+            <path
+                android:fillColor="#00000000"
+                android:pathData="M29.5,42.6 A27,27 0 0,1 78.5,42.6"
+                android:strokeWidth="2.5"
+                android:strokeColor="#00E5FF"
+                android:strokeLineCap="round" />
+            <path
+                android:fillColor="#00000000"
+                android:pathData="M78.5,65.4 A27,27 0 0,1 29.5,65.4"
+                android:strokeWidth="2.5"
+                android:strokeColor="#FFB300"
+                android:strokeLineCap="round" />
+
+            <!-- Interlocking Esports 'S' Crest: Upper Electric Cyan Blade -->
+            <path
+                android:fillColor="#00E5FF"
+                android:pathData="M67,34.5 L45,34.5 L38,41.5 L38,47.5 L61,55 L65,49.5 L45.5,43.5 L45.5,41 L63.5,41 Z" />
+            <path
+                android:fillColor="#B3FFFFFF"
+                android:pathData="M65.2,36 L45.8,36 L44.2,37.6 L64.2,37.6 Z" />
+
+            <!-- Interlocking Esports 'S' Crest: Lower Solar-Gold Blade -->
+            <path
+                android:fillColor="#FFC400"
+                android:pathData="M41,73.5 L63,73.5 L70,66.5 L70,60.5 L47,53 L43,58.5 L62.5,64.5 L62.5,67 L44.5,67 Z" />
+            <path
+                android:fillColor="#99FFF8E1"
+                android:pathData="M42.8,72 L62.2,72 L63.8,70.4 L43.8,70.4 Z" />
+
+            <!-- Live Broadcast Pulse Indicator -->
+            <path
+                android:fillColor="#55FF1744"
+                android:pathData="M73,30.5 A5,5 0 1,1 72.99,30.5 Z" />
+            <path
+                android:fillColor="#FF1744"
+                android:pathData="M73,32.5 A3,3 0 1,1 72.99,32.5 Z" />
+        </vector>
+    </foreground>
+
+    <monochrome>
+        <vector
+            android:width="108dp"
+            android:height="108dp"
+            android:viewportWidth="108"
+            android:viewportHeight="108">
+            <path
+                android:fillColor="#00000000"
+                android:pathData="M29.5,42.6 A27,27 0 0,1 78.5,42.6"
+                android:strokeWidth="2.6"
+                android:strokeColor="#FFFFFFFF"
+                android:strokeLineCap="round" />
+            <path
+                android:fillColor="#00000000"
+                android:pathData="M78.5,65.4 A27,27 0 0,1 29.5,65.4"
+                android:strokeWidth="2.6"
+                android:strokeColor="#FFFFFFFF"
+                android:strokeLineCap="round" />
+            <path
+                android:fillColor="#FFFFFFFF"
+                android:pathData="M67,34.5 L45,34.5 L38,41.5 L38,47.5 L61,55 L65,49.5 L45.5,43.5 L45.5,41 L63.5,41 Z" />
+            <path
+                android:fillColor="#FFFFFFFF"
+                android:pathData="M41,73.5 L63,73.5 L70,66.5 L70,60.5 L47,53 L43,58.5 L62.5,64.5 L62.5,67 L44.5,67 Z" />
+            <path
+                android:fillColor="#FFFFFFFF"
+                android:pathData="M73,32.5 A3,3 0 1,1 72.99,32.5 Z" />
+        </vector>
+    </monochrome>
+
+</adaptive-icon>
