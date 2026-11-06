@@ -22,27 +22,44 @@ jobs:
           distribution: 'temurin'
           java-version: '21'
 
-      - name: Configure Pre-Installed Android SDK & Platforms
+      - name: Configure Pre-Installed Android SDK, NDK r28+ & CMake
         run: |
           SDK_ROOT="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
           echo "ANDROID_HOME=$SDK_ROOT" >> "$GITHUB_ENV"
           echo "ANDROID_SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
           SDKMANAGER="$(ls -d "$SDK_ROOT"/cmdline-tools/*/bin | sort -V | tail -1)/sdkmanager"
           yes | "$SDKMANAGER" --licenses > /dev/null || true
-          "$SDKMANAGER" --install "platform-tools" "build-tools;35.0.0" "platforms;android-36" > /dev/null || true
+          "$SDKMANAGER" --install "platform-tools" "build-tools;35.0.0" "platforms;android-36" "cmake;3.22.1" > /dev/null || true
           "$SDKMANAGER" --install "platforms;android-37.0" "build-tools;36.0.0" > /dev/null || "$SDKMANAGER" --install "platforms;android-37" > /dev/null || true
           if [ -d "$SDK_ROOT/platforms/android-37.0" ] && [ ! -d "$SDK_ROOT/platforms/android-37" ]; then
             ln -s "$SDK_ROOT/platforms/android-37.0" "$SDK_ROOT/platforms/android-37"
             sed -i 's/AndroidVersion.ApiLevel=37.0/AndroidVersion.ApiLevel=37/' "$SDK_ROOT/platforms/android-37.0/source.properties" || true
           fi
+          NDK_VER=""
+          if [ -d "$SDK_ROOT/ndk" ]; then
+            NDK_VER="$(ls -1 "$SDK_ROOT/ndk" | grep -E '^(28|29|30)\.' | sort -V | tail -1 || true)"
+          fi
+          if [ -z "$NDK_VER" ]; then
+            "$SDKMANAGER" --install "ndk;28.2.13676358" > /dev/null
+            NDK_VER="28.2.13676358"
+          fi
+          echo "Detected NDK version: $NDK_VER"
+          echo "SOL_NDK_VERSION=$NDK_VER" >> "$GITHUB_ENV"
           yes | "$SDKMANAGER" --licenses > /dev/null || true
+
+      - name: Fetch Official Xiph RNNoise v0.1.1 C Sources (48 kHz Neural Denoiser)
+        run: |
+          mkdir -p app/src/main/cpp/rnnoise
+          curl -fsSL "https://github.com/xiph/rnnoise/archive/refs/tags/v0.1.1.tar.gz" | tar -xz --strip-components=1 -C app/src/main/cpp/rnnoise \
+            || curl -fsSL "https://gitlab.xiph.org/xiph/rnnoise/-/archive/v0.1.1/rnnoise-v0.1.1.tar.gz" | tar -xz --strip-components=1 -C app/src/main/cpp/rnnoise \
+            || echo "Warning: Xiph mirror unreachable; CMake will build self-contained C Bark-MMSE fallback."
 
       - name: Set up Official Gradle 8.14
         uses: gradle/actions/setup-gradle@v6
         with:
           gradle-version: '8.14'
 
-      - name: Run Lint, Unit Tests & Compile Signed Release APK
+      - name: Run Lint, Unit Tests & Compile Signed Release APK (Kotlin + C NDK)
         env:
           SIGNING_KEY_BASE64: ${{ secrets.SIGNING_KEY_BASE64 }}
           SIGNING_STORE_PASSWORD: ${{ secrets.SIGNING_STORE_PASSWORD }}
@@ -51,17 +68,25 @@ jobs:
         run: |
           gradle lintDebug testDebugUnitTest assembleDebug assembleRelease -Pandroid.suppressUnsupportedCompileSdk=36,37 --no-daemon --stacktrace
 
-      - name: Verify Permanent Release Signature & Stage Clean APK Names
+      - name: Verify Release Signature, 16 KB ELF Alignment & Stage Clean APK Names
         run: |
           SDK_ROOT="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
           APKSIGNER="$(ls "$SDK_ROOT"/build-tools/*/apksigner | sort -V | tail -1)"
           APP_VER="$(grep 'versionName =' app/build.gradle.kts | head -1 | cut -d'"' -f2)"
-          APP_VER="${APP_VER:-1.0.1}"
+          APP_VER="${APP_VER:-1.1.0}"
           REL_APK="$(ls app/build/outputs/apk/release/*.apk | head -1)"
           CERT_INFO="$("$APKSIGNER" verify --verbose --print-certs "$REL_APK")"
           echo "$CERT_INFO"
           if echo "$CERT_INFO" | grep -q "CN=Android Debug"; then
             echo "::error::Release APK was signed with a Debug key! Check GitHub Secrets."
+            exit 1
+          fi
+          unzip -p "$REL_APK" "lib/arm64-v8a/libsol_rnnoise.so" > /tmp/libsol_rnnoise.so
+          LOAD_INFO="$(readelf -lW /tmp/libsol_rnnoise.so | grep 'LOAD')"
+          echo "=== arm64-v8a libsol_rnnoise.so ELF LOAD Segments ==="
+          echo "$LOAD_INFO"
+          if echo "$LOAD_INFO" | awk '{print $NF}' | grep -Eq '^0x1000$|^0x2000$'; then
+            echo "::error::libsol_rnnoise.so has <16KB ELF LOAD alignment!"
             exit 1
           fi
           mkdir -p dist/release dist/debug
