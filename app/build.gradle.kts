@@ -1,3 +1,9 @@
+/*
+ * SolStream Studio — Ultra-Lightweight Mobile Gaming Broadcast Engine
+ * Copyright (c) 2026 Sol (@Sol_CODM / github.com/PppP01). All rights reserved.
+ * SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+ */
+
 import java.io.File
 import java.util.Base64
 import org.gradle.api.GradleException
@@ -12,6 +18,7 @@ val keystoreBase64 = System.getenv("SIGNING_KEY_BASE64")?.trim()
 val keystoreStorePass = System.getenv("SIGNING_STORE_PASSWORD")?.trim()
 val keystoreKeyAlias = System.getenv("SIGNING_KEY_ALIAS")?.trim()
 val keystoreKeyPass = System.getenv("SIGNING_KEY_PASSWORD")?.trim()
+val requestedNdkVersion = System.getenv("SOL_NDK_VERSION")?.trim()
 
 val hasReleaseKeystore = !keystoreBase64.isNullOrBlank() &&
     !keystoreStorePass.isNullOrBlank() &&
@@ -36,13 +43,36 @@ gradle.taskGraph.whenReady {
 android {
     namespace = "com.solgaming.solstreamstudio"
     compileSdk = 37
+    if (!requestedNdkVersion.isNullOrBlank()) {
+        ndkVersion = requestedNdkVersion
+    }
 
     defaultConfig {
         applicationId = "com.solgaming.solstreamstudio"
         minSdk = 29
         targetSdk = 36
-        versionCode = 3
-        versionName = "1.0.2"
+        versionCode = 4
+        versionName = "1.1.0"
+
+        ndk {
+            abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64")
+        }
+
+        externalNativeBuild {
+            cmake {
+                arguments += listOf(
+                    "-DANDROID_STL=none",
+                    "-DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON"
+                )
+            }
+        }
+    }
+
+    externalNativeBuild {
+        cmake {
+            path = file("src/main/cpp/CMakeLists.txt")
+            version = "3.22.1"
+        }
     }
 
     signingConfigs {
