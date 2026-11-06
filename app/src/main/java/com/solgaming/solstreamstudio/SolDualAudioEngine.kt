@@ -1,3 +1,10 @@
+/*
+ * SolStream Studio — Ultra-Lightweight Mobile Gaming Broadcast Engine
+ * Copyright (c) 2026 Sol (@Sol_CODM / github.com/PppP01). All rights reserved.
+ * SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+ * Commercial redistribution, rebranding, or app-store monetization prohibited without written license.
+ */
+
 package com.solgaming.solstreamstudio
 
 import android.annotation.SuppressLint
@@ -16,19 +23,55 @@ import android.media.MediaCodecInfo
 import android.media.MediaCodecList
 import android.media.MediaFormat
 import android.media.MediaRecorder
+import android.media.audiofx.AcousticEchoCanceler
+import android.media.audiofx.NoiseSuppressor
 import android.media.projection.MediaProjection
+import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
+import android.os.PerformanceHintManager
 import android.os.Process
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.nio.ByteBuffer
+import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.math.PI
 import kotlin.math.abs
+import kotlin.math.cos
 import kotlin.math.log10
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.math.pow
 import kotlin.math.roundToInt
+import kotlin.math.sin
+import kotlin.math.sqrt
+
+data class MicCalibrationAdvice(
+    val measuredNoiseFloorDb: Int,
+    val measuredSpeechRmsDb: Int,
+    val measuredPeakDb: Int,
+    val recommendedGainPercent: Int,
+    val recommendedHpfHz: Int,
+    val recommendedNoiseMode: String,
+    val recommendedNoiseLevel: Int,
+    val recommendedPreset: String,
+    val recommendDeEsser: Boolean,
+    val recommendSlowAgc: Boolean,
+    val plainSummary: String
+) {
+    fun applyTo(base: StreamSettings): StreamSettings {
+        val presetApplied = MicDspProcessor.applyPresetToSettings(base, recommendedPreset)
+        return presetApplied.copy(
+            micGainPercent = recommendedGainPercent,
+            hpfCutoffHz = recommendedHpfHz,
+            noiseSuppressMode = recommendedNoiseMode,
+            rnnoiseLevel = recommendedNoiseLevel,
+            deEsserEnabled = recommendDeEsser || presetApplied.deEsserEnabled,
+            slowAgcEnabled = recommendSlowAgc || presetApplied.slowAgcEnabled
+        )
+    }
+}
 
 class SolDualAudioEngine(private val context: Context) {
 
@@ -40,7 +83,14 @@ class SolDualAudioEngine(private val context: Context) {
 
     @Volatile var gameStreamMuted = false
     @Volatile var gameGainLinear = 1.0f
-    @Volatile var vadDuckingDepth = 0.0f // 0.0f = Off, 0.20f = -20%, 0.35f = -35%
+    @Volatile var vadDuckingDepth = 0.0f // 0.0f = Off, 0.20f = -20%, 0.35f = -35%, 0.50f = -50%
+
+    // Stackable Stereo Game Soundstage switches (Bus B: Stages 11–12, stream-only)
+    @Volatile var gameCinemaWideEnabled = false
+    @Volatile var gameSubPunchEnabled = false
+    @Volatile var gameFootstepFocusEnabled = false
+    @Volatile var gameBlastTamerEnabled = false
+
     @Volatile var micStatusText = "MIC READY"
     @Volatile var routedMicLabel = "Auto"
     @Volatile var gameAudioActive = false
@@ -61,23 +111,92 @@ class SolDualAudioEngine(private val context: Context) {
     @Volatile private var activeSettings = StreamSettings()
     @Volatile private var targetMicDelaySamples = 0
     @Volatile private var pendingMicRecreate = false
+    @Volatile private var pendingFxSync = false
 
     private var audioThread: Thread? = null
     private var callbackThread: HandlerThread? = null
     private var recordingCallback: AudioManager.AudioRecordingCallback? = null
     private var activeMicRecordRef: AudioRecord? = null
+    private var hwNoiseSuppressor: NoiseSuppressor? = null
+    private var hwEchoCanceler: AcousticEchoCanceler? = null
     private var streamOriginUs: Long = 0L
+
+    // 64-bit Double stereo biquad filter pair for zero bass rounding noise on the stereo game bus
+    private class StereoBiquad64 {
+        var b0 = 1.0; var b1 = 0.0; var b2 = 0.0
+        var a1 = 0.0; var a2 = 0.0
+        private var z1L = 0.0; private var z2L = 0.0
+        private var z1R = 0.0; private var z2R = 0.0
+
+        fun configurePeaking(sampleRate: Int, freqHz: Double, q: Double, gainDb: Double) {
+            val amp = 10.0.pow(gainDb / 40.0)
+            val w0 = 2.0 * PI * freqHz / sampleRate.toDouble()
+            val cosW = cos(w0)
+            val alpha = sin(w0) / (2.0 * q)
+            val a0 = 1.0 + alpha / amp
+            b0 = (1.0 + alpha * amp) / a0
+            b1 = (-2.0 * cosW) / a0
+            b2 = (1.0 - alpha * amp) / a0
+            a1 = (-2.0 * cosW) / a0
+            a2 = (1.0 - alpha / amp) / a0
+        }
+
+        fun configureHighPass(sampleRate: Int, cutoffHz: Double) {
+            val w0 = 2.0 * PI * cutoffHz / sampleRate.toDouble()
+            val cosW = cos(w0)
+            val alpha = sin(w0) / sqrt(2.0)
+            val a0 = 1.0 + alpha
+            b0 = ((1.0 + cosW) * 0.5) / a0
+            b1 = -(1.0 + cosW) / a0
+            b2 = ((1.0 + cosW) * 0.5) / a0
+            a1 = (-2.0 * cosW) / a0
+            a2 = (1.0 - alpha) / a0
+        }
+
+        fun processLeft(x: Float): Float {
+            val xd = x.toDouble()
+            var y = b0 * xd + z1L
+            if (!y.isFinite() || abs(y) < 1e-24) y = 0.0
+            z1L = b1 * xd - a1 * y + z2L
+            z2L = b2 * xd - a2 * y
+            if (abs(z1L) < 1e-24) z1L = 0.0
+            if (abs(z2L) < 1e-24) z2L = 0.0
+            return y.toFloat()
+        }
+
+        fun processRight(x: Float): Float {
+            val xd = x.toDouble()
+            var y = b0 * xd + z1R
+            if (!y.isFinite() || abs(y) < 1e-24) y = 0.0
+            z1R = b1 * xd - a1 * y + z2R
+            z2R = b2 * xd - a2 * y
+            if (abs(z1R) < 1e-24) z1R = 0.0
+            if (abs(z2R) < 1e-24) z2R = 0.0
+            return y.toFloat()
+        }
+    }
 
     fun updateLiveSettings(s: StreamSettings) {
         val prev = activeSettings
         activeSettings = s
         micDsp.applySettings(s)
-        gameGainLinear = (s.gameGainPercent.coerceIn(0, 125)) / 100.0f
+        gameGainLinear = (s.gameGainPercent.coerceIn(0, 135)) / 100.0f
         vadDuckingDepth = (s.vadDuckingPercent.coerceIn(0, 60)) / 100.0f
+        gameCinemaWideEnabled = s.gameCinemaWideEnabled
+        gameSubPunchEnabled = s.gameSubPunchEnabled
+        gameFootstepFocusEnabled = s.gameFootstepFocusEnabled
+        gameBlastTamerEnabled = s.gameBlastTamerEnabled
         targetMicDelaySamples = (s.micSyncDelayMs.coerceIn(0, 200) * sampleRate) / 1000
 
-        if (isRunning && (s.micDeviceId != prev.micDeviceId || s.micAudioSource != prev.micAudioSource)) {
-            pendingMicRecreate = true
+        if (isRunning) {
+            if (s.micDeviceId != prev.micDeviceId || s.micAudioSource != prev.micAudioSource) {
+                pendingMicRecreate = true
+            } else if (s.noiseSuppressMode != prev.noiseSuppressMode ||
+                s.rnnoiseLevel != prev.rnnoiseLevel ||
+                s.speakerAecEnabled != prev.speakerAecEnabled
+            ) {
+                pendingFxSync = true
+            }
         }
     }
 
@@ -96,6 +215,7 @@ class SolDualAudioEngine(private val context: Context) {
         if (isRunning && audioThread?.isAlive == true) return true
         activeSettings = settings
         pendingMicRecreate = false
+        pendingFxSync = false
         lastSentAudioPtsUs = -1L
         gameAudioReceivingSignal = false
         updateLiveSettings(settings)
@@ -121,6 +241,8 @@ class SolDualAudioEngine(private val context: Context) {
             )
             return false
         }
+
+        syncPlatformAudioEffects(micRecord.audioSessionId, settings)
 
         val gameRecord = if (mediaProjection != null) buildGamePlaybackRecord(mediaProjection) else null
         gameAudioActive = gameRecord != null && gameRecord.state == AudioRecord.STATE_INITIALIZED
@@ -159,12 +281,71 @@ class SolDualAudioEngine(private val context: Context) {
         } catch (_: Exception) {
         }
         audioThread = null
+        releasePlatformAudioEffects()
         unregisterMicMonitorCallback()
         activeMicRecordRef = null
+        micDsp.release()
         gameAudioActive = false
         gameAudioReceivingSignal = false
         lastGamePeakDb = -90.0f
         lastMixTruePeakDb = -90.0f
+    }
+
+    private fun syncPlatformAudioEffects(audioSessionId: Int, s: StreamSettings) {
+        releasePlatformAudioEffects()
+        if (audioSessionId <= 0) {
+            micDsp.platformHwNsAttached = false
+            micDsp.applySettings(s)
+            return
+        }
+
+        // Attach chip HW NoiseSuppressor ONLY when HW_NS is explicitly chosen (never clash with C RNNoise!)
+        val wantHwNs = s.noiseSuppressMode.equals("HW_NS", ignoreCase = true) && s.rnnoiseLevel > 0
+        if (wantHwNs) {
+            try {
+                if (NoiseSuppressor.isAvailable()) {
+                    val ns = NoiseSuppressor.create(audioSessionId)
+                    if (ns != null) {
+                        ns.enabled = true
+                        hwNoiseSuppressor = ns
+                    }
+                }
+            } catch (_: Throwable) {
+            }
+        }
+        micDsp.platformHwNsAttached = (hwNoiseSuppressor?.enabled == true)
+        micDsp.applySettings(s)
+
+        // Attach hardware AcousticEchoCanceler if user plays on phone speakers without earphones
+        if (s.speakerAecEnabled) {
+            try {
+                if (AcousticEchoCanceler.isAvailable()) {
+                    val aec = AcousticEchoCanceler.create(audioSessionId)
+                    if (aec != null) {
+                        aec.enabled = true
+                        hwEchoCanceler = aec
+                    }
+                }
+            } catch (_: Throwable) {
+            }
+        }
+    }
+
+    private fun releasePlatformAudioEffects() {
+        val ns = hwNoiseSuppressor
+        hwNoiseSuppressor = null
+        if (ns != null) {
+            try { ns.enabled = false } catch (_: Throwable) {}
+            try { ns.release() } catch (_: Throwable) {}
+        }
+
+        val aec = hwEchoCanceler
+        hwEchoCanceler = null
+        if (aec != null) {
+            try { aec.enabled = false } catch (_: Throwable) {}
+            try { aec.release() } catch (_: Throwable) {}
+        }
+        micDsp.platformHwNsAttached = false
     }
 
     private fun describeRoutedMic(dev: AudioDeviceInfo?): String {
@@ -243,8 +424,8 @@ class SolDualAudioEngine(private val context: Context) {
     }
 
     private fun createHardwareAacEncoder(requestedBps: Int): MediaCodec? {
-        val clampedReq = requestedBps.coerceIn(96_000, 320_000)
-        val candidates = listOf(clampedReq, 256_000, 192_000, 160_000, 128_000).distinct()
+        val clampedReq = requestedBps.coerceIn(64_000, 320_000)
+        val candidates = listOf(clampedReq, 256_000, 192_000, 160_000, 128_000, 96_000, 64_000).distinct()
 
         val preferredCodecName: String? = try {
             val list = MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos
@@ -299,6 +480,7 @@ class SolDualAudioEngine(private val context: Context) {
 
         val resolvedSource = when {
             settings.micAudioSource != 0 -> settings.micAudioSource
+            settings.speakerAecEnabled -> MediaRecorder.AudioSource.VOICE_COMMUNICATION
             chosenOption?.isBluetooth == true -> MediaRecorder.AudioSource.VOICE_RECOGNITION
             else -> MediaRecorder.AudioSource.DEFAULT
         }
@@ -518,6 +700,18 @@ class SolDualAudioEngine(private val context: Context) {
         var gameRecord: AudioRecord? = initialGameRecord
         var aacCodec: MediaCodec? = initialAacCodec
 
+        // Optional Android 12+ ADPF PerformanceHintSession for cool efficiency-core scheduling
+        val adpfSession: PerformanceHintManager.Session? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            try {
+                val phm = context.getSystemService(PerformanceHintManager::class.java)
+                phm?.createHintSession(intArrayOf(Process.myTid()), 10_000_000L)
+            } catch (_: Throwable) {
+                null
+            }
+        } else {
+            null
+        }
+
         val frameSamples = 480 // 10 ms @ 48,000 Hz
         val maxOutSamples = frameSamples + 2
         val micFloat = FloatArray(frameSamples)
@@ -529,6 +723,14 @@ class SolDualAudioEngine(private val context: Context) {
         val gameBlockR = FloatArray(maxOutSamples)
         val gameRing = GameStereoSyncRing()
 
+        // Bus B: 64-bit Stereo Game Soundstage Filters
+        val gameInfraHpf = StereoBiquad64().apply { configureHighPass(sampleRate, 28.0) }
+        val gameSubPunchEq = StereoBiquad64().apply { configurePeaking(sampleRate, 65.0, 0.75, 1.8) }
+        val gameFootMudTrim = StereoBiquad64().apply { configurePeaking(sampleRate, 260.0, 1.10, -1.4) }
+        val gameFootPresence = StereoBiquad64().apply { configurePeaking(sampleRate, 2850.0, 1.05, 2.0) }
+        var sideBassLpState = 0.0f // Anchors <200 Hz center bass during Cinema 3D M/S widening
+        var gameBlastEnv = 0.0f
+
         val outPcmBytes = ByteArray((maxOutSamples + 4) * 4)
 
         val maxDelaySamples = (sampleRate * 220) / 1000
@@ -536,7 +738,7 @@ class SolDualAudioEngine(private val context: Context) {
         var delayWritePos = 0
         var activeDelaySamples = targetMicDelaySamples.coerceIn(0, (sampleRate * 200) / 1000)
 
-        // 64-sample (1.33 ms) Look-Ahead 4x Cubic Oversampled Limiter state
+        // Bus C: 64-sample (1.33 ms) Look-Ahead 4x Cubic Oversampled Limiter state
         val lookLen = 64
         val lookMask = lookLen - 1
         val lookBufL = FloatArray(lookLen)
@@ -589,24 +791,31 @@ class SolDualAudioEngine(private val context: Context) {
             while (isRunning) {
                 if (pendingMicRecreate) {
                     pendingMicRecreate = false
+                    pendingFxSync = false
                     val rebuilt = recreateMicRecordSafely(micRecord, onStatusChanged)
                     if (rebuilt != null) {
                         micRecord = rebuilt
                         micStartupFade = 0.0f
                         consecutiveMicErrors = 0
                     }
+                } else if (pendingFxSync) {
+                    pendingFxSync = false
+                    val session = micRecord?.audioSessionId ?: 0
+                    syncPlatformAudioEffects(session, activeSettings)
                 }
 
                 val curMic: AudioRecord? = micRecord
                 val readMic = curMic?.read(micFloat, 0, frameSamples, AudioRecord.READ_BLOCKING)
                     ?: AudioRecord.ERROR_INVALID_OPERATION
 
+                val dspWorkStartNs = System.nanoTime()
+
                 val validMicSamples: Int
                 if (readMic > 0) {
                     consecutiveMicErrors = 0
                     validMicSamples = readMic
                     if (!audioAnchorInitialized) {
-                        audioStartOffsetUs = max(0L, (System.nanoTime() / 1000L) - streamOriginUs)
+                        audioStartOffsetUs = max(0L, (dspWorkStartNs / 1000L) - streamOriginUs)
                         audioAnchorInitialized = true
                     }
                 } else {
@@ -663,7 +872,7 @@ class SolDualAudioEngine(private val context: Context) {
                     }
                 }
 
-                // 1. Process Microphone ONLY in 32-bit float before mixing
+                // === BUS A: Isolated 32-Bit Float Microphone Studio (Stages 1–9) ===
                 val currentlyMuted = micDsp.streamMicMuted
                 micDsp.processMonoFrameInPlace(micFloat, validMicSamples)
 
@@ -692,10 +901,10 @@ class SolDualAudioEngine(private val context: Context) {
                     }
                     micFloat[i] = s
                 }
-                if (!currentlyMuted && validMicSamples > 0) {
-                    prevUnmutedMicSample = micFloat[validMicSamples - 1]
+                prevUnmutedMicSample = if (!currentlyMuted && validMicSamples > 0) {
+                    micFloat[validMicSamples - 1]
                 } else {
-                    prevUnmutedMicSample = 0f
+                    0f
                 }
 
                 val wallElapsedUs = max(0L, (System.nanoTime() / 1000L) - streamOriginUs)
@@ -728,7 +937,6 @@ class SolDualAudioEngine(private val context: Context) {
                     resampledMic
                 }
 
-                // 2. Apply optional pre-allocated lip-sync delay smoothly
                 val desiredDelay = targetMicDelaySamples.coerceIn(0, maxDelaySamples)
                 if (activeDelaySamples < desiredDelay) activeDelaySamples++
                 else if (activeDelaySamples > desiredDelay) activeDelaySamples--
@@ -746,6 +954,7 @@ class SolDualAudioEngine(private val context: Context) {
                     delayedMicFloat
                 }
 
+                // === BUS B: Synchronized Stereo Game Soundstage (Stages 10–13) ===
                 var rawGamePeakInBlock = 0f
                 if (gameRecord != null && gameAudioActive) {
                     gameRing.pullSynchronizedBlock(gameBlockL, gameBlockR, outSamples)
@@ -753,12 +962,12 @@ class SolDualAudioEngine(private val context: Context) {
                         val p = max(abs(gameBlockL[i]), abs(gameBlockR[i]))
                         if (p > rawGamePeakInBlock) rawGamePeakInBlock = p
                     }
-                    if (rawGamePeakInBlock > 0.00006f) { // > -84 dBFS real game audio signal
+                    if (rawGamePeakInBlock > 0.00006f) {
                         silentGameBlocks = 0
                         gameAudioReceivingSignal = true
                     } else {
                         silentGameBlocks++
-                        if (silentGameBlocks > 300) { // > 3.0s continuous silence
+                        if (silentGameBlocks > 300) {
                             gameAudioReceivingSignal = false
                         }
                     }
@@ -768,7 +977,6 @@ class SolDualAudioEngine(private val context: Context) {
                     gameAudioReceivingSignal = false
                 }
 
-                // 3. Smooth VAD Auto-Ducking + Game Mute + 64-Sample Look-Ahead 4x Cubic Oversampled Limiter
                 val targetDuck = if (vadDuckingDepth > 0f && micDsp.vadSpeechActive && !currentlyMuted) {
                     1.0f - vadDuckingDepth
                 } else {
@@ -776,22 +984,65 @@ class SolDualAudioEngine(private val context: Context) {
                 }
                 val targetGameMute = if (gameStreamMuted) 0.0f else 1.0f
                 val gLinear = gameGainLinear
+                val useSubPunch = gameSubPunchEnabled
+                val useFootstep = gameFootstepFocusEnabled
+                val useCinemaWide = gameCinemaWideEnabled
+                val useBlastTamer = gameBlastTamerEnabled
                 val ceiling = 0.875f // -1.16 dBTP broadcast-safe ceiling
 
                 var blockGamePeak = 1e-5f
                 var blockMixTruePeak = 1e-5f
                 var byteIdx = 0
 
+                // === BUS C: Soundstage Shaping -> Ducking -> Centered Voice Mix -> 4x Cubic Look-Ahead Limiter ===
                 for (i in 0 until outSamples) {
                     val duckSpeed = if (targetDuck < duckSmoothGain) 0.015f else 0.002f
                     duckSmoothGain += duckSpeed * (targetDuck - duckSmoothGain)
                     gameMuteSmooth += 0.008f * (targetGameMute - gameMuteSmooth)
 
-                    val gL = gameBlockL[i] * gLinear * duckSmoothGain * gameMuteSmooth
-                    val gR = gameBlockR[i] * gLinear * duckSmoothGain * gameMuteSmooth
+                    var gL = gameBlockL[i] * gLinear
+                    var gR = gameBlockR[i] * gLinear
+
+                    if (useSubPunch) {
+                        gL = gameSubPunchEq.processLeft(gameInfraHpf.processLeft(gL))
+                        gR = gameSubPunchEq.processRight(gameInfraHpf.processRight(gR))
+                    }
+
+                    if (useFootstep) {
+                        gL = gameFootPresence.processLeft(gameFootMudTrim.processLeft(gL))
+                        gR = gameFootPresence.processRight(gameFootMudTrim.processRight(gR))
+                    }
+
+                    if (useCinemaWide) {
+                        // Phase-safe Mid-Side spatial widener: widens >200 Hz directional cues (+26%)
+                        // while anchoring <200 Hz bass center (zero mono cancellation on phone speakers!)
+                        val mid = 0.5f * (gL + gR)
+                        val side = 0.5f * (gL - gR)
+                        sideBassLpState += 0.026f * (side - sideBassLpState)
+                        val sideHigh = side - sideBassLpState
+                        val wideSide = side + 0.26f * sideHigh
+                        gL = mid + wideSide
+                        gR = mid - wideSide
+                    }
+
+                    if (useBlastTamer) {
+                        val gPeak = max(abs(gL), abs(gR))
+                        gameBlastEnv += (if (gPeak > gameBlastEnv) 0.05f else 0.00025f) * (gPeak - gameBlastEnv)
+                        val blastThresh = 0.335f // ~ -9.5 dBFS explosion spike threshold
+                        if (gameBlastEnv > blastThresh) {
+                            val blastGain = (blastThresh / gameBlastEnv).pow(0.60f).coerceIn(0.42f, 1.0f)
+                            gL *= blastGain
+                            gR *= blastGain
+                        }
+                    }
+
+                    gL *= duckSmoothGain * gameMuteSmooth
+                    gR *= duckSmoothGain * gameMuteSmooth
+
                     val gAbs = max(abs(gL), abs(gR))
                     if (gAbs > blockGamePeak) blockGamePeak = gAbs
 
+                    // Voice remains 100% locked dead-center onto widened stereo game audio
                     val mCenter = micSourceArray[i]
                     val inMixL = gL + mCenter
                     val inMixR = gR + mCenter
@@ -805,7 +1056,6 @@ class SolDualAudioEngine(private val context: Context) {
                     if (estTruePeak > blockMixTruePeak) blockMixTruePeak = estTruePeak
                     val reqGain = if (estTruePeak > ceiling) ceiling / estTruePeak else 1.0f
 
-                    // Push histL1/histR1 (aligned with cubic interval [p1..p2]) into 64-sample look-ahead line
                     lookBufL[lookIdx] = histL1
                     lookBufR[lookIdx] = histR1
                     lookReqGain[lookIdx] = reqGain
@@ -855,7 +1105,7 @@ class SolDualAudioEngine(private val context: Context) {
                 lastGamePeakDb = 20.0f * log10(max(1e-5f, blockGamePeak))
                 lastMixTruePeakDb = 20.0f * log10(max(1e-5f, blockMixTruePeak * limiterGain))
 
-                // 4. Periodic routed-device & hardware timestamp check (every 2s)
+                // Periodic routed-device check (every 2s)
                 val nowMs = System.currentTimeMillis()
                 if (nowMs - lastDriftCheckMs > 2000L) {
                     lastDriftCheckMs = nowMs
@@ -876,7 +1126,7 @@ class SolDualAudioEngine(private val context: Context) {
                     }
                 }
 
-                // 5 & 6. Feed sample-accurate PCM into AAC Encoder & drain packets (with AAC self-recovery)
+                // Feed sample-accurate PCM into AAC Encoder & drain packets (with AAC self-recovery)
                 var activeAac: MediaCodec? = aacCodec
                 if (activeAac == null && nowMs - lastAacRecreateAttemptMs > 2000L) {
                     lastAacRecreateAttemptMs = nowMs
@@ -946,6 +1196,11 @@ class SolDualAudioEngine(private val context: Context) {
                 } else {
                     totalSamplesQueued += outSamples.toLong()
                 }
+
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && adpfSession != null) {
+                    val workNs = (System.nanoTime() - dspWorkStartNs).coerceIn(50_000L, 9_500_000L)
+                    try { adpfSession.reportActualWorkDuration(workNs) } catch (_: Throwable) {}
+                }
             }
         } catch (e: Exception) {
             if (isRunning) {
@@ -959,6 +1214,11 @@ class SolDualAudioEngine(private val context: Context) {
         } finally {
             val exitedWhileActive = isRunning
             isRunning = false
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && adpfSession != null) {
+                try { adpfSession.close() } catch (_: Throwable) {}
+            }
+            releasePlatformAudioEffects()
+            micDsp.release()
             try { micRecord?.stop() } catch (_: Exception) {}
             try { micRecord?.release() } catch (_: Exception) {}
             try { gameRecord?.stop() } catch (_: Exception) {}
@@ -976,6 +1236,7 @@ class SolDualAudioEngine(private val context: Context) {
         oldMic: AudioRecord?,
         onStatusChanged: ((String) -> Unit)?
     ): AudioRecord? {
+        releasePlatformAudioEffects()
         unregisterMicMonitorCallback()
         try { oldMic?.stop() } catch (_: Exception) {}
         try { oldMic?.release() } catch (_: Exception) {}
@@ -983,6 +1244,7 @@ class SolDualAudioEngine(private val context: Context) {
         val fresh = buildMicAudioRecord(activeSettings)
         if (fresh != null && fresh.state == AudioRecord.STATE_INITIALIZED) {
             return try {
+                syncPlatformAudioEffects(fresh.audioSessionId, activeSettings)
                 fresh.startRecording()
                 activeMicRecordRef = fresh
                 registerMicMonitorCallback(fresh, onStatusChanged)
@@ -1035,49 +1297,125 @@ class SolDualAudioEngine(private val context: Context) {
         return null
     }
 
+    // === PRE-STREAM 10-SECOND GUIDED CODM GRIP CALIBRATOR & AUTO-ADVISOR ===
     companion object {
         private const val TEST_PCM_FILE = "solstream_mic_test.pcm"
+        private val playbackStopRequested = AtomicBoolean(false)
+
+        @Volatile var lastCalibrationAdvice: MicCalibrationAdvice? = null
+            private set
 
         fun getTestFile(context: Context): File = File(context.cacheDir, TEST_PCM_FILE)
 
+        fun stopMicTestPlayback() {
+            playbackStopRequested.set(true)
+        }
+
         fun deleteMicTestFile(context: Context): Boolean {
+            stopMicTestPlayback()
             val f = getTestFile(context)
             return if (f.exists()) f.delete() else true
         }
 
-        @SuppressLint("MissingPermission")
+        /**
+         * Compatibility bridge so existing MainActivity calls compile and run the upgraded 10s Calibrator.
+         */
         fun recordFiveSecondMicTest(
             context: Context,
             settings: StreamSettings,
             onProgress: (String) -> Unit,
             onComplete: (Boolean, String) -> Unit
         ) {
+            recordGuidedTenSecondMicTest(context, settings, onProgress) { ok, summary, _ ->
+                onComplete(ok, summary)
+            }
+        }
+
+        @SuppressLint("MissingPermission")
+        fun recordGuidedTenSecondMicTest(
+            context: Context,
+            settings: StreamSettings,
+            onProgress: (String) -> Unit,
+            onComplete: (Boolean, String, MicCalibrationAdvice?) -> Unit
+        ) {
+            stopMicTestPlayback()
             Thread({
                 val sampleRate = 48000
                 val dsp = MicDspProcessor(sampleRate).apply { applySettings(settings) }
                 val engine = SolDualAudioEngine(context)
                 val rec = engine.buildMicAudioRecord(settings)
                 if (rec == null || rec.state != AudioRecord.STATE_INITIALIZED) {
-                    onComplete(false, "Could not open selected mic. Check Mic permission or Bluetooth state.")
+                    dsp.release()
+                    onComplete(false, "Could not open selected mic. Check Mic permission or Bluetooth state.", null)
                     return@Thread
                 }
+
+                engine.syncPlatformAudioEffects(rec.audioSessionId, settings)
 
                 val outFile = getTestFile(context)
                 val frame = FloatArray(480)
                 val pcmBytes = ByteArray(480 * 2)
-                var maxPeakDb = -90f
+
+                // Raw acoustic analyzers (measured BEFORE MicDspProcessor so advisor recommends ideal settings)
+                var quietEnergySum = 0.0
+                var quietLowEnergySum = 0.0
+                var quietFrames = 0
+                var lowLpState = 0.0f
+
+                var speechEnergySum = 0.0
+                var speechHighSibSum = 0.0
+                var speechActiveFrames = 0
+                var sibHpPrev = 0.0f
+                var rawSpeechPeak = 1e-5f
+                var maxProcessedPeakDb = -90f
                 var startupFade = 0f
 
                 try {
                     FileOutputStream(outFile).use { fos ->
                         rec.startRecording()
                         val devName = engine.describeRoutedMic(rec.routedDevice)
-                        val totalFrames = 500
+                        val totalFrames = 1000 // 1,000 * 10 ms = 10.0 seconds
+
                         for (step in 0 until totalFrames) {
                             val r = rec.read(frame, 0, frame.size, AudioRecord.READ_BLOCKING)
                             if (r <= 0) continue
+
+                            // 1. Measure raw pre-DSP mic characteristics
+                            var rawSq = 0.0
+                            var lowSq = 0.0
+                            var highDiffSq = 0.0
+                            for (i in 0 until r) {
+                                val raw = if (frame[i].isFinite()) frame[i] else 0f
+                                rawSq += (raw * raw).toDouble()
+                                lowLpState += 0.015f * (raw - lowLpState) // ~115 Hz low-rumble tracker
+                                lowSq += (lowLpState * lowLpState).toDouble()
+                                val diff = raw - sibHpPrev
+                                sibHpPrev = raw
+                                highDiffSq += (diff * diff).toDouble()
+                                if (step >= 300 && abs(raw) > rawSpeechPeak) {
+                                    rawSpeechPeak = abs(raw)
+                                }
+                            }
+                            val blockRawRms = sqrt(rawSq / r.toDouble()).toFloat()
+
+                            if (step < 300) {
+                                // Phase 1 (0.0s .. 3.0s): Quiet Grip + Fan Baseline
+                                quietEnergySum += rawSq / r.toDouble()
+                                quietLowEnergySum += lowSq / r.toDouble()
+                                quietFrames++
+                            } else {
+                                // Phase 2 (3.0s .. 10.0s): Normal & Loud CODM Callouts
+                                val quietRef = if (quietFrames > 0) sqrt(quietEnergySum / quietFrames).toFloat() else 0.002f
+                                if (blockRawRms > max(0.005f, quietRef * 2.2f)) {
+                                    speechEnergySum += rawSq / r.toDouble()
+                                    speechHighSibSum += highDiffSq / r.toDouble()
+                                    speechActiveFrames++
+                                }
+                            }
+
+                            // 2. Process through live 10-stage MicDspProcessor so user hears real output on playback
                             dsp.processMonoFrameInPlace(frame, r)
-                            if (dsp.lastPeakDb > maxPeakDb) maxPeakDb = dsp.lastPeakDb
+                            if (dsp.lastPeakDb > maxProcessedPeakDb) maxProcessedPeakDb = dsp.lastPeakDb
 
                             var idx = 0
                             for (i in 0 until r) {
@@ -1091,35 +1429,111 @@ class SolDualAudioEngine(private val context: Context) {
                                 pcmBytes[idx++] = ((v shr 8) and 0xFF).toByte()
                             }
                             fos.write(pcmBytes, 0, idx)
+
                             if (step % 50 == 0) {
-                                val secLeft = 5 - (step / 100)
-                                onProgress("Recording on $devName (${secLeft}s)... Peak: ${dsp.lastPeakDb.toInt()} dB")
+                                if (step < 300) {
+                                    val quietLeft = 3 - (step / 100)
+                                    onProgress(
+                                        "Phase 1/2 — Hold 2-hand CODM grip SILENTLY (${quietLeft}s)... Fan Floor: ${dsp.lastNoiseFloorDb.toInt()} dB"
+                                    )
+                                } else {
+                                    val speakLeft = 10 - (step / 100)
+                                    onProgress(
+                                        "Phase 2/2 — Speak normal & loud CODM callouts (${speakLeft}s)... Peak: ${dsp.lastPeakDb.toInt()} dB"
+                                    )
+                                }
                             }
                         }
-                        onComplete(
-                            true,
-                            "5s test saved ($devName)! Peak: ${maxPeakDb.toInt()} dB | Noise Floor: ${dsp.lastNoiseFloorDb.toInt()} dB | Clips: ${dsp.clipCount}"
+
+                        // 3. Compute Smart Auto-Advisor Calibration
+                        val rawQuietRms = if (quietFrames > 0) sqrt(quietEnergySum / quietFrames).toFloat() else 0.0015f
+                        val rawQuietDb = MicDspProcessor.linearToDb(rawQuietRms).roundToInt()
+                        val lowRumbleRatio = if (quietEnergySum > 1e-10) (quietLowEnergySum / quietEnergySum) else 0.25
+
+                        val rawSpeechRms = if (speechActiveFrames >= 12) {
+                            sqrt(speechEnergySum / speechActiveFrames).toFloat()
+                        } else {
+                            max(rawQuietRms * 3.0f, 0.035f)
+                        }
+                        val rawSpeechDb = MicDspProcessor.linearToDb(rawSpeechRms).roundToInt()
+                        val peakDbInt = maxProcessedPeakDb.roundToInt()
+
+                        // Target ~ -16.5 dBFS (0.150 linear) post-gain speech RMS while preventing raw clipping
+                        val idealGainLin = (0.150f / max(rawSpeechRms, 0.015f))
+                            .coerceAtMost(0.88f / max(rawSpeechPeak, 0.12f))
+                            .coerceIn(0.75f, 2.20f)
+                        val gainSteps = listOf(75, 100, 125, 150, 180, 220)
+                        val rawPct = (idealGainLin * 100f).roundToInt()
+                        val recGainPct = gainSteps.minByOrNull { abs(it - rawPct) } ?: 125
+
+                        val recHpf = when {
+                            lowRumbleRatio > 0.55 || rawQuietDb > -48 -> 100
+                            settings.voiceGenderProfile.equals("MALE", ignoreCase = true) -> 80
+                            settings.voiceGenderProfile.equals("FEMALE", ignoreCase = true) -> 100
+                            else -> 85
+                        }
+
+                        val (recNsMode, recNsLvl) = when {
+                            rawQuietDb >= -46 -> "RNNOISE" to 3
+                            rawQuietDb >= -55 -> "RNNOISE" to 2
+                            rawQuietDb >= -63 -> "RNNOISE" to 1
+                            else -> "LIGHT" to 1
+                        }
+
+                        val sibRatio = if (speechEnergySum > 1e-9) (speechHighSibSum / speechEnergySum) else 0.08
+                        val needDeEss = sibRatio > 0.18 || recGainPct >= 150
+                        val needAgc = speechActiveFrames >= 12 && (MicDspProcessor.linearToDb(rawSpeechPeak) - rawSpeechDb) > 13f
+                        val recPreset = if (rawQuietDb >= -55) "SOL_LUXE" else "STUDIO"
+
+                        val nsLabel = if (recNsMode == "RNNOISE") "C RNNoise Lv$recNsLvl" else "Light Cut Lv1"
+                        val spokeNote = if (speechActiveFrames < 8) " (Low speech detected—speak louder in Phase 2 to refine Gain)" else ""
+                        val summaryText =
+                            "10s Grip Test Saved ($devName)! Peak: ${peakDbInt}dB | Fan Floor: ${rawQuietDb}dB | Clips: ${dsp.clipCount}$spokeNote\n" +
+                                "-> Advisor: Preset $recPreset • Gain ${recGainPct}% • HPF ${recHpf}Hz • $nsLabel" +
+                                (if (needDeEss) " • De-Esser ON" else "")
+
+                        val advice = MicCalibrationAdvice(
+                            measuredNoiseFloorDb = rawQuietDb,
+                            measuredSpeechRmsDb = rawSpeechDb,
+                            measuredPeakDb = peakDbInt,
+                            recommendedGainPercent = recGainPct,
+                            recommendedHpfHz = recHpf,
+                            recommendedNoiseMode = recNsMode,
+                            recommendedNoiseLevel = recNsLvl,
+                            recommendedPreset = recPreset,
+                            recommendDeEsser = needDeEss,
+                            recommendSlowAgc = needAgc,
+                            plainSummary = summaryText
                         )
+                        lastCalibrationAdvice = advice
+                        onComplete(true, summaryText, advice)
                     }
                 } catch (e: Exception) {
-                    onComplete(false, "Mic test failed: ${e.javaClass.simpleName}")
+                    onComplete(false, "Mic calibration failed: ${e.javaClass.simpleName}", null)
                 } finally {
+                    engine.releasePlatformAudioEffects()
+                    dsp.release()
                     try { rec.stop(); rec.release() } catch (_: Exception) {}
                 }
-            }, "SolMicTester").start()
+            }, "SolMicCalibrator10s").start()
         }
 
         fun playRecordedMicTest(context: Context, onFinished: (String) -> Unit) {
             val file = getTestFile(context)
             if (!file.exists() || file.length() == 0L) {
-                onFinished("No mic test recorded yet. Tap 'Record 5s Test' first.")
+                onFinished("No mic test recorded yet. Tap 'Record 10s Test' first.")
                 return
             }
+            playbackStopRequested.set(false)
             Thread({
                 var track: AudioTrack? = null
                 try {
-                    val data = FileInputStream(file).use { it.readBytes() }
-                    val durationMs = ((data.size / 2L) * 1000L) / 48000L
+                    val minOutBuf = AudioTrack.getMinBufferSize(
+                        48000,
+                        AudioFormat.CHANNEL_OUT_MONO,
+                        AudioFormat.ENCODING_PCM_16BIT
+                    ).coerceAtLeast(9600)
+
                     val builtTrack = AudioTrack.Builder()
                         .setAudioAttributes(
                             AudioAttributes.Builder()
@@ -1134,14 +1548,26 @@ class SolDualAudioEngine(private val context: Context) {
                                 .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
                                 .build()
                         )
-                        .setBufferSizeInBytes(max(data.size, 9600))
-                        .setTransferMode(AudioTrack.MODE_STATIC)
+                        .setBufferSizeInBytes(minOutBuf * 2)
+                        .setTransferMode(AudioTrack.MODE_STREAM)
                         .build()
                     track = builtTrack
-                    builtTrack.write(data, 0, data.size)
                     builtTrack.play()
-                    Thread.sleep(durationMs + 150L)
-                    onFinished("Playback finished.")
+
+                    val chunk = ByteArray(4800) // 50 ms streaming chunks (never hits MODE_STATIC size limits)
+                    FileInputStream(file).use { fis ->
+                        while (!playbackStopRequested.get()) {
+                            val readBytes = fis.read(chunk)
+                            if (readBytes <= 0) break
+                            builtTrack.write(chunk, 0, readBytes, AudioTrack.WRITE_BLOCKING)
+                        }
+                    }
+                    if (!playbackStopRequested.get()) {
+                        Thread.sleep(120L)
+                        onFinished("10s calibration playback finished.")
+                    } else {
+                        onFinished("Playback stopped.")
+                    }
                 } catch (e: Exception) {
                     onFinished("Playback error: ${e.javaClass.simpleName}")
                 } finally {
