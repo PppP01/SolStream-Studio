@@ -57,11 +57,14 @@ class MainActivity : AppCompatActivity() {
 
     private val micTestBusy = AtomicBoolean(false)
     private val netTestBusy = AtomicBoolean(false)
+    private val hwScanBusy = AtomicBoolean(false)
 
     // UI References for dynamic refresh
+    private lateinit var tvHeaderSubtitle: TextView
     private lateinit var tvLiveBanner: TextView
     private lateinit var btnReapproveCapture: Button
     private lateinit var tvPreflightStatus: TextView
+    private lateinit var tvRestrictedHint: TextView
     private lateinit var tvVaultSecurityLabel: TextView
     private lateinit var etRtmpsUrl: EditText
     private lateinit var etStreamKey: EditText
@@ -143,7 +146,10 @@ class MainActivity : AppCompatActivity() {
 
         SolStreamService.onStateChangedListener = {
             runOnUiThread {
-                if (!isFinishing && !isDestroyed) refreshAllUi()
+                if (!isFinishing && !isDestroyed) {
+                    settings = KeystoreVault.loadSettings(this)
+                    refreshAllUi()
+                }
             }
         }
         refreshAllUi()
@@ -172,9 +178,9 @@ class MainActivity : AppCompatActivity() {
                 @Suppress("DEPRECATION")
                 packageManager.getPackageInfo(packageName, 0)
             }
-            info.versionName?.removeSuffix("-debug") ?: "1.0.1"
+            info.versionName?.removeSuffix("-debug") ?: "1.0.2"
         } catch (_: Exception) {
-            "1.0.1"
+            "1.0.2"
         }
     }
 
@@ -210,7 +216,7 @@ class MainActivity : AppCompatActivity() {
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 20f)
             typeface = Typeface.DEFAULT_BOLD
         }
-        val subtitle = TextView(this).apply {
+        tvHeaderSubtitle = TextView(this).apply {
             text = "${scanSummary.deviceModel} (${scanSummary.socModel}) • Android ${scanSummary.androidRelease}\n${scanSummary.toBadgeText()}"
             setTextColor(Color.parseColor("#90A4AE"))
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f)
@@ -240,22 +246,31 @@ class MainActivity : AppCompatActivity() {
         }.apply { visibility = View.GONE }
 
         container.addView(title)
-        container.addView(subtitle)
+        container.addView(tvHeaderSubtitle)
         container.addView(tvLiveBanner)
         container.addView(btnReapproveCapture)
 
-        // === CARD 1: PRE-FLIGHT PERMISSIONS & DIRECT SETTINGS TELEPORTERS ===
+        // === CARD 1: PRE-FLIGHT PERMISSIONS & EXACT 1-2-3-4 RESTRICTED UNLOCK FLOW ===
         val cardPreflight = sectionCard("1. Pre-Flight Readiness & Direct Settings Setup")
         tvPreflightStatus = bodyText("")
         cardPreflight.addView(tvPreflightStatus)
+
+        tvRestrictedHint = TextView(this).apply {
+            text = "Android 13–17 Tip (Why ⋮ 3-dots hide at first): Tap '3. Tap Accessibility 1st' and tap greyed-out SolStream Studio once -> press OK -> then tap '4. Unlock Restricted (⋮)' so the top-right ⋮ menu appears!"
+            setTextColor(Color.parseColor("#FFD54F"))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.2f)
+            setPadding(0, dp(2), 0, dp(6))
+        }
+        cardPreflight.addView(tvRestrictedHint)
 
         val rowPerms = buttonRow(
             actionButton("1. Grant Mic & Notif", "#1E3A5F") { requestRuntimePermissions() },
             actionButton("2. Unrestricted Batt", "#1E3A5F") { openBatteryUnrestricted() }
         )
+        // Exact order Android 13-17 enforces: trigger Accessibility prompt FIRST, then App Info ⋮ SECOND
         val rowRestrictedAndAcc = buttonRow(
-            actionButton("3. Unlock Restricted", "#283593") { openAppInfoForRestrictedSettings() },
-            actionButton("4. Enable Accessibility", "#00695C") { openAccessibilitySettingsDirect() }
+            actionButton("3. Tap Accessibility 1st", "#00695C") { openAccessibilitySettingsDirect() },
+            actionButton("4. Unlock Restricted (⋮)", "#283593") { openAppInfoForRestrictedSettings() }
         )
         val btnSetupGuide = actionButton("Samsung One UI & Neckband Audio Setup Guide", "#37474F") {
             showSamsungSetupGuide()
@@ -310,7 +325,7 @@ class MainActivity : AppCompatActivity() {
         // === CARD 3: VIDEO, 120->60 FPS PACING & CODM HUD FRAMING ===
         val cardVideo = sectionCard("3. Video Encoder, Bitrate & CODM HUD Framing")
         cardVideo.addView(
-            bodyText("CODM stays at 120 FPS on your screen while the hardware encoder paces YouTube output cleanly at 60 or 30 FPS.")
+            bodyText("CODM stays at 120 FPS on your screen while the hardware encoder paces YouTube output cleanly at 60 or 30 FPS. Keep GPU Sharpen OFF for the lowest phone heat during marathon streams.")
         )
 
         btnCodec = actionButton("", "#1C2836") { cycleCodec() }
@@ -335,7 +350,11 @@ class MainActivity : AppCompatActivity() {
         btnFraming = actionButton("", "#283593") { cycleFraming() }
         btnSmartZoom = actionButton("", "#1C2836") { cycleSmartZoom() }
         btnSharpen = actionButton("", "#1C2836") {
-            updateSetting(settings.copy(gpuSharpen = !settings.gpuSharpen))
+            val nextSharp = !settings.gpuSharpen
+            updateSetting(
+                newSettings = settings.copy(gpuSharpen = nextSharp),
+                userToggledSharp = true
+            )
         }
 
         cardVideo.addView(buttonRow(btnCodec, btnResolution))
@@ -413,12 +432,7 @@ class MainActivity : AppCompatActivity() {
             btnGlipBench
         )
         val rowUpdate = buttonRow(
-            actionButton("Refresh Mics / HW Scan", "#263238") {
-                scanSummary = CodecCapabilityProbe.scanDevice(this, forceRefresh = true)
-                micOptions = CodecCapabilityProbe.listAvailableMicInputs(this)
-                refreshAllUi()
-                Toast.makeText(this, "Hardware & mic list refreshed!", Toast.LENGTH_SHORT).show()
-            },
+            actionButton("Refresh Mics / HW Scan", "#263238") { refreshHardwareAndMicsAsync() },
             actionButton("Check GitHub Update", "#263238") { checkGitHubReleaseUpdate() }
         )
 
@@ -440,6 +454,30 @@ class MainActivity : AppCompatActivity() {
         return rootScroll
     }
 
+    private fun refreshHardwareAndMicsAsync() {
+        if (!hwScanBusy.compareAndSet(false, true)) return
+        Toast.makeText(this, "Scanning hardware encoders & microphones...", Toast.LENGTH_SHORT).show()
+        Thread({
+            try {
+                val freshScan = CodecCapabilityProbe.scanDevice(applicationContext, forceRefresh = true)
+                val freshMics = CodecCapabilityProbe.listAvailableMicInputs(applicationContext)
+                runOnUiThread {
+                    hwScanBusy.set(false)
+                    if (!isFinishing && !isDestroyed) {
+                        scanSummary = freshScan
+                        micOptions = freshMics
+                        tvHeaderSubtitle.text =
+                            "${scanSummary.deviceModel} (${scanSummary.socModel}) • Android ${scanSummary.androidRelease}\n${scanSummary.toBadgeText()}"
+                        refreshAllUi()
+                        Toast.makeText(this, "Hardware & mic list refreshed!", Toast.LENGTH_SHORT).show()
+                    }
+                }
+            } catch (_: Exception) {
+                hwScanBusy.set(false)
+            }
+        }, "SolAsyncHwScan").start()
+    }
+
     private fun refreshAllUi() {
         val micGranted = ContextCompat.checkSelfPermission(
             this,
@@ -454,12 +492,13 @@ class MainActivity : AppCompatActivity() {
         val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
         val battUnrestricted = pm.isIgnoringBatteryOptimizations(packageName)
         val accEnabled = isAccessibilityServiceEnabled()
+        val isLive = SolStreamService.isBroadcastLive
 
         tvLiveBanner.text = when {
             SolStreamService.needsProjectionReapproval ->
                 "STATUS: Screen capture paused by Android (lock/system). Tap orange button below to re-approve!"
-            SolStreamService.isBroadcastLive ->
-                "STATUS: ${SolStreamService.connectionStateLabel} • Floating Ghost Pill active (Double-tap pill in CODM to expand)"
+            isLive ->
+                "STATUS: ${SolStreamService.connectionStateLabel} • Live controls below & in-game Ghost Pill sync immediately!"
             SolStreamService.isGlipBenchmarkRunning ->
                 "STATUS: Passive Glip Benchmark Recording Thermal & RAM..."
             else ->
@@ -470,23 +509,35 @@ class MainActivity : AppCompatActivity() {
         tvPreflightStatus.text =
             "• Mic Permission: ${okWait(micGranted)}   • Notifications: ${okWait(notifGranted)}\n" +
                 "• Battery Unrestricted: ${okWait(battUnrestricted)}   • Accessibility Service: ${okWait(accEnabled)}"
+        tvRestrictedHint.visibility = if (accEnabled) View.GONE else View.VISIBLE
 
         tvVaultSecurityLabel.text = "Stream Key (AES-256-GCM • ${KeystoreVault.getKeySecurityDescription()}):"
         btnShowHideKey.text = if (showStreamKeyPlain) "Hide Key" else "Show Key"
 
+        val restartSuffix = if (isLive) " [Next]" else ""
         val av1Available = scanSummary.av1Hardware != null &&
             (scanSummary.av1Hardware?.supports1440p60 == true || scanSummary.av1Hardware?.supports1080p60 == true)
-        btnCodec.text = "Codec: ${settings.codec}" + if (!av1Available && settings.codec != "AV1") " (AV1 SW Blocked)" else ""
-        btnResolution.text = "Res: ${if (max(settings.width, settings.height) >= 2560) "1440p" else "1080p"}"
-        btnFps.text = "Stream: ${settings.fps} FPS"
-        val orient = if (settings.isVertical) "9:16 Shorts" else "16:9 Wide (${settings.landscapeFlip}°)"
+        btnCodec.text = "Codec: ${settings.codec}" +
+            (if (!av1Available && settings.codec != "AV1") " (AV1 SW Blocked)" else "") +
+            restartSuffix
+        btnResolution.text = "Res: ${if (max(settings.width, settings.height) >= 2560) "1440p" else "1080p"}$restartSuffix"
+        btnFps.text = "Stream: ${settings.fps} FPS$restartSuffix"
+        val orient = if (settings.isVertical) {
+            "9:16 Shorts$restartSuffix"
+        } else {
+            "16:9 Wide (${settings.landscapeFlip}°)"
+        }
         btnOrientationFlip.text = orient
         btnBitrate.text = "Target: ${settings.targetBitrateKbps / 1000} Mbps"
-        btnRateControl.text = "Rate: ${if (settings.useVbr) "VBR (Test)" else "CBR (Rec)"}"
+        btnRateControl.text = "Rate: ${if (settings.useVbr) "VBR (Test)" else "CBR (Rec)"}$restartSuffix"
         btnAbr.text = "Queue-Aware Auto Bitrate (Ping Guard): ${if (settings.adaptiveBitrate) "ON" else "OFF"}"
         btnFraming.text = "Framing: ${settings.framingMode}"
         btnSmartZoom.text = "Smart Zoom: ${settings.smartZoomPercent}%"
-        btnSharpen.text = "Optional GPU Crisp Sharpen: ${if (settings.gpuSharpen) "ON (Subtle)" else "OFF (Coolest)"}"
+        btnSharpen.text = if (settings.gpuSharpen) {
+            "GPU Crisp Sharpen: ON (Turn OFF to reduce phone heat)"
+        } else {
+            "GPU Crisp Sharpen: OFF (Recommended — Coolest Temp)"
+        }
 
         val selectedMicLabel = micOptions.firstOrNull { it.deviceId == settings.micDeviceId }?.label
             ?: micOptions.firstOrNull()?.label ?: "Auto Phone Mic"
@@ -497,7 +548,7 @@ class MainActivity : AppCompatActivity() {
             else -> "AUTO (Glip Smart)"
         }
         btnMicSource.text = "Source: $srcName"
-        btnAudioBitrate.text = "AAC: ${settings.audioBitrateKbps} kbps"
+        btnAudioBitrate.text = "AAC: ${settings.audioBitrateKbps} kbps$restartSuffix"
         btnVoicePreset.text = "Voice: ${settings.voicePreset}"
         btnHpf.text = if (settings.hpfCutoffHz == 0) "HPF Rumble: OFF" else "HPF: ${settings.hpfCutoffHz} Hz"
         val nsText = when (settings.rnnoiseLevel) { 1 -> "LOW"; 2 -> "MED"; else -> "OFF" }
@@ -510,7 +561,7 @@ class MainActivity : AppCompatActivity() {
         btnMicDelay.text = "Mic Sync: +${settings.micSyncDelayMs} ms"
         btnExtraToggles.text = "BRB Auto-Mute Mic: ${onOff(settings.brbMuteMicToo)} | Low-Lat Wi-Fi Lock: ${onOff(settings.wifiLowLatencyLock)}"
 
-        if (SolStreamService.isBroadcastLive) {
+        if (isLive) {
             btnGoLive.text = "STOP LIVE STREAM"
             btnGoLive.background = roundedDrawable("#D50000", "#FF5252")
         } else {
@@ -525,17 +576,39 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun updateSetting(newSettings: StreamSettings, requiresRestartIfLive: Boolean = false) {
+    private fun updateSetting(
+        newSettings: StreamSettings,
+        requiresRestartIfLive: Boolean = false,
+        userToggledSharp: Boolean = false
+    ) {
         settings = newSettings
         KeystoreVault.saveSettings(this, settings)
-        refreshAllUi()
-        if (SolStreamService.isBroadcastLive && requiresRestartIfLive) {
+        if (SolStreamService.isBroadcastLive) {
+            SolStreamService.instance?.applyDashboardSettingsLive(
+                newSettings = settings,
+                userToggledSharp = userToggledSharp
+            )
+            if (requiresRestartIfLive) {
+                Toast.makeText(
+                    this,
+                    "Saved for next stream! (Encoder Codec/Res/FPS/Rate/AAC require stream restart.)",
+                    Toast.LENGTH_SHORT
+                ).show()
+            } else if (userToggledSharp && settings.gpuSharpen) {
+                Toast.makeText(
+                    this,
+                    "GPU Sharp ON live — turn OFF anytime to reduce phone heat.",
+                    Toast.LENGTH_SHORT
+                ).show()
+            }
+        } else if (userToggledSharp && settings.gpuSharpen) {
             Toast.makeText(
                 this,
-                "Saved for next stream! Use the in-game Floating Pill for live adjustments.",
+                "Tip: Turn GPU Sharp OFF if you want cooler phone temps on 3+ hour streams.",
                 Toast.LENGTH_SHORT
             ).show()
         }
+        refreshAllUi()
     }
 
     // === CYCLERS ===
@@ -558,6 +631,12 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun cycleOrientationAndFlip() {
+        if (SolStreamService.isBroadcastLive && !settings.isVertical) {
+            // While live in 16:9 landscape, flip cleanly between 0° and 180° for USB-C cable comfort
+            val nextFlip = if (settings.landscapeFlip == 0) 180 else 0
+            updateSetting(settings.copy(landscapeFlip = nextFlip), requiresRestartIfLive = false)
+            return
+        }
         when {
             !settings.isVertical && settings.landscapeFlip == 0 ->
                 updateSetting(settings.copy(isVertical = false, landscapeFlip = 180))
@@ -743,11 +822,26 @@ class MainActivity : AppCompatActivity() {
     }
 
     // === DIRECT PERMISSION & SETTINGS TELEPORTERS ===
+    private fun openAccessibilitySettingsDirect() {
+        try {
+            if (!isAccessibilityServiceEnabled()) {
+                Toast.makeText(
+                    this,
+                    "Installed apps -> SolStream Studio -> if greyed out, tap it once & press OK so ⋮ appears in Step 4!",
+                    Toast.LENGTH_LONG
+                ).show()
+            }
+            startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+        } catch (_: Exception) {
+            startActivity(Intent(Settings.ACTION_SETTINGS))
+        }
+    }
+
     private fun openAppInfoForRestrictedSettings() {
         try {
             Toast.makeText(
                 this,
-                "Tap ⋮ (top-right) -> 'Allow restricted settings'!",
+                "Tap ⋮ (top-right) -> 'Allow restricted settings'! (If no ⋮ shows, tap grey SolStream in Step 3 first.)",
                 Toast.LENGTH_LONG
             ).show()
             startActivity(
@@ -756,21 +850,6 @@ class MainActivity : AppCompatActivity() {
                     Uri.parse("package:$packageName")
                 )
             )
-        } catch (_: Exception) {
-            startActivity(Intent(Settings.ACTION_SETTINGS))
-        }
-    }
-
-    private fun openAccessibilitySettingsDirect() {
-        try {
-            if (!isAccessibilityServiceEnabled()) {
-                Toast.makeText(
-                    this,
-                    "Tap Installed apps -> SolStream Studio -> Turn ON",
-                    Toast.LENGTH_LONG
-                ).show()
-            }
-            startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
         } catch (_: Exception) {
             startActivity(Intent(Settings.ACTION_SETTINGS))
         }
@@ -820,12 +899,14 @@ class MainActivity : AppCompatActivity() {
                 .setTitle("Enable Accessibility Service First")
                 .setMessage(
                     "SolStream Studio uses Android's Accessibility Overlay to display your floating live pill in CODM and keep microphone sharing active alongside squad voice chat.\n\n" +
-                        "Tip: If Android greys out the switch, tap SolStream Studio once in Accessibility, then tap '1. Unlock Restricted' below to jump straight to App Info (⋮ -> Allow restricted settings)."
+                        "Why ⋮ 3-dots hide on Android 13–17:\n" +
+                        "1) Tap 'Step A: Accessibility' below -> Installed apps -> tap greyed-out SolStream Studio once & press OK.\n" +
+                        "2) Tap 'Step B: Unlock ⋮' -> tap ⋮ at top-right -> Allow restricted settings, then turn Accessibility ON!"
                 )
-                .setPositiveButton("2. Open Accessibility") { _, _ ->
+                .setPositiveButton("Step A: Accessibility") { _, _ ->
                     openAccessibilitySettingsDirect()
                 }
-                .setNeutralButton("1. Unlock Restricted") { _, _ ->
+                .setNeutralButton("Step B: Unlock ⋮") { _, _ ->
                     openAppInfoForRestrictedSettings()
                 }
                 .setNegativeButton("Stream Without Overlay") { _, _ ->
@@ -933,13 +1014,11 @@ class MainActivity : AppCompatActivity() {
 
         Thread({
             try {
-                // 1. DNS Resolution
                 val dnsStartNs = System.nanoTime()
                 val resolvedIp = InetAddress.getByName(host)
                 val dnsMs = (System.nanoTime() - dnsStartNs) / 1_000_000L
                 val targetAddr = InetSocketAddress(resolvedIp, port)
 
-                // 2. Real TLS Handshake + Certificate & SNI Verification (if rtmps://)
                 var tlsInfo = "Plain RTMP (No TLS)"
                 if (isTls) {
                     val rawSock = Socket()
@@ -963,7 +1042,6 @@ class MainActivity : AppCompatActivity() {
                     }
                 }
 
-                // 3. Idle 1-RTT Ping & Jitter (4 samples)
                 val idleSamples = mutableListOf<Long>()
                 repeat(4) {
                     idleSamples.add(measureSingleTcpRttMs(targetAddr, 3000))
@@ -977,7 +1055,6 @@ class MainActivity : AppCompatActivity() {
                     }
                 }
 
-                // 4. Sustained Upload Capacity & Loaded RTT Bufferbloat Test (against speed-test endpoint)
                 var uploadMbps = -1.0
                 var loadedRttMs = -1L
                 val probeDone = AtomicBoolean(false)
@@ -999,7 +1076,7 @@ class MainActivity : AppCompatActivity() {
 
                 var upConn: HttpsURLConnection? = null
                 try {
-                    val totalBytes = 2 * 1024 * 1024 // 2.0 MB sustained upload burst
+                    val totalBytes = 2 * 1024 * 1024
                     val chunk = ByteArray(16 * 1024) { 0x5A.toByte() }
                     upConn = (URL("https://speed.cloudflare.com/__up").openConnection() as HttpsURLConnection).apply {
                         requestMethod = "POST"
@@ -1027,7 +1104,6 @@ class MainActivity : AppCompatActivity() {
                         uploadMbps = (totalBytes * 8.0) / (upSec * 1_000_000.0)
                     }
                 } catch (_: Exception) {
-                    // Speed-test endpoint blocked/unreachable; still report verified YouTube TLS metrics
                 } finally {
                     probeDone.set(true)
                     try { loadedPingThread.join(1200) } catch (_: Exception) {}
@@ -1195,10 +1271,12 @@ class MainActivity : AppCompatActivity() {
 
     private fun showSamsungSetupGuide() {
         val msg = """
-            1. UNLOCK RESTRICTED ACCESSIBILITY (One-Time on Sideloaded APKs):
-            • On Android 13–17, first tap '4. Enable Accessibility' -> Installed apps -> tap greyed-out SolStream Studio once so Android registers the prompt.
-            • Return here and tap '3. Unlock Restricted' (teleports straight into SolStream App Info) -> tap ⋮ at top-right -> 'Allow restricted settings'.
-            • Now tap '4. Enable Accessibility' and toggle SolStream Studio ON!
+            1. UNLOCK RESTRICTED ACCESSIBILITY (Why ⋮ 3-Dots Hide at First):
+            • On Android 13–17, Android hides the App Info ⋮ menu until you try Accessibility once!
+            • Tap '3. Tap Accessibility 1st' -> Installed apps -> tap greyed-out SolStream Studio once & press OK.
+            • Return here and tap '4. Unlock Restricted (⋮)' -> tap ⋮ at top-right -> 'Allow restricted settings'.
+            • Tap '3. Tap Accessibility 1st' again and toggle SolStream Studio ON!
+            (Once unlocked, future signed updates keep Accessibility ON forever.)
 
             2. REALME NECKBAND STEREO + 45ms GAME MODE TIP:
             • If using Phone Mic for 48 kHz studio voice while keeping stereo footsteps in your neckband: open Bluetooth Settings -> realme Buds Wireless 5 ANC (Gear icon) -> toggle Calls OFF and keep Audio ON.
@@ -1211,11 +1289,11 @@ class MainActivity : AppCompatActivity() {
         AlertDialog.Builder(this)
             .setTitle("Samsung One UI & CODM Pro Setup")
             .setMessage(msg)
-            .setPositiveButton("Open App Info (⋮)") { _, _ ->
-                openAppInfoForRestrictedSettings()
-            }
-            .setNeutralButton("Open Accessibility") { _, _ ->
+            .setPositiveButton("Step 1: Accessibility") { _, _ ->
                 openAccessibilitySettingsDirect()
+            }
+            .setNeutralButton("Step 2: App Info (⋮)") { _, _ ->
+                openAppInfoForRestrictedSettings()
             }
             .setNegativeButton("Got It", null)
             .show()
