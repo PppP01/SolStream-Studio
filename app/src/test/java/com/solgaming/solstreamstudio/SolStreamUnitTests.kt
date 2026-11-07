@@ -67,7 +67,12 @@ class SolStreamUnitTests {
 
     @Test
     fun voicePresetsAndGenderProfiles_applyCleanlyAndPreserveMixAndMatchFreedom() {
-        val base = StreamSettings(voiceGenderProfile = "MALE", gameGainPercent = 250, targetBitrateKbps = 100000)
+        val base = StreamSettings(
+            voiceGenderProfile = "MALE",
+            hpfCutoffHz = 0,
+            gameGainPercent = 250,
+            targetBitrateKbps = 100000
+        )
         val luxe = MicDspProcessor.applyPresetToSettings(base, "SOL_LUXE")
         assertEquals("SOL_LUXE", luxe.voicePreset)
         assertEquals("MALE", luxe.voiceGenderProfile)
