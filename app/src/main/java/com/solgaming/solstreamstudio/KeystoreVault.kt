@@ -1,4 +1,5 @@
 /*
+ * ॐ नमः शिवाय (Om Namah Shivaya)
  * SolStream Studio — Ultra-Lightweight Mobile Gaming Broadcast Engine
  * Copyright (c) 2026 Sol (@Sol_CODM / github.com/PppP01). All rights reserved.
  * SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
@@ -83,16 +84,16 @@ data class StreamSettings(
     val noiseGateEnabled: Boolean = true,         // Gentle breath/idle expander
     val voiceEqEnabled: Boolean = false,          // Gender-tuned 3-band dynamic vocal EQ
     val deEsserEnabled: Boolean = false,          // Gender-tuned split-band sibilance tamer
-    val velvetWarmthEnabled: Boolean = false,     //Even-order tube warmth + 11.5 kHz silky air
+    val velvetWarmthEnabled: Boolean = false,     // Even-order tube warmth + 11.5 kHz silky air
     val compressorEnabled: Boolean = true,        // Broadcast 3:1 vocal leveling compressor
     val whisperLiftEnabled: Boolean = false,      // Upward low-level callout booster
     val slowAgcEnabled: Boolean = false,          // Speech-gated slow broadcast loudness ride
     val speakerAecEnabled: Boolean = false,       // Optional hardware AcousticEchoCanceler for speaker players
     val micGainPercent: Int = 125,                // 50..250%
-    val gameGainPercent: Int = 100,               // 0..135%
+    val gameGainPercent: Int = 100,               // 0..250% (Protected by 4x Cubic Look-Ahead Limiter)
     val gameCinemaWideEnabled: Boolean = false,   // Stackable Game Bus: Mid-Side 3D spatial widener
-    val gameSubPunchEnabled: Boolean = false,     // Stackable Game Bus: +1.5 dB @ 65 Hz theater sub-punch
-    val gameFootstepFocusEnabled: Boolean = false,// Stackable Game Bus: +1.8 dB @ 2.8 kHz footstep lift
+    val gameSubPunchEnabled: Boolean = false,     // Stackable Game Bus: +1.8 dB @ 65 Hz theater sub-punch
+    val gameFootstepFocusEnabled: Boolean = false,// Stackable Game Bus: +2.0 dB @ 2.85 kHz footstep lift
     val gameBlastTamerEnabled: Boolean = false,   // Stackable Game Bus: tames harsh explosion spikes
     val vadDuckingPercent: Int = 0,               // 0, 20, 35, 50%
     val micSyncDelayMs: Int = 0,                  // 0..200 ms
@@ -104,6 +105,7 @@ data class StreamSettings(
 
 object KeystoreVault {
 
+    const val AUSPICIOUS_DEDICATION = "ॐ नमः शिवाय"
     const val DEFAULT_YOUTUBE_RTMPS = "rtmps://a.rtmps.youtube.com:443/live2"
     const val DEFAULT_TWITCH_RTMPS = "rtmps://live.twitch.tv:443/app"
     const val DEFAULT_KICK_RTMPS = "rtmps://fa723fc1b171.global-contribute.live-video.net:443/app"
@@ -128,7 +130,6 @@ object KeystoreVault {
         val trimmed = rawUrl.trim().trimEnd('/')
         if (trimmed.isEmpty()) return DEFAULT_YOUTUBE_RTMPS
 
-        // Auto-upgrade legacy a.rtmp.youtube.com over rtmps:// to official a.rtmps.youtube.com
         val fixedHost = trimmed
             .replace("rtmps://a.rtmp.youtube.com", "rtmps://a.rtmps.youtube.com", ignoreCase = true)
             .replace("rtmps://b.rtmp.youtube.com", "rtmps://b.rtmps.youtube.com", ignoreCase = true)
@@ -362,7 +363,6 @@ object KeystoreVault {
                 cachedSecurityLabel = null
                 return kg.generateKey()
             } catch (_: Exception) {
-                // Fall back cleanly to TEE hardware keystore
             }
         }
 
@@ -561,7 +561,7 @@ object KeystoreVault {
                 slowAgcEnabled = j.optBoolean("slowAgcEnabled", fallback.slowAgcEnabled),
                 speakerAecEnabled = j.optBoolean("speakerAecEnabled", fallback.speakerAecEnabled),
                 micGainPercent = j.optInt("micGainPercent", fallback.micGainPercent).coerceIn(50, 250),
-                gameGainPercent = j.optInt("gameGainPercent", fallback.gameGainPercent).coerceIn(0, 135),
+                gameGainPercent = j.optInt("gameGainPercent", fallback.gameGainPercent).coerceIn(0, 250),
                 gameCinemaWideEnabled = j.optBoolean("gameCinemaWideEnabled", fallback.gameCinemaWideEnabled),
                 gameSubPunchEnabled = j.optBoolean("gameSubPunchEnabled", fallback.gameSubPunchEnabled),
                 gameFootstepFocusEnabled = j.optBoolean("gameFootstepFocusEnabled", fallback.gameFootstepFocusEnabled),
