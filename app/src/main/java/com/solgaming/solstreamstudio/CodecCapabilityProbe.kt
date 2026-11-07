@@ -95,7 +95,7 @@ enum class DeviceTier(
         defaultWidth = 2560,
         defaultHeight = 1440,
         defaultFps = 60,
-        defaultBitrateKbps = 24000,
+        defaultBitrateKbps = 20000,
         defaultAudioBitrateKbps = 320
     );
 
@@ -338,7 +338,7 @@ object CodecCapabilityProbe {
     private const val CACHE_PREFS = "solstream_hw_probe_cache_v3"
     private const val KEY_FINGERPRINT = "cached_fingerprint"
     private const val KEY_PAYLOAD = "cached_scan_json"
-    private const val CACHE_SCHEMA_TAG = "ultra_v111_r1"
+    private const val CACHE_SCHEMA_TAG = "ultra_v111_r2"
 
     private val probeExecutor = Executors.newSingleThreadExecutor { r ->
         Thread(r, "SolHwProbeWorker").apply { isDaemon = true }
@@ -346,6 +346,24 @@ object CodecCapabilityProbe {
     private val mainHandler = Handler(Looper.getMainLooper())
 
     @Volatile private var cachedScan: DeviceScanSummary? = null
+
+    /**
+     * Maps Android kernel usable totalMem (which subtracts ~0.6–0.9 GiB for GPU/modem/TEE hardware
+     * carveouts on every phone) to the device's true physical LPDDR tier (4, 6, 8, 12, 16, 24 GB).
+     */
+    internal fun normalizePhysicalRamGb(totalBytes: Long): Int {
+        if (totalBytes <= 0L) return 8
+        val gib = totalBytes.toDouble() / (1024.0 * 1024.0 * 1024.0)
+        return when {
+            gib >= 18.0 -> 24
+            gib >= 13.0 -> 16
+            gib >= 9.0 -> 12
+            gib >= 6.2 -> 8
+            gib >= 4.5 -> 6
+            gib >= 3.1 -> 4
+            else -> 3
+        }
+    }
 
     fun peekCachedOrPlaceholder(context: Context): DeviceScanSummary {
         cachedScan?.let { return it }
@@ -509,7 +527,7 @@ object CodecCapabilityProbe {
             val memInfo = ActivityManager.MemoryInfo()
             am.getMemoryInfo(memInfo)
             if (memInfo.totalMem > 0L) {
-                ramGb = max(2, ((memInfo.totalMem + 536_870_912L) / (1024L * 1024L * 1024L)).toInt())
+                ramGb = normalizePhysicalRamGb(memInfo.totalMem)
             }
         } catch (_: Exception) {
         }
@@ -737,7 +755,6 @@ object CodecCapabilityProbe {
                 fps = testFps
             )
 
-            // Verify 4K surface configure independently before advertising 4K60/4K30 support
             val verified4k60 = ok4k60 && surfaceOk && verifySurfaceConfigureOnly(info.name, mime, 3840, 2160, 60)
             val verified4k30 = (ok4k30 || ok4k60) && surfaceOk &&
                 (verified4k60 || verifySurfaceConfigureOnly(info.name, mime, 3840, 2160, 30))
@@ -810,10 +827,6 @@ object CodecCapabilityProbe {
         }
     }
 
-    /**
-     * Counts an encode as verified ONLY when an actual encoded frame buffer (info.size > 0,
-     * excluding BUFFER_FLAG_CODEC_CONFIG and INFO_OUTPUT_FORMAT_CHANGED) is dequeued.
-     */
     internal fun isRealEncodedFrameOutput(outIdx: Int, size: Int, flags: Int): Boolean {
         if (outIdx < 0 || size <= 0) return false
         val isCodecConfig = (flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0
