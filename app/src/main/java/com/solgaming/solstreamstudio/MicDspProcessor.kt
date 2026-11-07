@@ -1,4 +1,5 @@
 /*
+ * ॐ नमः शिवाय (Om Namah Shivaya)
  * SolStream Studio — Ultra-Lightweight Mobile Gaming Broadcast Engine
  * Copyright (c) 2026 Sol (@Sol_CODM / github.com/PppP01). All rights reserved.
  * SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
@@ -83,6 +84,7 @@ class MicDspProcessor(private val sampleRate: Int = 48000) {
 
     private val nativeLock = Any()
     @Volatile private var nativeRnnHandle: Long = 0L
+    @Volatile private var released: Boolean = false
 
     private var configuredHpfHz = -1
     private var configuredGender = ""
@@ -163,20 +165,26 @@ class MicDspProcessor(private val sampleRate: Int = 48000) {
         }
     }
 
-    private fun ensureNativeDenoiserHandle(): Long {
-        val existing = nativeRnnHandle
-        if (existing != 0L) return existing
-        if (!SolNativeRnnoise.isLibraryLoaded) return 0L
+    /**
+     * Thread-safe native RNNoise execution locked against [release] so a delayed audio thread
+     * can never access a freed C DenoiseState pointer.
+     */
+    private fun runNativeRnnoiseLocked(buffer: FloatArray, wetStrength: Float): Float {
+        if (!SolNativeRnnoise.isLibraryLoaded) return -1.0f
         synchronized(nativeLock) {
+            if (released) return -1.0f
             if (nativeRnnHandle == 0L) {
                 nativeRnnHandle = SolNativeRnnoise.createInstance()
             }
-            return nativeRnnHandle
+            val handle = nativeRnnHandle
+            if (handle == 0L) return -1.0f
+            return SolNativeRnnoise.processMono480InPlace(handle, buffer, wetStrength)
         }
     }
 
     fun release() {
         synchronized(nativeLock) {
+            released = true
             val h = nativeRnnHandle
             nativeRnnHandle = 0L
             if (h != 0L) {
@@ -194,7 +202,7 @@ class MicDspProcessor(private val sampleRate: Int = 48000) {
         }
         val w0 = 2.0 * PI * cutoffHz.toDouble() / sampleRate.toDouble()
         val cosW = cos(w0)
-        val alpha = sin(w0) / sqrt(2.0) // Butterworth Q = 0.7071
+        val alpha = sin(w0) / sqrt(2.0)
         val a0 = 1.0 + alpha
         hpfFilter.b0 = ((1.0 + cosW) * 0.5) / a0
         hpfFilter.b1 = -(1.0 + cosW) / a0
@@ -247,7 +255,6 @@ class MicDspProcessor(private val sampleRate: Int = 48000) {
         configuredGender = gender
         when (gender) {
             "MALE" -> {
-                // Deep chest foundation (115 Hz), box/mud cleanup (310 Hz), clear callout presence (3.5 kHz)
                 configurePeakingEq(eqLowWarmth, 115.0, 0.78, 1.8)
                 configurePeakingEq(eqMudCut, 310.0, 1.25, -2.6)
                 configurePeakingEq(eqPresence, 3500.0, 0.95, 2.4)
@@ -255,7 +262,6 @@ class MicDspProcessor(private val sampleRate: Int = 48000) {
                 configureHighShelf(eqVelvetAir, 11000.0, 1.8)
             }
             "FEMALE" -> {
-                // Warmth matched to higher fundamental (165 Hz), honk cut (400 Hz), smooth presence (4.2 kHz)
                 configurePeakingEq(eqLowWarmth, 165.0, 0.80, 1.6)
                 configurePeakingEq(eqMudCut, 400.0, 1.30, -2.4)
                 configurePeakingEq(eqPresence, 4200.0, 1.00, 2.2)
@@ -263,7 +269,6 @@ class MicDspProcessor(private val sampleRate: Int = 48000) {
                 configureHighShelf(eqVelvetAir, 12000.0, 2.0)
             }
             else -> {
-                // Balanced broadcast curve for all voices
                 configurePeakingEq(eqLowWarmth, 135.0, 0.80, 1.5)
                 configurePeakingEq(eqMudCut, 345.0, 1.25, -2.4)
                 configurePeakingEq(eqPresence, 3800.0, 0.98, 2.3)
@@ -330,17 +335,14 @@ class MicDspProcessor(private val sampleRate: Int = 48000) {
         var neuralVadProb = -1.0f
         var ranNativeRnnoise = false
 
-        if (nsMode == "RNNOISE" && nsLevel > 0 && count == 480 && sampleRate == 48000 && SolNativeRnnoise.isLibraryLoaded) {
-            val handle = ensureNativeDenoiserHandle()
-            if (handle != 0L) {
-                val wetStrength = when (nsLevel) {
-                    1 -> 0.65f
-                    2 -> 0.88f
-                    else -> 1.00f
-                }
-                neuralVadProb = SolNativeRnnoise.processMono480InPlace(handle, buffer, wetStrength)
-                ranNativeRnnoise = (neuralVadProb >= 0.0f)
+        if (nsMode == "RNNOISE" && nsLevel > 0 && count == 480 && sampleRate == 48000) {
+            val wetStrength = when (nsLevel) {
+                1 -> 0.65f
+                2 -> 0.88f
+                else -> 1.00f
             }
+            neuralVadProb = runNativeRnnoiseLocked(buffer, wetStrength)
+            ranNativeRnnoise = (neuralVadProb >= 0.0f)
         }
 
         // Measure post-HPF / post-RNNoise frame energy & zero-crossing rate for VAD & noise-floor tracking
@@ -387,7 +389,7 @@ class MicDspProcessor(private val sampleRate: Int = 48000) {
             )
         lastVadProbability = if (neuralVadProb >= 0f) neuralVadProb else if (speechDetected) 0.85f else 0.05f
 
-        val holdDurationSamples = (sampleRate * 0.16f).toInt() // 160 ms natural syllable tail hold
+        val holdDurationSamples = (sampleRate * 0.16f).toInt()
         if (speechDetected) {
             gateHoldSamples = holdDurationSamples
         } else if (gateHoldSamples > 0) {
@@ -396,9 +398,10 @@ class MicDspProcessor(private val sampleRate: Int = 48000) {
         val activeSpeech = speechDetected || gateHoldSamples > 0
         vadSpeechActive = activeSpeech
 
-        // Run light spectral cut ONLY if selected (or as fallback if RNNoise/HW_NS wasn't active)
+        // Fallback to Light Spectral Cut whenever RNNOISE did not run on the current frame
+        // (e.g., partial !=480 frame, native handle failure, or JVM unit test)
         val runLightSpectral = nsLevel > 0 && !ranNativeRnnoise &&
-            (nsMode == "LIGHT" || (nsMode == "RNNOISE" && !SolNativeRnnoise.isLibraryLoaded) || (nsMode == "HW_NS" && !platformHwNsAttached))
+            (nsMode == "LIGHT" || nsMode == "RNNOISE" || (nsMode == "HW_NS" && !platformHwNsAttached))
 
         val targetSuppressGain = if (runLightSpectral) {
             val strength = when (nsLevel) {
@@ -416,8 +419,8 @@ class MicDspProcessor(private val sampleRate: Int = 48000) {
         val useSlowAgc = slowAgcEnabled
         if (useSlowAgc) {
             if (speechDetected && rms > 0.011f) {
-                val targetSpeechRms = 0.145f // ~ -16.8 dBFS consistent speaking loudness
-                val desiredAgc = (targetSpeechRms / rms).coerceIn(0.63f, 1.95f) // -4 dB .. +5.8 dB
+                val targetSpeechRms = 0.145f
+                val desiredAgc = (targetSpeechRms / rms).coerceIn(0.63f, 1.95f)
                 val agcRate = if (desiredAgc < slowAgcGain) 0.06f else 0.02f
                 slowAgcGain += agcRate * (desiredAgc - slowAgcGain)
             }
@@ -433,7 +436,7 @@ class MicDspProcessor(private val sampleRate: Int = 48000) {
         val useWhisper = whisperLiftEnabled
         val useComp = compressorEnabled
 
-        val targetGate = if (!useGate || activeSpeech) 1.0f else 0.24f // Smooth -12.4 dB idle breath floor
+        val targetGate = if (!useGate || activeSpeech) 1.0f else 0.24f
         val targetAirMix = if (useVelvet && activeSpeech) 1.0f else 0.0f
         var targetCompBlockGain = 1.0f
         var minCompGainInFrame = 1.0f
@@ -461,7 +464,6 @@ class MicDspProcessor(private val sampleRate: Int = 48000) {
                 s = eqPresence.process(s)
             }
 
-            // True Split-Band De-Esser: subtracts ONLY excess sibilant energy without ducking chest/mid voice
             if (useDeEss) {
                 val sibSignal = sibilanceBand.process(s)
                 val absSib = abs(sibSignal)
@@ -473,7 +475,6 @@ class MicDspProcessor(private val sampleRate: Int = 48000) {
                 }
             }
 
-            // Velvet Preamp Warmth (DC-blocked even-order harmonic richness + VAD-gated silky top air)
             if (useVelvet) {
                 val clamped = s.coerceIn(-1.2f, 1.2f)
                 val sq = clamped * clamped
@@ -487,21 +488,18 @@ class MicDspProcessor(private val sampleRate: Int = 48000) {
                 s = warmed + velvetAirMixSmooth * (aired - warmed)
             }
 
-            // Upward Whisper Lift + Broadcast 3:1 Compressor (computed every 16 samples & slewed sample-accurately)
             val absIn = abs(s)
             compEnv += (if (absIn > compEnv) 0.018f else 0.0007f) * (absIn - compEnv)
 
             if ((i and 15) == 0) {
                 var desiredDynGain = 1.0f
                 if (useWhisper && activeSpeech && compEnv in 0.012f..0.110f) {
-                    // Gently lift quiet callouts up to +4.2 dB without boosting room floor
                     val lift = (0.110f / max(compEnv, 0.025f)).pow(0.32f).coerceIn(1.0f, 1.62f)
                     desiredDynGain *= lift
                 }
                 if (useComp) {
-                    val threshold = 0.224f // ~ -13.0 dBFS
+                    val threshold = 0.224f
                     if (compEnv > threshold) {
-                        // 3:1 compression ratio: (threshold / env)^(2/3) * 1.14 makeup
                         val atten = (threshold / compEnv).pow(0.6667f)
                         if (atten < minCompGainInFrame) minCompGainInFrame = atten
                         desiredDynGain *= atten * 1.14f
@@ -515,7 +513,6 @@ class MicDspProcessor(private val sampleRate: Int = 48000) {
             compGainSmooth += 0.08f * (targetCompBlockGain - compGainSmooth)
             s *= compGainSmooth * currentAgcGain
 
-            // Transparent rational soft-clip safety ceiling before 4x cubic look-ahead master limiter
             if (abs(s) > 0.92f) {
                 val sign = if (s >= 0f) 1f else -1f
                 val excess = abs(s) - 0.92f
@@ -548,10 +545,6 @@ class MicDspProcessor(private val sampleRate: Int = 48000) {
             else -> preset
         }
 
-        /**
-         * Applies a 1-tap voice preset recipe onto [StreamSettings] while leaving every individual
-         * filter switch editable afterward for 100% mix-and-match customization.
-         */
         fun applyPresetToSettings(current: StreamSettings, newPreset: String): StreamSettings {
             val p = newPreset.uppercase(Locale.US)
             val defaultHpf = when (current.voiceGenderProfile.uppercase(Locale.US)) {
@@ -562,9 +555,7 @@ class MicDspProcessor(private val sampleRate: Int = 48000) {
             val activeHpf = if (current.hpfCutoffHz == 0) defaultHpf else current.hpfCutoffHz
 
             return when (p) {
-                "RAW" -> current.copy(
-                    voicePreset = "RAW"
-                )
+                "RAW" -> current.copy(voicePreset = "RAW")
                 "CLEAN" -> current.copy(
                     voicePreset = "CLEAN",
                     hpfCutoffHz = activeHpf,
