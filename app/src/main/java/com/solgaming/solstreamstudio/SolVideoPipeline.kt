@@ -1,6 +1,14 @@
+/*
+ * SolStream Studio — Ultra-Lightweight Mobile Gaming Broadcast Engine
+ * Copyright (c) 2026 Sol (@Sol_CODM / github.com/PppP01). All rights reserved.
+ * SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+ * Commercial redistribution, rebranding, or app-store monetization prohibited without written license.
+ */
+
 package com.solgaming.solstreamstudio
 
 import android.content.Context
+import android.graphics.Bitmap
 import android.graphics.SurfaceTexture
 import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
@@ -16,6 +24,7 @@ import android.opengl.EGLExt
 import android.opengl.EGLSurface
 import android.opengl.GLES11Ext
 import android.opengl.GLES20
+import android.opengl.GLUtils
 import android.opengl.Matrix
 import android.os.Build
 import android.os.Bundle
@@ -27,8 +36,10 @@ import android.view.WindowManager
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.FloatBuffer
+import java.util.Locale
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.math.roundToInt
 
 class SolVideoPipeline(private val context: Context) {
 
@@ -38,24 +49,63 @@ class SolVideoPipeline(private val context: Context) {
         val outWidth: Int,
         val outHeight: Int,
         val fps: Int,
-        val isVbr: Boolean
+        val isVbr: Boolean,
+        val isHdr10: Boolean = false,
+        val glEngineLabel: String = "ES 3.0",
+        val companionActive: Boolean = false
     )
 
     private data class ConfiguredEncoder(
         val codec: MediaCodec,
         val inputSurface: Surface,
-        val actualIsVbr: Boolean
+        val actualIsVbr: Boolean,
+        val actualIsHdr10: Boolean
     )
 
     @Volatile var isRunning = false
         private set
 
-    @Volatile var brbBlackoutActive = false
-    @Volatile var liveFramingMode = "FIT"        // "FIT", "FILL", "SMART"
+    // Scene state: "LIVE", "STARTING_SOON", or "BRB" (backward-compatible with brbBlackoutActive)
+    @Volatile var activeSceneMode: String = "LIVE"
+
+    var brbBlackoutActive: Boolean
+        get() = activeSceneMode != "LIVE"
+        set(value) {
+            activeSceneMode = if (value) {
+                if (activeSceneMode == "STARTING_SOON") "STARTING_SOON" else "BRB"
+            } else {
+                "LIVE"
+            }
+        }
+
+    // Live-adjustable visual & filter states (0-ms hot-swap inside OpenGL render loop)
+    @Volatile var liveFramingMode = "FIT"              // "FIT", "SMART", "FILL"
     @Volatile var liveSmartZoomPercent = 108
-    @Volatile var liveLandscapeFlip = 0          // 0 or 180
+    @Volatile var liveLandscapeFlip = 0                // 0 or 180
+    @Volatile var liveUpscalerMode = "BICUBIC"         // "BILINEAR", "BICUBIC", "LANCZOS"
+    @Volatile var liveCinematicFilmic = false
+    @Volatile var liveAmoledVivid = false
+    @Volatile var liveShadowBoost = false
+    @Volatile var liveColorTempFilter = "NEUTRAL"      // "NEUTRAL", "WARM", "COOL"
     @Volatile var liveGpuSharpen = false
+    @Volatile var liveShortsBackdropMode = "BLUR"      // "DARK", "BLUR", "POSTER"
+    @Volatile var liveOverlayImageEnabled = false
+    @Volatile var liveBannerEnabled = false
+    @Volatile var liveBannerText = ""
+    @Volatile var liveBannerPosition = "TOP"          // "TOP", "BOTTOM"
+    @Volatile var liveMinimapShieldEnabled = false
+    @Volatile var liveMinimapShieldCorner = "TOP_RIGHT"
+    @Volatile var liveRoiMode = "AUTO"                 // "OFF", "AUTO", "CENTER", "HUD"
+
+    /** Automatic Severe-Thermal cooldown relief: steps 60 FPS pacing down to 30 FPS temporarily. */
+    @Volatile var thermalThrottle30Fps = false
+
+    /** Pauses secondary 9:16 Dual-Format companion rendering first if Severe warmth occurs. */
+    @Volatile var companionPausedByThermal = false
+
     @Volatile var currentBitrateBps = 20_000_000
+        private set
+    @Volatile var companionBitrateBps = 8_000_000
         private set
 
     @Volatile var actualEncodedFps = 0
@@ -66,30 +116,60 @@ class SolVideoPipeline(private val context: Context) {
         private set
     @Volatile var lastSentVideoPtsUs: Long = -1L
         private set
+    @Volatile var activeGlEngineSummary: String = "OpenGL ES"
+        private set
 
-    /** Optional hook for SolStreamService to react if hardware encoder/GL dies mid-stream. */
     @Volatile var onFatalPipelineError: ((String) -> Unit)? = null
 
     @Volatile private var pendingCaptureWidth = 0
     @Volatile private var pendingCaptureHeight = 0
 
+    private var maxHardwareBitrateBps = 100_000_000
+    private var primarySupportsRoi = false
+    private var primaryOutW = 1920
+    private var primaryOutH = 1080
+
     private var videoCodecInstance: MediaCodec? = null
+    private var companionCodecInstance: MediaCodec? = null
     private var virtualDisplay: VirtualDisplay? = null
     private var renderThread: Thread? = null
     private var drainThread: Thread? = null
+    private var companionDrainThread: Thread? = null
     private var callbackHandlerThread: HandlerThread? = null
     private var projectionRef: MediaProjection? = null
     private var projectionCallback: MediaProjection.Callback? = null
 
+    fun setSceneMode(mode: String) {
+        val norm = when (mode.uppercase(Locale.US)) {
+            "STARTING_SOON" -> "STARTING_SOON"
+            "BRB" -> "BRB"
+            else -> "LIVE"
+        }
+        activeSceneMode = norm
+    }
+
     fun applyLiveVisualSettings(s: StreamSettings) {
-        liveFramingMode = s.framingMode
+        liveFramingMode = s.framingMode.uppercase(Locale.US)
         liveSmartZoomPercent = s.smartZoomPercent.coerceIn(100, 125)
         liveLandscapeFlip = if (s.landscapeFlip == 180) 180 else 0
+        liveUpscalerMode = s.upscalerMode.uppercase(Locale.US)
+        liveCinematicFilmic = s.cinematicFilmic
+        liveAmoledVivid = s.amoledVivid
+        liveShadowBoost = s.shadowBoost
+        liveColorTempFilter = s.colorTempFilter.uppercase(Locale.US)
         liveGpuSharpen = s.gpuSharpen
+        liveShortsBackdropMode = s.shortsBackdropMode.uppercase(Locale.US)
+        liveOverlayImageEnabled = s.overlayImageEnabled
+        liveBannerEnabled = s.liveBannerEnabled
+        liveBannerText = s.liveBannerText
+        liveBannerPosition = s.liveBannerPosition.uppercase(Locale.US)
+        liveMinimapShieldEnabled = s.minimapShieldEnabled
+        liveMinimapShieldCorner = s.minimapShieldCorner.uppercase(Locale.US)
+        liveRoiMode = s.roiMode.uppercase(Locale.US)
     }
 
     fun setBitrateOnFly(newBitrateBps: Int) {
-        val clamped = newBitrateBps.coerceIn(1_000_000, 55_000_000)
+        val clamped = newBitrateBps.coerceIn(400_000, maxHardwareBitrateBps)
         currentBitrateBps = clamped
         try {
             val params = Bundle().apply {
@@ -100,12 +180,60 @@ class SolVideoPipeline(private val context: Context) {
         }
     }
 
+    fun setCompanionBitrateOnFly(newBitrateBps: Int) {
+        val clamped = newBitrateBps.coerceIn(800_000, 25_000_000)
+        companionBitrateBps = clamped
+        try {
+            val params = Bundle().apply {
+                putInt(MediaCodec.PARAMETER_KEY_VIDEO_BITRATE, clamped)
+            }
+            companionCodecInstance?.setParameters(params)
+        } catch (_: Exception) {
+        }
+    }
+
     fun requestSyncFrame() {
         try {
             val params = Bundle().apply {
                 putInt(MediaCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME, 0)
             }
             videoCodecInstance?.setParameters(params)
+            companionCodecInstance?.setParameters(params)
+        } catch (_: Exception) {
+        }
+    }
+
+    private fun pushHardwareRoiIfSupported(codec: MediaCodec, width: Int, height: Int, mode: String) {
+        if (!primarySupportsRoi || Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return
+        val m = mode.uppercase(Locale.US)
+        if (m == "OFF") return
+
+        try {
+            // Android Codec2 ROI syntax: "top,left-bottom,right=deltaQp;"
+            val cTop = (height * 0.28f).roundToInt()
+            val cBot = (height * 0.72f).roundToInt()
+            val cLeft = (width * 0.30f).roundToInt()
+            val cRight = (width * 0.70f).roundToInt()
+
+            val rectSpec = when (m) {
+                "CENTER" -> "$cTop,$cLeft-$cBot,$cRight=-3;"
+                "HUD" -> {
+                    val mBot = (height * 0.34f).roundToInt()
+                    val mLeft = (width * 0.72f).roundToInt()
+                    val bTop = (height * 0.74f).roundToInt()
+                    "0,$mLeft-$mBot,$width=-2;$bTop,0-$height,$width=-2;"
+                }
+                else -> {
+                    // AUTO: Prioritize center crosshair (-3 QP) + top-right minimap/killfeed (-2 QP)
+                    val mBot = (height * 0.32f).roundToInt()
+                    val mLeft = (width * 0.74f).roundToInt()
+                    "$cTop,$cLeft-$cBot,$cRight=-3;0,$mLeft-$mBot,$width=-2;"
+                }
+            }
+            val b = Bundle().apply {
+                putString("qp-offset-rects", rectSpec)
+            }
+            codec.setParameters(b)
         } catch (_: Exception) {
         }
     }
@@ -116,33 +244,58 @@ class SolVideoPipeline(private val context: Context) {
         originTimeNs: Long,
         onProjectionStoppedBySystem: () -> Unit,
         onVideoConfig: (sps: ByteBuffer, pps: ByteBuffer?, vps: ByteBuffer?) -> Unit,
-        onEncodedVideo: (ByteBuffer, MediaCodec.BufferInfo) -> Unit
+        onEncodedVideo: (ByteBuffer, MediaCodec.BufferInfo) -> Unit,
+        enableDualCompanion: Boolean = false,
+        onCompanionConfig: ((sps: ByteBuffer, pps: ByteBuffer?, vps: ByteBuffer?) -> Unit)? = null,
+        onCompanionVideo: ((ByteBuffer, MediaCodec.BufferInfo) -> Unit)? = null
     ): ActiveVideoInfo? {
         if (isRunning) return null
         applyLiveVisualSettings(settings)
+        thermalThrottle30Fps = false
+        companionPausedByThermal = false
         lastSentVideoPtsUs = -1L
         actualEncodedFps = 0
         actualEncodedBitrateBps = 0
         actualFreshCaptureFps = 0
 
         val scan = CodecCapabilityProbe.scanDevice(context)
-        val chosenReport = resolveSafeHardwareEncoder(scan, settings)
+        // Simulcast to Twitch/Kick requires universal H.264 CBR
+        val effectiveCodecReq = if (settings.simulcastTwitchEnabled || settings.simulcastKickEnabled) {
+            "H264"
+        } else {
+            settings.codec
+        }
+        val chosenReport = resolveSafeHardwareEncoder(scan, effectiveCodecReq)
         if (chosenReport == null) {
             DiagnosticsLogger.log(
                 "VIDEO_ERR",
-                "No verified hardware video encoder matched ${settings.codec}. Software fallback is blocked to protect CODM FPS.",
-                "requested=${settings.codec}"
+                "No verified hardware video encoder matched $effectiveCodecReq. Software fallback is blocked to protect CODM FPS.",
+                "requested=$effectiveCodecReq"
             )
             return null
         }
 
-        val baseLong = if (chosenReport.supports1440p60 && max(settings.width, settings.height) >= 2560) 2560 else 1920
-        val baseShort = if (baseLong == 2560) 1440 else 1080
-        val outWidth = if (settings.isVertical) baseShort else baseLong
-        val outHeight = if (settings.isVertical) baseLong else baseShort
         val targetFps = if (settings.fps <= 30) 30 else 60
-        val startBps = settings.targetBitrateKbps.coerceIn(4000, 50000) * 1000
+        val (baseLong, baseShort) = resolveSupportedResolutionTier(chosenReport, settings, targetFps)
+        val rawOutW = if (settings.isVertical) baseShort else baseLong
+        val rawOutH = if (settings.isVertical) baseLong else baseShort
+        val (outWidth, outHeight) = chosenReport.alignDimensions(rawOutW, rawOutH)
+        primaryOutW = outWidth
+        primaryOutH = outHeight
+        primarySupportsRoi = chosenReport.supportsRoi
+
+        val chipMaxBps = chosenReport.maxBitrateMbps.coerceIn(8, 100) * 1_000_000
+        maxHardwareBitrateBps = min(100_000_000, max(25_000_000, chipMaxBps))
+        val startBps = (settings.targetBitrateKbps.coerceIn(500, 100_000) * 1000L)
+            .coerceIn(500_000L, maxHardwareBitrateBps.toLong())
+            .toInt()
         currentBitrateBps = startBps
+
+        val wantHdr10 = settings.hdr10Enabled &&
+            chosenReport.supports10BitHdr &&
+            !settings.simulcastTwitchEnabled &&
+            !settings.simulcastKickEnabled &&
+            settings.glEngineMode.uppercase(Locale.US) != "ES20"
 
         val configured = configureHardwareSurfaceEncoder(
             report = chosenReport,
@@ -150,23 +303,58 @@ class SolVideoPipeline(private val context: Context) {
             height = outHeight,
             fps = targetFps,
             bitrateBps = startBps,
-            wantVbr = settings.useVbr
+            wantVbr = settings.useVbr && !settings.simulcastTwitchEnabled && !settings.simulcastKickEnabled,
+            wantHdr10 = wantHdr10,
+            settings = settings
         ) ?: return null
 
         val codec = configured.codec
         val encoderInputSurface = configured.inputSurface
-        val actualVbr = configured.actualIsVbr
         videoCodecInstance = codec
 
+        // Optional Dual-Format 9:16 Companion Hardware Encoder (shares the single VirtualDisplay!)
+        var compConfigured: ConfiguredEncoder? = null
+        if (enableDualCompanion &&
+            !settings.isVertical &&
+            !configured.actualIsHdr10 &&
+            onCompanionConfig != null &&
+            onCompanionVideo != null &&
+            scan.supportsDualFormatCompanion()
+        ) {
+            val compReport = scan.hevcHardware?.takeIf { it.verifiedSurfaceConfigure } ?: chosenReport
+            val (compW, compH) = compReport.alignDimensions(1080, 1920)
+            val compFps = min(targetFps, 60)
+            val compStartBps = (settings.dualFormatBitrateKbps.coerceIn(1500, 20000) * 1000)
+            companionBitrateBps = compStartBps
+            compConfigured = configureHardwareSurfaceEncoder(
+                report = compReport,
+                width = compW,
+                height = compH,
+                fps = compFps,
+                bitrateBps = compStartBps,
+                wantVbr = false,
+                wantHdr10 = false,
+                settings = settings.copy(isVertical = true, maxBFrames = 0)
+            )
+            companionCodecInstance = compConfigured?.codec
+            if (compConfigured != null) {
+                DiagnosticsLogger.log(
+                    "DUAL_ENC",
+                    "Dual-Format 9:16 Shorts companion hardware encoder started (${compW}x${compH}@${compFps}fps).",
+                    "encoder=${compReport.encoderName}"
+                )
+            }
+        }
+
         val (rawScreenW, rawScreenH, densityDpi) = readPhysicalDisplayMetrics()
-        val panelLong = evenDimension(max(rawScreenW, rawScreenH).coerceAtLeast(1920))
-        val panelShort = evenDimension(min(rawScreenW, rawScreenH).coerceAtLeast(1080))
+        val panelLong = evenDimension(max(rawScreenW, rawScreenH).coerceAtLeast(1280))
+        val panelShort = evenDimension(min(rawScreenW, rawScreenH).coerceAtLeast(720))
         val capWidth = if (settings.isVertical) panelShort else panelLong
         val capHeight = if (settings.isVertical) panelLong else panelShort
         pendingCaptureWidth = 0
         pendingCaptureHeight = 0
 
-        // Android 14+ rule: MUST register MediaProjection.Callback BEFORE createVirtualDisplay()
+        // Android 14+ strict invariant: register MediaProjection.Callback BEFORE createVirtualDisplay()
         val cbThread = HandlerThread("SolProjectionCb").apply { start() }
         callbackHandlerThread = cbThread
         val cb = object : MediaProjection.Callback() {
@@ -204,6 +392,14 @@ class SolVideoPipeline(private val context: Context) {
         projectionCallback = cb
         mediaProjection.registerCallback(cb, Handler(cbThread.looper))
 
+        val preferEs30 = when (settings.glEngineMode.uppercase(Locale.US)) {
+            "ES20" -> false
+            "ES30" -> true
+            else -> scan.supportsGlEs30
+        }
+        val glLabelGuess = if (preferEs30) "OpenGL ES 3.0" else "OpenGL ES 2.0"
+        activeGlEngineSummary = glLabelGuess
+
         isRunning = true
 
         drainThread = Thread({
@@ -211,20 +407,44 @@ class SolVideoPipeline(private val context: Context) {
                 codec = codec,
                 codecKey = chosenReport.codecKey,
                 originTimeUs = originTimeNs / 1000L,
+                isPrimaryStream = true,
                 onVideoConfig = onVideoConfig,
                 onEncodedVideo = onEncodedVideo
             )
         }, "SolVideoDrain").apply { start() }
 
+        if (compConfigured != null && onCompanionConfig != null && onCompanionVideo != null) {
+            val compCodecKey = if (scan.hevcHardware?.verifiedSurfaceConfigure == true) "HEVC" else chosenReport.codecKey
+            companionDrainThread = Thread({
+                runEncoderDrainLoop(
+                    codec = compConfigured.codec,
+                    codecKey = compCodecKey,
+                    originTimeUs = originTimeNs / 1000L,
+                    isPrimaryStream = false,
+                    onVideoConfig = onCompanionConfig,
+                    onEncodedVideo = onCompanionVideo
+                )
+            }, "SolCompanionDrain").apply { start() }
+        }
+
+        val compSurf = compConfigured?.inputSurface
+        val (compAlignedW, compAlignedH) = (scan.hevcHardware ?: chosenReport).alignDimensions(1080, 1920)
+
         renderThread = Thread({
             runGlRenderLoop(
                 mediaProjection = mediaProjection,
                 encoderInputSurface = encoderInputSurface,
+                companionInputSurface = compSurf,
+                companionWidth = compAlignedW,
+                companionHeight = compAlignedH,
+                preferGlEs30 = preferEs30,
+                use10BitEgl = configured.actualIsHdr10,
                 initialCapWidth = capWidth,
                 initialCapHeight = capHeight,
                 densityDpi = densityDpi,
                 outWidth = outWidth,
                 outHeight = outHeight,
+                isVerticalPrimary = settings.isVertical,
                 targetFps = targetFps,
                 originTimeNs = originTimeNs
             )
@@ -236,7 +456,10 @@ class SolVideoPipeline(private val context: Context) {
             outWidth = outWidth,
             outHeight = outHeight,
             fps = targetFps,
-            isVbr = actualVbr
+            isVbr = configured.actualIsVbr,
+            isHdr10 = configured.actualIsHdr10,
+            glEngineLabel = glLabelGuess,
+            companionActive = (compConfigured != null)
         )
     }
 
@@ -246,8 +469,12 @@ class SolVideoPipeline(private val context: Context) {
         renderThread = null
 
         try { videoCodecInstance?.signalEndOfInputStream() } catch (_: Exception) {}
+        try { companionCodecInstance?.signalEndOfInputStream() } catch (_: Exception) {}
+
         try { drainThread?.join(1500) } catch (_: Exception) {}
         drainThread = null
+        try { companionDrainThread?.join(1200) } catch (_: Exception) {}
+        companionDrainThread = null
 
         try { virtualDisplay?.release() } catch (_: Exception) {}
         virtualDisplay = null
@@ -265,11 +492,35 @@ class SolVideoPipeline(private val context: Context) {
         try { videoCodecInstance?.release() } catch (_: Exception) {}
         videoCodecInstance = null
 
-        // Intentionally preserve DiagnosticsLogger.freshCaptureFps and lastAverageQp
-        // so post-stream Session Reports show final measured values instead of N/A.
+        try { companionCodecInstance?.stop() } catch (_: Exception) {}
+        try { companionCodecInstance?.release() } catch (_: Exception) {}
+        companionCodecInstance = null
+
         actualEncodedFps = 0
         actualEncodedBitrateBps = 0
         actualFreshCaptureFps = 0
+    }
+
+    private fun resolveSupportedResolutionTier(
+        report: HardwareEncoderReport,
+        settings: StreamSettings,
+        fps: Int
+    ): Pair<Int, Int> {
+        val reqLong = max(settings.width, settings.height)
+        return when {
+            reqLong >= 3840 -> {
+                if ((fps <= 30 && report.supports4k30) || report.supports4k60) 3840 to 2160
+                else if (report.supports1440p60) 2560 to 1440
+                else 1920 to 1080
+            }
+            reqLong >= 2560 -> {
+                if (report.supports1440p60) 2560 to 1440 else 1920 to 1080
+            }
+            reqLong >= 1920 -> 1920 to 1080
+            reqLong >= 1280 -> 1280 to 720
+            reqLong >= 800 -> if (report.supports480p) 854 to 480 else 1280 to 720
+            else -> if (report.supports360p) 640 to 360 else if (report.supports480p) 854 to 480 else 1280 to 720
+        }
     }
 
     private fun evenDimension(value: Int): Int {
@@ -293,50 +544,73 @@ class SolVideoPipeline(private val context: Context) {
 
     private fun resolveSafeHardwareEncoder(
         scan: DeviceScanSummary,
-        settings: StreamSettings
+        requestedCodec: String
     ): HardwareEncoderReport? {
-        val primary = scan.findReport(settings.codec)
+        val primary = scan.findReport(requestedCodec)
         if (primary != null && primary.verifiedSurfaceConfigure) return primary
-        if (scan.hevcHardware?.verifiedSurfaceConfigure == true) return scan.hevcHardware
+        if (scan.hevcHardware?.verifiedSurfaceConfigure == true && requestedCodec != "H264") {
+            return scan.hevcHardware
+        }
         return scan.h264Hardware?.takeIf { it.verifiedSurfaceConfigure }
+            ?: scan.hevcHardware?.takeIf { it.verifiedSurfaceConfigure }
     }
 
-    private fun selectSupportedHighProfile(
+    private fun selectSupportedProfileLevel(
         codec: MediaCodec,
         mimeType: String,
         codecKey: String,
         width: Int,
-        height: Int
+        height: Int,
+        wantHdr10: Boolean
     ): Pair<Int, Int>? {
         return try {
             val caps = codec.codecInfo.getCapabilitiesForType(mimeType)
             val levels = caps.profileLevels ?: return null
-            if (codecKey == "H264") {
-                val targetProfile = MediaCodecInfo.CodecProfileLevel.AVCProfileHigh
-                val minLevel = if (max(width, height) >= 2560) {
-                    MediaCodecInfo.CodecProfileLevel.AVCLevel51
-                } else {
-                    MediaCodecInfo.CodecProfileLevel.AVCLevel42
+            val maxDim = max(width, height)
+
+            when (codecKey) {
+                "H264" -> {
+                    val targetProfile = MediaCodecInfo.CodecProfileLevel.AVCProfileHigh
+                    val minLevel = when {
+                        maxDim >= 3840 -> MediaCodecInfo.CodecProfileLevel.AVCLevel52
+                        maxDim >= 2560 -> MediaCodecInfo.CodecProfileLevel.AVCLevel51
+                        maxDim >= 1920 -> MediaCodecInfo.CodecProfileLevel.AVCLevel42
+                        else -> MediaCodecInfo.CodecProfileLevel.AVCLevel31
+                    }
+                    val match = levels
+                        .filter { it.profile == targetProfile && it.level >= minLevel }
+                        .minByOrNull { it.level }
+                        ?: levels.filter { it.profile == targetProfile }.maxByOrNull { it.level }
+                    match?.let { it.profile to it.level }
                 }
-                val match = levels
-                    .filter { it.profile == targetProfile && it.level >= minLevel }
-                    .minByOrNull { it.level }
-                    ?: levels.filter { it.profile == targetProfile }.maxByOrNull { it.level }
-                match?.let { it.profile to it.level }
-            } else if (codecKey == "HEVC") {
-                val targetProfile = MediaCodecInfo.CodecProfileLevel.HEVCProfileMain
-                val minLevel = if (max(width, height) >= 2560) {
-                    MediaCodecInfo.CodecProfileLevel.HEVCMainTierLevel5
-                } else {
-                    MediaCodecInfo.CodecProfileLevel.HEVCMainTierLevel41
+                "HEVC" -> {
+                    val targetProfile = if (wantHdr10) {
+                        MediaCodecInfo.CodecProfileLevel.HEVCProfileMain10
+                    } else {
+                        MediaCodecInfo.CodecProfileLevel.HEVCProfileMain
+                    }
+                    val minLevel = when {
+                        maxDim >= 3840 -> MediaCodecInfo.CodecProfileLevel.HEVCMainTierLevel51
+                        maxDim >= 2560 -> MediaCodecInfo.CodecProfileLevel.HEVCMainTierLevel5
+                        maxDim >= 1920 -> MediaCodecInfo.CodecProfileLevel.HEVCMainTierLevel41
+                        else -> MediaCodecInfo.CodecProfileLevel.HEVCMainTierLevel31
+                    }
+                    val match = levels
+                        .filter { it.profile == targetProfile && it.level >= minLevel }
+                        .minByOrNull { it.level }
+                        ?: levels.filter { it.profile == targetProfile }.maxByOrNull { it.level }
+                    match?.let { it.profile to it.level }
                 }
-                val match = levels
-                    .filter { it.profile == targetProfile && it.level >= minLevel }
-                    .minByOrNull { it.level }
-                    ?: levels.filter { it.profile == targetProfile }.maxByOrNull { it.level }
-                match?.let { it.profile to it.level }
-            } else {
-                null
+                "AV1" -> {
+                    val targetProfile = if (wantHdr10) {
+                        MediaCodecInfo.CodecProfileLevel.AV1ProfileMain10
+                    } else {
+                        MediaCodecInfo.CodecProfileLevel.AV1ProfileMain8
+                    }
+                    val match = levels.filter { it.profile == targetProfile }.maxByOrNull { it.level }
+                    match?.let { it.profile to it.level }
+                }
+                else -> null
             }
         } catch (_: Exception) {
             null
@@ -349,18 +623,24 @@ class SolVideoPipeline(private val context: Context) {
         height: Int,
         fps: Int,
         bitrateBps: Int,
-        wantVbr: Boolean
+        wantVbr: Boolean,
+        wantHdr10: Boolean,
+        settings: StreamSettings
     ): ConfiguredEncoder? {
         for (attempt in 1..3) {
             var codec: MediaCodec? = null
             try {
                 val created = MediaCodec.createByCodecName(report.encoderName)
                 codec = created
+                val tryHdrThisAttempt = wantHdr10 && attempt == 1
                 val requestedMode = when {
                     wantVbr && report.supportsVbr -> MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR
                     report.supportsCbr -> MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR
                     else -> MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR
                 }
+
+                val keyframeSec = settings.keyframeIntervalSec.coerceIn(1, 4)
+                val bFrames = if (attempt == 1) settings.maxBFrames.coerceIn(0, 2) else 0
 
                 val format = MediaFormat.createVideoFormat(report.mimeType, width, height).apply {
                     setInteger(
@@ -369,24 +649,48 @@ class SolVideoPipeline(private val context: Context) {
                     )
                     setInteger(MediaFormat.KEY_BIT_RATE, bitrateBps)
                     setInteger(MediaFormat.KEY_FRAME_RATE, fps)
-                    setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 2)
+                    setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, keyframeSec)
                     setInteger(MediaFormat.KEY_BITRATE_MODE, requestedMode)
 
                     if (attempt <= 2) {
-                        setInteger(MediaFormat.KEY_COLOR_STANDARD, MediaFormat.COLOR_STANDARD_BT709)
-                        setInteger(MediaFormat.KEY_COLOR_RANGE, MediaFormat.COLOR_RANGE_LIMITED)
-                        setInteger(MediaFormat.KEY_COLOR_TRANSFER, MediaFormat.COLOR_TRANSFER_SDR_VIDEO)
+                        if (tryHdrThisAttempt) {
+                            setInteger(MediaFormat.KEY_COLOR_STANDARD, MediaFormat.COLOR_STANDARD_BT2020)
+                            setInteger(MediaFormat.KEY_COLOR_RANGE, MediaFormat.COLOR_RANGE_LIMITED)
+                            setInteger(MediaFormat.KEY_COLOR_TRANSFER, MediaFormat.COLOR_TRANSFER_HLG)
+                        } else {
+                            setInteger(MediaFormat.KEY_COLOR_STANDARD, MediaFormat.COLOR_STANDARD_BT709)
+                            setInteger(MediaFormat.KEY_COLOR_RANGE, MediaFormat.COLOR_RANGE_LIMITED)
+                            setInteger(MediaFormat.KEY_COLOR_TRANSFER, MediaFormat.COLOR_TRANSFER_SDR_VIDEO)
+                        }
+
+                        // KEY_PRIORITY = 1 gives foreground CODM 120-185 FPS gameplay priority on shared SoC bus!
                         setInteger(MediaFormat.KEY_OPERATING_RATE, fps)
-                        setInteger(MediaFormat.KEY_PRIORITY, 0)
-                        setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0)
+                        setInteger(MediaFormat.KEY_PRIORITY, 1)
+                        setInteger(MediaFormat.KEY_MAX_B_FRAMES, bFrames)
+
                         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                             setFloat(MediaFormat.KEY_MAX_FPS_TO_ENCODER, fps.toFloat())
+                        }
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && settings.lowLatencyCodecHint && bFrames == 0) {
+                            setInteger(MediaFormat.KEY_LATENCY, 1)
+                        }
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && settings.qpMaxCap in 24..51 && attempt == 1) {
+                            val qpCap = settings.qpMaxCap
+                            setInteger(MediaFormat.KEY_VIDEO_QP_I_MAX, qpCap)
+                            setInteger(MediaFormat.KEY_VIDEO_QP_P_MAX, qpCap)
+                            setInteger(MediaFormat.KEY_VIDEO_QP_B_MAX, qpCap)
                         }
                         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                             setInteger(
                                 MediaFormat.KEY_VIDEO_ENCODING_STATISTICS_LEVEL,
                                 MediaFormat.VIDEO_ENCODING_STATISTICS_LEVEL_1
                             )
+                        }
+                        if (report.supportsRoi && settings.roiMode.uppercase(Locale.US) != "OFF" && attempt == 1) {
+                            try {
+                                setFeatureEnabled("region-of-interest", true)
+                            } catch (_: Exception) {
+                            }
                         }
                         if (report.complexityMax > report.complexityMin) {
                             val midHigh = (report.complexityMin + report.complexityMax + 1) / 2
@@ -395,12 +699,13 @@ class SolVideoPipeline(private val context: Context) {
                     }
 
                     if (attempt == 1) {
-                        selectSupportedHighProfile(
+                        selectSupportedProfileLevel(
                             codec = created,
                             mimeType = report.mimeType,
                             codecKey = report.codecKey,
                             width = width,
-                            height = height
+                            height = height,
+                            wantHdr10 = tryHdrThisAttempt
                         )?.let { (prof, lvl) ->
                             setInteger(MediaFormat.KEY_PROFILE, prof)
                             setInteger(MediaFormat.KEY_LEVEL, lvl)
@@ -433,7 +738,8 @@ class SolVideoPipeline(private val context: Context) {
                 return ConfiguredEncoder(
                     codec = created,
                     inputSurface = inputSurface,
-                    actualIsVbr = isActualVbr
+                    actualIsVbr = isActualVbr,
+                    actualIsHdr10 = tryHdrThisAttempt
                 )
             } catch (e: Exception) {
                 try { codec?.release() } catch (_: Exception) {}
@@ -449,58 +755,133 @@ class SolVideoPipeline(private val context: Context) {
         return null
     }
 
+    private fun chooseEncoderEglConfig(
+        eglDisplay: EGLDisplay,
+        wantEs30: Boolean,
+        want10Bit: Boolean
+    ): Pair<EGLConfig, Int>? {
+        val es3Bit = 0x0040 // EGL_OPENGL_ES3_BIT_KHR
+        val candidates = buildList {
+            if (wantEs30 && want10Bit) add(Triple(es3Bit, 3, true))
+            if (wantEs30) add(Triple(es3Bit, 3, false))
+            add(Triple(EGL14.EGL_OPENGL_ES2_BIT, 2, false))
+        }
+
+        for ((renderBit, clientVer, tenBit) in candidates) {
+            val rBits = if (tenBit) 10 else 8
+            val aBits = if (tenBit) 2 else 8
+            val attribs = intArrayOf(
+                EGL14.EGL_RED_SIZE, rBits,
+                EGL14.EGL_GREEN_SIZE, rBits,
+                EGL14.EGL_BLUE_SIZE, rBits,
+                EGL14.EGL_ALPHA_SIZE, aBits,
+                EGL14.EGL_RENDERABLE_TYPE, renderBit,
+                0x3142, 1, // EGL_RECORDABLE_ANDROID
+                EGL14.EGL_NONE
+            )
+            val configs = arrayOfNulls<EGLConfig>(1)
+            val numCfg = IntArray(1)
+            if (EGL14.eglChooseConfig(eglDisplay, attribs, 0, configs, 0, 1, numCfg, 0) &&
+                numCfg[0] > 0 &&
+                configs[0] != null
+            ) {
+                return configs[0]!! to clientVer
+            }
+        }
+        return null
+    }
+
     private fun runGlRenderLoop(
         mediaProjection: MediaProjection,
         encoderInputSurface: Surface,
+        companionInputSurface: Surface?,
+        companionWidth: Int,
+        companionHeight: Int,
+        preferGlEs30: Boolean,
+        use10BitEgl: Boolean,
         initialCapWidth: Int,
         initialCapHeight: Int,
         densityDpi: Int,
         outWidth: Int,
         outHeight: Int,
+        isVerticalPrimary: Boolean,
         targetFps: Int,
         originTimeNs: Long
     ) {
         var eglDisplay: EGLDisplay = EGL14.EGL_NO_DISPLAY
         var eglContext: EGLContext = EGL14.EGL_NO_CONTEXT
         var eglSurface: EGLSurface = EGL14.EGL_NO_SURFACE
+        var companionEglSurface: EGLSurface = EGL14.EGL_NO_SURFACE
         var captureSurface: Surface? = null
         var surfaceTexture: SurfaceTexture? = null
         var oesTexId = 0
-        var program = 0
+        var oesProg = 0
+        var rgbaProg = 0
+
+        // Static GPU 2D texture cache (uploaded ONLY when changed -> 0 per-frame CPU work)
+        var sceneTexId = 0
+        var loadedSceneSlotKey = ""
+        var overlayTexId = 0
+        var posterTexId = 0
+        var bannerTexId = 0
+        var loadedBannerSig = ""
+        var seenAssetRevision = -1
 
         try {
             eglDisplay = EGL14.eglGetDisplay(EGL14.EGL_DEFAULT_DISPLAY)
             val version = IntArray(2)
             EGL14.eglInitialize(eglDisplay, version, 0, version, 1)
 
-            val attribList = intArrayOf(
-                EGL14.EGL_RED_SIZE, 8,
-                EGL14.EGL_GREEN_SIZE, 8,
-                EGL14.EGL_BLUE_SIZE, 8,
-                EGL14.EGL_ALPHA_SIZE, 8,
-                EGL14.EGL_RENDERABLE_TYPE, EGL14.EGL_OPENGL_ES2_BIT,
-                0x3142, 1, // EGL_RECORDABLE_ANDROID
-                EGL14.EGL_NONE
-            )
-            val configs = arrayOfNulls<EGLConfig>(1)
-            val numConfigs = IntArray(1)
-            EGL14.eglChooseConfig(eglDisplay, attribList, 0, configs, 0, 1, numConfigs, 0)
-            val eglConfig = configs[0] ?: throw IllegalStateException("No recordable EGLConfig")
+            val chosenCfgPair = chooseEncoderEglConfig(eglDisplay, preferGlEs30, use10BitEgl)
+                ?: throw IllegalStateException("No recordable EGLConfig available")
+            var eglConfig = chosenCfgPair.first
+            var glClientVer = chosenCfgPair.second
 
-            val ctxAttribs = intArrayOf(EGL14.EGL_CONTEXT_CLIENT_VERSION, 2, EGL14.EGL_NONE)
-            eglContext = EGL14.eglCreateContext(eglDisplay, eglConfig, EGL14.EGL_NO_CONTEXT, ctxAttribs, 0)
+            var ctx = EGL14.eglCreateContext(
+                eglDisplay,
+                eglConfig,
+                EGL14.EGL_NO_CONTEXT,
+                intArrayOf(EGL14.EGL_CONTEXT_CLIENT_VERSION, glClientVer, EGL14.EGL_NONE),
+                0
+            )
+            if (ctx == EGL14.EGL_NO_CONTEXT && glClientVer == 3) {
+                val fallback20 = chooseEncoderEglConfig(eglDisplay, wantEs30 = false, want10Bit = false)
+                    ?: throw IllegalStateException("OpenGL ES 2.0 fallback failed")
+                eglConfig = fallback20.first
+                glClientVer = 2
+                ctx = EGL14.eglCreateContext(
+                    eglDisplay,
+                    eglConfig,
+                    EGL14.EGL_NO_CONTEXT,
+                    intArrayOf(EGL14.EGL_CONTEXT_CLIENT_VERSION, 2, EGL14.EGL_NONE),
+                    0
+                )
+            }
+            eglContext = ctx
+            activeGlEngineSummary = "OpenGL ES $glClientVer.0" + (if (use10BitEgl && glClientVer == 3) " (10-Bit HDR)" else "")
 
             val surfAttribs = intArrayOf(EGL14.EGL_NONE)
             eglSurface = EGL14.eglCreateWindowSurface(eglDisplay, eglConfig, encoderInputSurface, surfAttribs, 0)
+            if (companionInputSurface != null) {
+                try {
+                    companionEglSurface = EGL14.eglCreateWindowSurface(
+                        eglDisplay,
+                        eglConfig,
+                        companionInputSurface,
+                        surfAttribs,
+                        0
+                    )
+                } catch (_: Exception) {
+                    companionEglSurface = EGL14.EGL_NO_SURFACE
+                }
+            }
             EGL14.eglMakeCurrent(eglDisplay, eglSurface, eglSurface, eglContext)
+            DiagnosticsLogger.log("GL_INIT", "Initialized $activeGlEngineSummary render pipeline.")
 
-            program = GlShaderHelper.buildOesProgram()
-            val aPosLoc = GLES20.glGetAttribLocation(program, "aPosition")
-            val aTexLoc = GLES20.glGetAttribLocation(program, "aTexCoord")
-            val uMvpLoc = GLES20.glGetUniformLocation(program, "uMVPMatrix")
-            val uTexMatLoc = GLES20.glGetUniformLocation(program, "uTexMatrix")
-            val uSharpenLoc = GLES20.glGetUniformLocation(program, "uSharpen")
-            val uTexelStepLoc = GLES20.glGetUniformLocation(program, "uTexelStep")
+            val oesHandles = GlShaderBank.buildOesPipelineProgram(allowEs30Shader = (glClientVer >= 3))
+            oesProg = oesHandles.programId
+            val rgbaHandles = GlShaderBank.buildRgba2dProgram()
+            rgbaProg = rgbaHandles.programId
 
             val texIds = IntArray(1)
             GLES20.glGenTextures(1, texIds, 0)
@@ -531,6 +912,7 @@ class SolVideoPipeline(private val context: Context) {
             val capSurf = Surface(st)
             captureSurface = capSurf
 
+            // Single VirtualDisplay shared cleanly across primary (and optional 9:16 companion) surface!
             virtualDisplay = mediaProjection.createVirtualDisplay(
                 "SolStreamCapture",
                 activeCapW,
@@ -542,25 +924,47 @@ class SolVideoPipeline(private val context: Context) {
                 null
             )
 
-            val quadVertices = GlShaderHelper.createFloatBuffer(
+            val fullQuadVerts = GlShaderBank.createFloatBuffer(
                 floatArrayOf(-1f, -1f, 1f, -1f, -1f, 1f, 1f, 1f)
             )
-            val quadTexCoords = GlShaderHelper.createFloatBuffer(
+            val oesTexCoords = GlShaderBank.createFloatBuffer(
                 floatArrayOf(0f, 0f, 1f, 0f, 0f, 1f, 1f, 1f)
             )
+            // Flipped V coordinate so Android ARGB_8888 Bitmaps render upright in OpenGL NDC
+            val bitmapTexCoords = GlShaderBank.createFloatBuffer(
+                floatArrayOf(0f, 1f, 1f, 1f, 0f, 0f, 1f, 0f)
+            )
+            val bannerTopVerts = GlShaderBank.createFloatBuffer(
+                floatArrayOf(-0.92f, 0.78f, 0.92f, 0.78f, -0.92f, 0.95f, 0.92f, 0.95f)
+            )
+            val bannerBottomVerts = GlShaderBank.createFloatBuffer(
+                floatArrayOf(-0.92f, -0.95f, 0.92f, -0.95f, -0.92f, -0.78f, 0.92f, -0.78f)
+            )
+
             val stMatrix = FloatArray(16)
             val mvpMatrix = FloatArray(16)
+            val identityMvp = FloatArray(16)
             Matrix.setIdentityM(stMatrix, 0)
+            Matrix.setIdentityM(identityMvp, 0)
 
-            val frameIntervalNs = 1_000_000_000L / targetFps.toLong()
             var nextRenderNs = System.nanoTime()
+            var lastPrimarySwapNs = 0L
             var lastSurfaceTsNs = -1L
             var freshWindowStartMs = System.currentTimeMillis()
+            var lastRoiPushMs = 0L
             var freshFramesInWindow = 0
             var repeatedFramesTotal = 0L
-            var wasBrbActive = false
+            var prevSceneMode = "LIVE"
 
             while (isRunning) {
+                val sceneNow = activeSceneMode
+                val effectiveFps = when {
+                    sceneNow != "LIVE" -> 15 // Cool down GPU & Wi-Fi automatically during Starting Soon / BRB!
+                    thermalThrottle30Fps -> 30
+                    else -> targetFps
+                }
+                val frameIntervalNs = 1_000_000_000L / effectiveFps.toLong()
+
                 val nowNs = System.nanoTime()
                 val waitNs = nextRenderNs - nowNs
                 if (waitNs > 1_000_000L) {
@@ -575,6 +979,7 @@ class SolVideoPipeline(private val context: Context) {
                     nextRenderNs = nowNs + frameIntervalNs
                 }
 
+                // Dynamic capture resize without re-creating VirtualDisplay
                 val reqW = pendingCaptureWidth
                 val reqH = pendingCaptureHeight
                 if (reqW >= 128 && reqH >= 128 && (reqW != activeCapW || reqH != activeCapH)) {
@@ -587,13 +992,14 @@ class SolVideoPipeline(private val context: Context) {
                         virtualDisplay?.resize(activeCapW, activeCapH, densityDpi)
                         DiagnosticsLogger.log(
                             "CAPTURE_RESIZE",
-                            "Adapted incoming game capture size seamlessly without interrupting YouTube encoder.",
+                            "Adapted incoming game capture size seamlessly without interrupting stream.",
                             "capture=${activeCapW}x${activeCapH} -> stream=${outWidth}x${outHeight}"
                         )
                     } catch (_: Exception) {
                     }
                 }
 
+                var freshGameFrameArrived = false
                 val pullNewTexture = synchronized(frameSync) {
                     if (frameAvailable) {
                         frameAvailable = false
@@ -609,60 +1015,13 @@ class SolVideoPipeline(private val context: Context) {
                     if (curTs != lastSurfaceTsNs) {
                         lastSurfaceTsNs = curTs
                         freshFramesInWindow++
+                        freshGameFrameArrived = true
                     } else {
                         repeatedFramesTotal++
                     }
-                } else if (!brbBlackoutActive && hasFirstFrame) {
+                } else if (sceneNow == "LIVE" && hasFirstFrame) {
                     repeatedFramesTotal++
                 }
-
-                val isBrbNow = brbBlackoutActive
-                if (wasBrbActive && !isBrbNow) {
-                    requestSyncFrame()
-                }
-                wasBrbActive = isBrbNow
-
-                GLES20.glViewport(0, 0, outWidth, outHeight)
-                GLES20.glClearColor(0f, 0f, 0f, 1f)
-                GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
-
-                if (!isBrbNow && hasFirstFrame) {
-                    computeFramingMatrix(
-                        mvp = mvpMatrix,
-                        srcW = activeCapW,
-                        srcH = activeCapH,
-                        dstW = outWidth,
-                        dstH = outHeight,
-                        mode = liveFramingMode,
-                        smartZoomPct = liveSmartZoomPercent,
-                        flipDeg = liveLandscapeFlip
-                    )
-
-                    GLES20.glUseProgram(program)
-                    GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
-                    GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, oesTexId)
-
-                    GLES20.glUniformMatrix4fv(uMvpLoc, 1, false, mvpMatrix, 0)
-                    GLES20.glUniformMatrix4fv(uTexMatLoc, 1, false, stMatrix, 0)
-                    GLES20.glUniform1f(uSharpenLoc, if (liveGpuSharpen) 0.28f else 0.0f)
-                    GLES20.glUniform2f(uTexelStepLoc, 1.0f / activeCapW.toFloat(), 1.0f / activeCapH.toFloat())
-
-                    quadVertices.position(0)
-                    GLES20.glEnableVertexAttribArray(aPosLoc)
-                    GLES20.glVertexAttribPointer(aPosLoc, 2, GLES20.GL_FLOAT, false, 0, quadVertices)
-
-                    quadTexCoords.position(0)
-                    GLES20.glEnableVertexAttribArray(aTexLoc)
-                    GLES20.glVertexAttribPointer(aTexLoc, 2, GLES20.GL_FLOAT, false, 0, quadTexCoords)
-
-                    GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
-                    GLES20.glDisableVertexAttribArray(aPosLoc)
-                    GLES20.glDisableVertexAttribArray(aTexLoc)
-                }
-
-                val ptsNs = max(1_000L, System.nanoTime() - originTimeNs)
-                EGLExt.eglPresentationTimeANDROID(eglDisplay, eglSurface, ptsNs)
-                EGL14.eglSwapBuffers(eglDisplay, eglSurface)
 
                 val nowMs = System.currentTimeMillis()
                 val elapsedMs = nowMs - freshWindowStartMs
@@ -672,6 +1031,168 @@ class SolVideoPipeline(private val context: Context) {
                     DiagnosticsLogger.repeatedFramesCount = repeatedFramesTotal
                     freshWindowStartMs = nowMs
                     freshFramesInWindow = 0
+                }
+
+                // Periodic Hardware ROI push (every 2.5s when enabled)
+                if (nowMs - lastRoiPushMs > 2500L) {
+                    lastRoiPushMs = nowMs
+                    videoCodecInstance?.let { pushHardwareRoiIfSupported(it, primaryOutW, primaryOutH, liveRoiMode) }
+                }
+
+                // Smart Duplicate-Frame Skip: if CODM is running at 39-45 FPS (lobby or BR fight)
+                // and no new frame arrived, skip redundant 1440p/4K GPU redraws unless >=33ms keep-alive is due!
+                val sceneChanged = (sceneNow != prevSceneMode)
+                if (sceneChanged) {
+                    prevSceneMode = sceneNow
+                    requestSyncFrame()
+                }
+                val nsSinceLastSwap = nowNs - lastPrimarySwapNs
+                if (sceneNow == "LIVE" &&
+                    hasFirstFrame &&
+                    !freshGameFrameArrived &&
+                    !sceneChanged &&
+                    nsSinceLastSwap in 1L..32_500_000L
+                ) {
+                    continue
+                }
+
+                // Refresh static 2D scene/overlay/banner textures ONLY when revision or text changed
+                val curRev = SolSceneAssetStore.currentRevision()
+                val assetDirty = (curRev != seenAssetRevision)
+                if (assetDirty) {
+                    seenAssetRevision = curRev
+                    loadedSceneSlotKey = ""
+                    if (overlayTexId != 0) {
+                        GlShaderBank.deleteTexture2d(overlayTexId)
+                        overlayTexId = 0
+                    }
+                    if (posterTexId != 0) {
+                        GlShaderBank.deleteTexture2d(posterTexId)
+                        posterTexId = 0
+                    }
+                }
+
+                if (sceneNow != "LIVE") {
+                    val wantKey = "$sceneNow:$isVerticalPrimary:${liveBannerText.trim()}"
+                    if (sceneTexId == 0 || loadedSceneSlotKey != wantKey) {
+                        if (sceneTexId != 0) GlShaderBank.deleteTexture2d(sceneTexId)
+                        val slot = if (sceneNow == "STARTING_SOON") {
+                            SolSceneAssetStore.AssetSlot.STARTING_SOON
+                        } else {
+                            SolSceneAssetStore.AssetSlot.BRB_SCENE
+                        }
+                        val bmp = SolSceneAssetStore.loadOrGenerateSceneBitmap(
+                            context = context,
+                            slot = slot,
+                            isVertical = isVerticalPrimary,
+                            customSubtitle = liveBannerText
+                        )
+                        sceneTexId = GlShaderBank.uploadBitmapTexture2d(bmp)
+                        bmp.recycle()
+                        loadedSceneSlotKey = wantKey
+                    }
+                }
+
+                if (liveOverlayImageEnabled && overlayTexId == 0) {
+                    SolSceneAssetStore.loadSavedBitmapForGl(context, SolSceneAssetStore.AssetSlot.OVERLAY_PNG)?.let { bmp ->
+                        overlayTexId = GlShaderBank.uploadBitmapTexture2d(bmp)
+                        bmp.recycle()
+                    }
+                } else if (!liveOverlayImageEnabled && overlayTexId != 0) {
+                    GlShaderBank.deleteTexture2d(overlayTexId)
+                    overlayTexId = 0
+                }
+
+                val needPoster = (isVerticalPrimary || companionEglSurface != EGL14.EGL_NO_SURFACE) &&
+                    liveShortsBackdropMode == "POSTER"
+                if (needPoster && posterTexId == 0) {
+                    SolSceneAssetStore.loadSavedBitmapForGl(context, SolSceneAssetStore.AssetSlot.SHORTS_POSTER)?.let { bmp ->
+                        posterTexId = GlShaderBank.uploadBitmapTexture2d(bmp)
+                        bmp.recycle()
+                    }
+                } else if (!needPoster && posterTexId != 0) {
+                    GlShaderBank.deleteTexture2d(posterTexId)
+                    posterTexId = 0
+                }
+
+                val wantBanner = liveBannerEnabled && liveBannerText.isNotBlank()
+                val curBannerSig = if (wantBanner) liveBannerText.trim() else ""
+                if (wantBanner && (bannerTexId == 0 || curBannerSig != loadedBannerSig)) {
+                    if (bannerTexId != 0) GlShaderBank.deleteTexture2d(bannerTexId)
+                    val bBmp = SolSceneAssetStore.buildLiveBannerBitmap(curBannerSig)
+                    bannerTexId = if (bBmp != null) {
+                        val id = GlShaderBank.uploadBitmapTexture2d(bBmp)
+                        bBmp.recycle()
+                        id
+                    } else 0
+                    loadedBannerSig = curBannerSig
+                } else if (!wantBanner && bannerTexId != 0) {
+                    GlShaderBank.deleteTexture2d(bannerTexId)
+                    bannerTexId = 0
+                    loadedBannerSig = ""
+                }
+
+                val ptsNs = max(1_000L, System.nanoTime() - originTimeNs)
+
+                // 1. Render Primary Broadcast Surface
+                EGL14.eglMakeCurrent(eglDisplay, eglSurface, eglSurface, eglContext)
+                renderCompositePass(
+                    oesHandles = oesHandles,
+                    rgbaHandles = rgbaHandles,
+                    oesTexId = oesTexId,
+                    sceneNow = sceneNow,
+                    sceneTexId = sceneTexId,
+                    posterTexId = posterTexId,
+                    overlayTexId = overlayTexId,
+                    bannerTexId = bannerTexId,
+                    hasFirstFrame = hasFirstFrame,
+                    srcW = activeCapW,
+                    srcH = activeCapH,
+                    dstW = outWidth,
+                    dstH = outHeight,
+                    isHdr10Surface = use10BitEgl,
+                    fullQuadVerts = fullQuadVerts,
+                    bannerTopVerts = bannerTopVerts,
+                    bannerBottomVerts = bannerBottomVerts,
+                    oesTexCoords = oesTexCoords,
+                    bitmapTexCoords = bitmapTexCoords,
+                    stMatrix = stMatrix,
+                    mvpMatrix = mvpMatrix,
+                    identityMvp = identityMvp
+                )
+                EGLExt.eglPresentationTimeANDROID(eglDisplay, eglSurface, ptsNs)
+                EGL14.eglSwapBuffers(eglDisplay, eglSurface)
+                lastPrimarySwapNs = System.nanoTime()
+
+                // 2. Render Optional 9:16 Shorts Companion Surface (when active and not paused by Severe thermal)
+                if (companionEglSurface != EGL14.EGL_NO_SURFACE && !companionPausedByThermal) {
+                    EGL14.eglMakeCurrent(eglDisplay, companionEglSurface, companionEglSurface, eglContext)
+                    renderCompositePass(
+                        oesHandles = oesHandles,
+                        rgbaHandles = rgbaHandles,
+                        oesTexId = oesTexId,
+                        sceneNow = sceneNow,
+                        sceneTexId = sceneTexId,
+                        posterTexId = posterTexId,
+                        overlayTexId = overlayTexId,
+                        bannerTexId = bannerTexId,
+                        hasFirstFrame = hasFirstFrame,
+                        srcW = activeCapW,
+                        srcH = activeCapH,
+                        dstW = companionWidth,
+                        dstH = companionHeight,
+                        isHdr10Surface = false,
+                        fullQuadVerts = fullQuadVerts,
+                        bannerTopVerts = bannerTopVerts,
+                        bannerBottomVerts = bannerBottomVerts,
+                        oesTexCoords = oesTexCoords,
+                        bitmapTexCoords = bitmapTexCoords,
+                        stMatrix = stMatrix,
+                        mvpMatrix = mvpMatrix,
+                        identityMvp = identityMvp
+                    )
+                    EGLExt.eglPresentationTimeANDROID(eglDisplay, companionEglSurface, ptsNs)
+                    EGL14.eglSwapBuffers(eglDisplay, companionEglSurface)
                 }
             }
         } catch (e: Exception) {
@@ -685,19 +1206,268 @@ class SolVideoPipeline(private val context: Context) {
             virtualDisplay = null
             try { captureSurface?.release() } catch (_: Exception) {}
             try { surfaceTexture?.release() } catch (_: Exception) {}
+
+            GlShaderBank.deleteTexture2d(sceneTexId)
+            GlShaderBank.deleteTexture2d(overlayTexId)
+            GlShaderBank.deleteTexture2d(posterTexId)
+            GlShaderBank.deleteTexture2d(bannerTexId)
             if (oesTexId != 0) {
                 try { GLES20.glDeleteTextures(1, intArrayOf(oesTexId), 0) } catch (_: Exception) {}
             }
-            if (program != 0) {
-                try { GLES20.glDeleteProgram(program) } catch (_: Exception) {}
+            if (oesProg != 0) {
+                try { GLES20.glDeleteProgram(oesProg) } catch (_: Exception) {}
+            }
+            if (rgbaProg != 0) {
+                try { GLES20.glDeleteProgram(rgbaProg) } catch (_: Exception) {}
             }
             if (eglDisplay != EGL14.EGL_NO_DISPLAY) {
                 EGL14.eglMakeCurrent(eglDisplay, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_CONTEXT)
                 if (eglSurface != EGL14.EGL_NO_SURFACE) EGL14.eglDestroySurface(eglDisplay, eglSurface)
+                if (companionEglSurface != EGL14.EGL_NO_SURFACE) EGL14.eglDestroySurface(eglDisplay, companionEglSurface)
                 if (eglContext != EGL14.EGL_NO_CONTEXT) EGL14.eglDestroyContext(eglDisplay, eglContext)
                 EGL14.eglTerminate(eglDisplay)
             }
             try { encoderInputSurface.release() } catch (_: Exception) {}
+            try { companionInputSurface?.release() } catch (_: Exception) {}
+        }
+    }
+
+    private fun renderCompositePass(
+        oesHandles: GlShaderBank.OesHandles,
+        rgbaHandles: GlShaderBank.Rgba2dHandles,
+        oesTexId: Int,
+        sceneNow: String,
+        sceneTexId: Int,
+        posterTexId: Int,
+        overlayTexId: Int,
+        bannerTexId: Int,
+        hasFirstFrame: Boolean,
+        srcW: Int,
+        srcH: Int,
+        dstW: Int,
+        dstH: Int,
+        isHdr10Surface: Boolean,
+        fullQuadVerts: FloatBuffer,
+        bannerTopVerts: FloatBuffer,
+        bannerBottomVerts: FloatBuffer,
+        oesTexCoords: FloatBuffer,
+        bitmapTexCoords: FloatBuffer,
+        stMatrix: FloatArray,
+        mvpMatrix: FloatArray,
+        identityMvp: FloatArray
+    ) {
+        GLES20.glViewport(0, 0, dstW, dstH)
+        GLES20.glDisable(GLES20.GL_SCISSOR_TEST)
+        GLES20.glDisable(GLES20.GL_BLEND)
+        GLES20.glClearColor(0.02f, 0.03f, 0.05f, 1.0f)
+        GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
+
+        // Stage A: Starting Soon or BRB Slate
+        if (sceneNow != "LIVE") {
+            if (sceneTexId != 0) {
+                drawRgbaQuad(rgbaHandles, sceneTexId, identityMvp, fullQuadVerts, bitmapTexCoords, enableBlend = false)
+            }
+            return
+        }
+
+        if (!hasFirstFrame) return
+
+        val dstIsVertical = dstH > dstW
+        val srcIsLandscape = srcW > srcH
+        val framing = liveFramingMode
+
+        // Stage B: 9:16 Vertical Shorts Backdrop (Frosted Live Gameplay Blur or Custom Poster)
+        if (dstIsVertical && srcIsLandscape && framing != "FILL") {
+            when (liveShortsBackdropMode) {
+                "POSTER" -> {
+                    if (posterTexId != 0) {
+                        drawRgbaQuad(rgbaHandles, posterTexId, identityMvp, fullQuadVerts, bitmapTexCoords, enableBlend = false)
+                    } else {
+                        computeFramingMatrix(mvpMatrix, srcW, srcH, dstW, dstH, "FILL", 100, liveLandscapeFlip)
+                        drawOesGameplayQuad(
+                            h = oesHandles,
+                            oesTexId = oesTexId,
+                            mvp = mvpMatrix,
+                            texMatrix = stMatrix,
+                            verts = fullQuadVerts,
+                            texCoords = oesTexCoords,
+                            srcW = srcW,
+                            srcH = srcH,
+                            isBlurPass = true,
+                            isHdr10 = isHdr10Surface
+                        )
+                    }
+                }
+                "BLUR" -> {
+                    computeFramingMatrix(mvpMatrix, srcW, srcH, dstW, dstH, "FILL", 100, liveLandscapeFlip)
+                    drawOesGameplayQuad(
+                        h = oesHandles,
+                        oesTexId = oesTexId,
+                        mvp = mvpMatrix,
+                        texMatrix = stMatrix,
+                        verts = fullQuadVerts,
+                        texCoords = oesTexCoords,
+                        srcW = srcW,
+                        srcH = srcH,
+                        isBlurPass = true,
+                        isHdr10 = isHdr10Surface
+                    )
+                }
+                // "DARK" leaves the clean obsidian background with 0 extra GPU draw calls!
+            }
+        }
+
+        // Stage C: Primary Crisp Gameplay Pass (Upscaler -> Shadow Boost -> Filmic/AMOLED/Temp -> CAS Sharpen)
+        computeFramingMatrix(
+            mvp = mvpMatrix,
+            srcW = srcW,
+            srcH = srcH,
+            dstW = dstW,
+            dstH = dstH,
+            mode = framing,
+            smartZoomPct = liveSmartZoomPercent,
+            flipDeg = liveLandscapeFlip
+        )
+        drawOesGameplayQuad(
+            h = oesHandles,
+            oesTexId = oesTexId,
+            mvp = mvpMatrix,
+            texMatrix = stMatrix,
+            verts = fullQuadVerts,
+            texCoords = oesTexCoords,
+            srcW = srcW,
+            srcH = srcH,
+            isBlurPass = false,
+            isHdr10 = isHdr10Surface
+        )
+
+        // Stage D: Optional Stream-Sniper Minimap / Room-Code Privacy Blur Box (Stream-Only!)
+        if (liveMinimapShieldEnabled) {
+            val boxW = (dstW * 0.21f).roundToInt().coerceAtLeast(32)
+            val boxH = (dstH * 0.28f).roundToInt().coerceAtLeast(32)
+            val scX: Int
+            val scY: Int
+            when (liveMinimapShieldCorner) {
+                "TOP_LEFT" -> { scX = 0; scY = dstH - boxH }
+                "BOTTOM_LEFT" -> { scX = 0; scY = 0 }
+                "BOTTOM_RIGHT" -> { scX = dstW - boxW; scY = 0 }
+                else -> { scX = dstW - boxW; scY = dstH - boxH } // TOP_RIGHT default
+            }
+            GLES20.glEnable(GLES20.GL_SCISSOR_TEST)
+            GLES20.glScissor(scX, scY, boxW, boxH)
+            drawOesGameplayQuad(
+                h = oesHandles,
+                oesTexId = oesTexId,
+                mvp = mvpMatrix,
+                texMatrix = stMatrix,
+                verts = fullQuadVerts,
+                texCoords = oesTexCoords,
+                srcW = srcW,
+                srcH = srcH,
+                isBlurPass = true,
+                isHdr10 = isHdr10Surface
+            )
+            GLES20.glDisable(GLES20.GL_SCISSOR_TEST)
+        }
+
+        // Stage E: Optional Premultiplied-Alpha .PNG Stream Overlay & Live Text Banner
+        if (overlayTexId != 0) {
+            drawRgbaQuad(rgbaHandles, overlayTexId, identityMvp, fullQuadVerts, bitmapTexCoords, enableBlend = true)
+        }
+        if (bannerTexId != 0) {
+            val bannerVerts = if (liveBannerPosition == "BOTTOM") bannerBottomVerts else bannerTopVerts
+            drawRgbaQuad(rgbaHandles, bannerTexId, identityMvp, bannerVerts, bitmapTexCoords, enableBlend = true)
+        }
+    }
+
+    private fun drawOesGameplayQuad(
+        h: GlShaderBank.OesHandles,
+        oesTexId: Int,
+        mvp: FloatArray,
+        texMatrix: FloatArray,
+        verts: FloatBuffer,
+        texCoords: FloatBuffer,
+        srcW: Int,
+        srcH: Int,
+        isBlurPass: Boolean,
+        isHdr10: Boolean
+    ) {
+        GLES20.glUseProgram(h.programId)
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+        GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, oesTexId)
+        GLES20.glUniform1i(h.uTexSamplerLoc, 0)
+
+        GLES20.glUniformMatrix4fv(h.uMvpLoc, 1, false, mvp, 0)
+        GLES20.glUniformMatrix4fv(h.uTexMatLoc, 1, false, texMatrix, 0)
+        GLES20.glUniform2f(h.uTexelStepLoc, 1.0f / srcW.toFloat(), 1.0f / srcH.toFloat())
+
+        val upscalerVal = when (liveUpscalerMode) {
+            "BILINEAR" -> 0.0f
+            "LANCZOS" -> 2.0f
+            else -> 1.0f // BICUBIC default
+        }
+        val tempShift = when (liveColorTempFilter) {
+            "WARM" -> 1.0f
+            "COOL" -> -1.0f
+            else -> 0.0f
+        }
+
+        GLES20.glUniform1f(h.uUpscalerLoc, if (isBlurPass) 0.0f else upscalerVal)
+        GLES20.glUniform1f(h.uBlurModeLoc, if (isBlurPass) 1.0f else 0.0f)
+        GLES20.glUniform1f(h.uShadowBoostLoc, if (!isBlurPass && !isHdr10 && liveShadowBoost) 1.0f else 0.0f)
+        GLES20.glUniform1f(h.uFilmicLoc, if (!isBlurPass && !isHdr10 && liveCinematicFilmic) 1.0f else 0.0f)
+        GLES20.glUniform1f(h.uVividLoc, if (!isBlurPass && !isHdr10 && liveAmoledVivid) 1.0f else 0.0f)
+        GLES20.glUniform1f(h.uTempShiftLoc, if (!isBlurPass && !isHdr10) tempShift else 0.0f)
+        GLES20.glUniform1f(h.uSharpenLoc, if (!isBlurPass && liveGpuSharpen) 0.34f else 0.0f)
+
+        verts.position(0)
+        GLES20.glEnableVertexAttribArray(h.aPosLoc)
+        GLES20.glVertexAttribPointer(h.aPosLoc, 2, GLES20.GL_FLOAT, false, 0, verts)
+
+        texCoords.position(0)
+        GLES20.glEnableVertexAttribArray(h.aTexLoc)
+        GLES20.glVertexAttribPointer(h.aTexLoc, 2, GLES20.GL_FLOAT, false, 0, texCoords)
+
+        GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
+        GLES20.glDisableVertexAttribArray(h.aPosLoc)
+        GLES20.glDisableVertexAttribArray(h.aTexLoc)
+    }
+
+    private fun drawRgbaQuad(
+        h: GlShaderBank.Rgba2dHandles,
+        texId: Int,
+        mvp: FloatArray,
+        verts: FloatBuffer,
+        texCoords: FloatBuffer,
+        enableBlend: Boolean
+    ) {
+        if (enableBlend) {
+            GLES20.glEnable(GLES20.GL_BLEND)
+            // Premultiplied-alpha blend mode matches Android ARGB_8888 Bitmaps with zero dark fringes
+            GLES20.glBlendFunc(GLES20.GL_ONE, GLES20.GL_ONE_MINUS_SRC_ALPHA)
+        } else {
+            GLES20.glDisable(GLES20.GL_BLEND)
+        }
+
+        GLES20.glUseProgram(h.programId)
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, texId)
+        GLES20.glUniform1i(h.uSamplerLoc, 0)
+        GLES20.glUniformMatrix4fv(h.uMvpLoc, 1, false, mvp, 0)
+
+        verts.position(0)
+        GLES20.glEnableVertexAttribArray(h.aPosLoc)
+        GLES20.glVertexAttribPointer(h.aPosLoc, 2, GLES20.GL_FLOAT, false, 0, verts)
+
+        texCoords.position(0)
+        GLES20.glEnableVertexAttribArray(h.aTexLoc)
+        GLES20.glVertexAttribPointer(h.aTexLoc, 2, GLES20.GL_FLOAT, false, 0, texCoords)
+
+        GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
+        GLES20.glDisableVertexAttribArray(h.aPosLoc)
+        GLES20.glDisableVertexAttribArray(h.aTexLoc)
+        if (enableBlend) {
+            GLES20.glDisable(GLES20.GL_BLEND)
         }
     }
 
@@ -747,6 +1517,7 @@ class SolVideoPipeline(private val context: Context) {
         codec: MediaCodec,
         codecKey: String,
         originTimeUs: Long,
+        isPrimaryStream: Boolean,
         onVideoConfig: (sps: ByteBuffer, pps: ByteBuffer?, vps: ByteBuffer?) -> Unit,
         onEncodedVideo: (ByteBuffer, MediaCodec.BufferInfo) -> Unit
     ) {
@@ -759,7 +1530,6 @@ class SolVideoPipeline(private val context: Context) {
         var ptsBaseUs = 0L
         var lastSentPtsUs = 0L
 
-        // Deduplicate Exynos per-frame INFO_OUTPUT_FORMAT_CHANGED events (caused by QP statistics)
         var lastLoggedFormatSig = ""
         var lastSentConfigSig: ByteArray? = null
 
@@ -774,8 +1544,8 @@ class SolVideoPipeline(private val context: Context) {
                 val outIdx = codec.dequeueOutputBuffer(bufferInfo, 15_000L)
                 if (outIdx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
                     val outFmt = codec.outputFormat
-                    // Capture QP statistics if vendor emits them inside outputFormat updates
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+                    if (isPrimaryStream &&
+                        Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
                         outFmt.containsKey(MediaFormat.KEY_VIDEO_QP_AVERAGE)
                     ) {
                         val qp = outFmt.getInteger(MediaFormat.KEY_VIDEO_QP_AVERAGE)
@@ -786,7 +1556,7 @@ class SolVideoPipeline(private val context: Context) {
                     }
 
                     val fmtSig = buildFormatSignature(outFmt)
-                    if (fmtSig != lastLoggedFormatSig) {
+                    if (isPrimaryStream && fmtSig != lastLoggedFormatSig) {
                         lastLoggedFormatSig = fmtSig
                         logActualEncoderOutputFormat(outFmt, codecKey)
                     }
@@ -800,7 +1570,7 @@ class SolVideoPipeline(private val context: Context) {
                 }
                 if (outIdx < 0) continue
 
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                if (isPrimaryStream && Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                     try {
                         val frameFmt = codec.getOutputFormat(outIdx)
                         if (frameFmt.containsKey(MediaFormat.KEY_VIDEO_QP_AVERAGE)) {
@@ -859,7 +1629,9 @@ class SolVideoPipeline(private val context: Context) {
                             adjPtsUs = lastSentPtsUs + 1_000L
                         }
                         lastSentPtsUs = adjPtsUs
-                        lastSentVideoPtsUs = adjPtsUs
+                        if (isPrimaryStream) {
+                            lastSentVideoPtsUs = adjPtsUs
+                        }
 
                         val outInfo = infoPool[slot].apply {
                             set(0, bufferInfo.size, adjPtsUs, bufferInfo.flags)
@@ -872,32 +1644,34 @@ class SolVideoPipeline(private val context: Context) {
                 }
                 codec.releaseOutputBuffer(outIdx, false)
 
-                val nowMs = System.currentTimeMillis()
-                val elapsedMs = nowMs - statsWindowStartMs
-                if (elapsedMs >= 1000L) {
-                    actualEncodedFps = ((framesInWindow * 1000L) / elapsedMs).toInt()
-                    actualEncodedBitrateBps = ((bytesInWindow * 8000L) / elapsedMs).toInt()
-                    DiagnosticsLogger.lastEncodedFps = actualEncodedFps
-                    DiagnosticsLogger.lastBitrateKbps = actualEncodedBitrateBps / 1000
-                    if (qpCountInWindow > 0) {
-                        DiagnosticsLogger.lastAverageQp = (qpSumInWindow / qpCountInWindow).toInt()
+                if (isPrimaryStream) {
+                    val nowMs = System.currentTimeMillis()
+                    val elapsedMs = nowMs - statsWindowStartMs
+                    if (elapsedMs >= 1000L) {
+                        actualEncodedFps = ((framesInWindow * 1000L) / elapsedMs).toInt()
+                        actualEncodedBitrateBps = ((bytesInWindow * 8000L) / elapsedMs).toInt()
+                        DiagnosticsLogger.lastEncodedFps = actualEncodedFps
+                        DiagnosticsLogger.lastBitrateKbps = actualEncodedBitrateBps / 1000
+                        if (qpCountInWindow > 0) {
+                            DiagnosticsLogger.lastAverageQp = (qpSumInWindow / qpCountInWindow).toInt()
+                        }
+                        statsWindowStartMs = nowMs
+                        framesInWindow = 0
+                        bytesInWindow = 0L
+                        qpSumInWindow = 0L
+                        qpCountInWindow = 0
                     }
-                    statsWindowStartMs = nowMs
-                    framesInWindow = 0
-                    bytesInWindow = 0L
-                    qpSumInWindow = 0L
-                    qpCountInWindow = 0
                 }
             } catch (ce: MediaCodec.CodecException) {
                 if (ce.isTransient) {
                     DiagnosticsLogger.log(
                         "ENC_TRANSIENT",
-                        "Hardware encoder reported a brief transient stall; continuing marathon stream safely.",
+                        "Hardware encoder reported a brief transient stall; continuing stream safely.",
                         ce.diagnosticInfo
                     )
                     try { Thread.sleep(8) } catch (_: Exception) {}
                 } else {
-                    if (isRunning) {
+                    if (isRunning && isPrimaryStream) {
                         val msg = "Hardware video encoder fatal error (${ce.diagnosticInfo})."
                         DiagnosticsLogger.log("ENC_ERR", msg, ce.message ?: "")
                         onFatalPipelineError?.invoke(msg)
@@ -905,7 +1679,7 @@ class SolVideoPipeline(private val context: Context) {
                     break
                 }
             } catch (e: Exception) {
-                if (isRunning) {
+                if (isRunning && isPrimaryStream) {
                     val msg = "Hardware video encoder stopped unexpectedly (${e.javaClass.simpleName})."
                     DiagnosticsLogger.log("ENC_ERR", msg, e.message ?: "")
                     onFatalPipelineError?.invoke(msg)
@@ -921,8 +1695,9 @@ class SolVideoPipeline(private val context: Context) {
             val h = if (format.containsKey(MediaFormat.KEY_HEIGHT)) format.getInteger(MediaFormat.KEY_HEIGHT) else -1
             val std = if (format.containsKey(MediaFormat.KEY_COLOR_STANDARD)) format.getInteger(MediaFormat.KEY_COLOR_STANDARD) else -1
             val rng = if (format.containsKey(MediaFormat.KEY_COLOR_RANGE)) format.getInteger(MediaFormat.KEY_COLOR_RANGE) else -1
+            val trf = if (format.containsKey(MediaFormat.KEY_COLOR_TRANSFER)) format.getInteger(MediaFormat.KEY_COLOR_TRANSFER) else -1
             val prof = if (format.containsKey(MediaFormat.KEY_PROFILE)) format.getInteger(MediaFormat.KEY_PROFILE) else -1
-            "$w:$h:$prof:$std:$rng"
+            "$w:$h:$prof:$std:$rng:$trf"
         } catch (_: Exception) {
             "unknown"
         }
@@ -949,19 +1724,14 @@ class SolVideoPipeline(private val context: Context) {
 
     private fun logActualEncoderOutputFormat(format: MediaFormat, codecKey: String) {
         try {
-            val std = if (format.containsKey(MediaFormat.KEY_COLOR_STANDARD)) {
-                format.getInteger(MediaFormat.KEY_COLOR_STANDARD)
-            } else -1
-            val rng = if (format.containsKey(MediaFormat.KEY_COLOR_RANGE)) {
-                format.getInteger(MediaFormat.KEY_COLOR_RANGE)
-            } else -1
-            val prof = if (format.containsKey(MediaFormat.KEY_PROFILE)) {
-                format.getInteger(MediaFormat.KEY_PROFILE)
-            } else -1
+            val std = if (format.containsKey(MediaFormat.KEY_COLOR_STANDARD)) format.getInteger(MediaFormat.KEY_COLOR_STANDARD) else -1
+            val rng = if (format.containsKey(MediaFormat.KEY_COLOR_RANGE)) format.getInteger(MediaFormat.KEY_COLOR_RANGE) else -1
+            val trf = if (format.containsKey(MediaFormat.KEY_COLOR_TRANSFER)) format.getInteger(MediaFormat.KEY_COLOR_TRANSFER) else -1
+            val prof = if (format.containsKey(MediaFormat.KEY_PROFILE)) format.getInteger(MediaFormat.KEY_PROFILE) else -1
             DiagnosticsLogger.log(
                 "VIDEO_FMT",
                 "$codecKey hardware encoder locked output format.",
-                "profile=$prof colorStd=$std colorRange=$rng"
+                "profile=$prof colorStd=$std colorRange=$rng transfer=$trf"
             )
         } catch (_: Exception) {
         }
@@ -1082,8 +1852,166 @@ class SolVideoPipeline(private val context: Context) {
         return ByteBuffer.wrap(arr)
     }
 
-    private object GlShaderHelper {
-        private const val VERTEX_SHADER = """
+    private object GlShaderBank {
+
+        data class OesHandles(
+            val programId: Int,
+            val aPosLoc: Int,
+            val aTexLoc: Int,
+            val uMvpLoc: Int,
+            val uTexMatLoc: Int,
+            val uTexSamplerLoc: Int,
+            val uTexelStepLoc: Int,
+            val uUpscalerLoc: Int,
+            val uBlurModeLoc: Int,
+            val uShadowBoostLoc: Int,
+            val uFilmicLoc: Int,
+            val uVividLoc: Int,
+            val uTempShiftLoc: Int,
+            val uSharpenLoc: Int
+        )
+
+        data class Rgba2dHandles(
+            val programId: Int,
+            val aPosLoc: Int,
+            val aTexLoc: Int,
+            val uMvpLoc: Int,
+            val uSamplerLoc: Int
+        )
+
+        private const val OES_VS_ES30 = """#version 300 es
+            uniform mat4 uMVPMatrix;
+            uniform mat4 uTexMatrix;
+            in vec4 aPosition;
+            in vec4 aTexCoord;
+            out vec2 vTexCoord;
+            void main() {
+                gl_Position = uMVPMatrix * aPosition;
+                vTexCoord = (uTexMatrix * aTexCoord).xy;
+            }
+        """
+
+        private const val OES_FS_BODY_CORE = """
+            uniform vec2 uTexelStep;
+            uniform float uUpscaler;
+            uniform float uBlurMode;
+            uniform float uShadowBoost;
+            uniform float uFilmic;
+            uniform float uVivid;
+            uniform float uTempShift;
+            uniform float uSharpen;
+
+            vec3 applyOrderedVisualFilters(vec3 baseCol, vec2 uv) {
+                vec3 col = baseCol;
+
+                if (uSharpen > 0.01) {
+                    vec3 n = TEX_FETCH(sTexture, uv + vec2(0.0, uTexelStep.y)).rgb;
+                    vec3 s = TEX_FETCH(sTexture, uv - vec2(0.0, uTexelStep.y)).rgb;
+                    vec3 e = TEX_FETCH(sTexture, uv + vec2(uTexelStep.x, 0.0)).rgb;
+                    vec3 w = TEX_FETCH(sTexture, uv - vec2(uTexelStep.x, 0.0)).rgb;
+                    vec3 minN = min(min(n, s), min(e, min(w, col)));
+                    vec3 maxN = max(max(n, s), max(e, max(w, col)));
+                    vec3 contrastHeadroom = clamp(min(minN, 1.0 - maxN) / max(maxN, vec3(0.001)), 0.0, 1.0);
+                    vec3 avg = 0.25 * (n + s + e + w);
+                    col = clamp(col + (col - avg) * (uSharpen * (0.45 + 0.55 * contrastHeadroom)), 0.0, 1.0);
+                }
+
+                if (uShadowBoost > 0.5) {
+                    col = clamp(col + 0.16 * col * (1.0 - col) * (1.0 - col), 0.0, 1.0);
+                }
+
+                if (uFilmic > 0.5) {
+                    vec3 aces = clamp((col * (2.51 * col + 0.03)) / (col * (2.43 * col + 0.59) + 0.14), 0.0, 1.0);
+                    col = mix(col, aces, 0.55);
+                }
+
+                if (uVivid > 0.5) {
+                    float luma = dot(col, vec3(0.2126, 0.7152, 0.0722));
+                    float maxC = max(col.r, max(col.g, col.b));
+                    float minC = min(col.r, min(col.g, col.b));
+                    float curSat = maxC - minC;
+                    float vibGain = 1.0 + 0.25 * (1.0 - curSat);
+                    col = clamp(vec3(luma) + (col - vec3(luma)) * vibGain, 0.0, 1.0);
+                }
+
+                if (abs(uTempShift) > 0.1) {
+                    vec3 tint = vec3(1.0 + 0.042 * uTempShift, 1.0 + 0.008 * uTempShift, 1.0 - 0.048 * uTempShift);
+                    col = clamp(col * tint, 0.0, 1.0);
+                }
+
+                return col;
+            }
+
+            vec3 sampleGameSpatial(vec2 uv) {
+                if (uBlurMode > 0.5) {
+                    vec2 r1 = uTexelStep * 4.5;
+                    vec2 r2 = uTexelStep * 9.5;
+                    vec3 acc = TEX_FETCH(sTexture, uv).rgb * 0.20;
+                    acc += TEX_FETCH(sTexture, uv + vec2(r1.x, 0.0)).rgb * 0.12;
+                    acc += TEX_FETCH(sTexture, uv - vec2(r1.x, 0.0)).rgb * 0.12;
+                    acc += TEX_FETCH(sTexture, uv + vec2(0.0, r1.y)).rgb * 0.12;
+                    acc += TEX_FETCH(sTexture, uv - vec2(0.0, r1.y)).rgb * 0.12;
+                    acc += TEX_FETCH(sTexture, uv + vec2(r2.x, r2.y)).rgb * 0.08;
+                    acc += TEX_FETCH(sTexture, uv + vec2(-r2.x, r2.y)).rgb * 0.08;
+                    acc += TEX_FETCH(sTexture, uv + vec2(r2.x, -r2.y)).rgb * 0.08;
+                    acc += TEX_FETCH(sTexture, uv + vec2(-r2.x, -r2.y)).rgb * 0.08;
+                    return acc * 0.54;
+                }
+
+                if (uUpscaler < 0.5) {
+                    return TEX_FETCH(sTexture, uv).rgb;
+                }
+
+                if (uUpscaler < 1.5) {
+                    vec2 texSize = 1.0 / max(uTexelStep, vec2(0.00001));
+                    vec2 coord = uv * texSize - 0.5;
+                    vec2 f = fract(coord);
+                    vec2 sf = f * f * (3.0 - 2.0 * f);
+                    vec2 smoothUv = (floor(coord) + sf + 0.5) * uTexelStep;
+                    vec3 c = TEX_FETCH(sTexture, smoothUv).rgb;
+                    vec3 n = TEX_FETCH(sTexture, smoothUv + vec2(0.0, uTexelStep.y * 0.65)).rgb;
+                    vec3 s = TEX_FETCH(sTexture, smoothUv - vec2(0.0, uTexelStep.y * 0.65)).rgb;
+                    vec3 e = TEX_FETCH(sTexture, smoothUv + vec2(uTexelStep.x * 0.65, 0.0)).rgb;
+                    vec3 w = TEX_FETCH(sTexture, smoothUv - vec2(uTexelStep.x * 0.65, 0.0)).rgb;
+                    vec3 minB = min(c, min(min(n, s), min(e, w)));
+                    vec3 maxB = max(c, max(max(n, s), max(e, w)));
+                    return clamp(c * 1.16 - 0.04 * (n + s + e + w), minB, maxB);
+                }
+
+                // Lanczos-2 inspired 9-tap anti-ringing spatial reconstruction
+                vec3 c0 = TEX_FETCH(sTexture, uv).rgb;
+                vec3 cn = TEX_FETCH(sTexture, uv + vec2(0.0, uTexelStep.y)).rgb;
+                vec3 cs = TEX_FETCH(sTexture, uv - vec2(0.0, uTexelStep.y)).rgb;
+                vec3 ce = TEX_FETCH(sTexture, uv + vec2(uTexelStep.x, 0.0)).rgb;
+                vec3 cw = TEX_FETCH(sTexture, uv - vec2(uTexelStep.x, 0.0)).rgb;
+                vec3 d1 = TEX_FETCH(sTexture, uv + uTexelStep).rgb;
+                vec3 d2 = TEX_FETCH(sTexture, uv - uTexelStep).rgb;
+                vec3 d3 = TEX_FETCH(sTexture, uv + vec2(uTexelStep.x, -uTexelStep.y)).rgb;
+                vec3 d4 = TEX_FETCH(sTexture, uv + vec2(-uTexelStep.x, uTexelStep.y)).rgb;
+                vec3 lo = min(c0, min(min(cn, cs), min(ce, cw)));
+                vec3 hi = max(c0, max(max(cn, cs), max(ce, cw)));
+                vec3 recon = c0 * 1.48 + (cn + cs + ce + cw) * (-0.08) + (d1 + d2 + d3 + d4) * (-0.04);
+                return clamp(recon, lo, hi);
+            }
+        """
+
+        private val OES_FS_ES30 = """#version 300 es
+            #extension GL_OES_EGL_image_external_essl3 : require
+            precision highp float;
+            in vec2 vTexCoord;
+            uniform samplerExternalOES sTexture;
+            out vec4 fragColor;
+            ${OES_FS_BODY_CORE.replace("TEX_FETCH", "texture")}
+            void main() {
+                vec3 col = sampleGameSpatial(vTexCoord);
+                if (uBlurMode < 0.5) {
+                    col = applyOrderedVisualFilters(col, vTexCoord);
+                }
+                fragColor = vec4(col, 1.0);
+            }
+        """
+
+        private const val OES_VS_ES20 = """
             uniform mat4 uMVPMatrix;
             uniform mat4 uTexMatrix;
             attribute vec4 aPosition;
@@ -1095,46 +2023,140 @@ class SolVideoPipeline(private val context: Context) {
             }
         """
 
-        private const val FRAGMENT_SHADER = """
+        private val OES_FS_ES20 = """
             #extension GL_OES_EGL_image_external : require
             precision highp float;
             varying vec2 vTexCoord;
             uniform samplerExternalOES sTexture;
-            uniform float uSharpen;
-            uniform vec2 uTexelStep;
+            ${OES_FS_BODY_CORE.replace("TEX_FETCH", "texture2D")}
             void main() {
-                vec4 center = texture2D(sTexture, vTexCoord);
-                if (uSharpen <= 0.01) {
-                    gl_FragColor = center;
-                } else {
-                    vec3 n = texture2D(sTexture, vTexCoord + vec2(0.0, uTexelStep.y)).rgb;
-                    vec3 s = texture2D(sTexture, vTexCoord - vec2(0.0, uTexelStep.y)).rgb;
-                    vec3 e = texture2D(sTexture, vTexCoord + vec2(uTexelStep.x, 0.0)).rgb;
-                    vec3 w = texture2D(sTexture, vTexCoord - vec2(uTexelStep.x, 0.0)).rgb;
-                    vec3 avg = 0.25 * (n + s + e + w);
-                    vec3 sharp = clamp(center.rgb + (center.rgb - avg) * uSharpen, 0.0, 1.0);
-                    gl_FragColor = vec4(sharp, center.a);
+                vec3 col = sampleGameSpatial(vTexCoord);
+                if (uBlurMode < 0.5) {
+                    col = applyOrderedVisualFilters(col, vTexCoord);
                 }
+                gl_FragColor = vec4(col, 1.0);
             }
         """
 
-        fun buildOesProgram(): Int {
-            val vs = compileShader(GLES20.GL_VERTEX_SHADER, VERTEX_SHADER)
-            val fs = compileShader(GLES20.GL_FRAGMENT_SHADER, FRAGMENT_SHADER)
+        private const val RGBA_VS = """
+            uniform mat4 uMVPMatrix;
+            attribute vec4 aPosition;
+            attribute vec4 aTexCoord;
+            varying vec2 vTexCoord;
+            void main() {
+                gl_Position = uMVPMatrix * aPosition;
+                vTexCoord = aTexCoord.xy;
+            }
+        """
+
+        private const val RGBA_FS = """
+            precision mediump float;
+            varying vec2 vTexCoord;
+            uniform sampler2D sRgbaTex;
+            void main() {
+                gl_FragColor = texture2D(sRgbaTex, vTexCoord);
+            }
+        """
+
+        fun buildOesPipelineProgram(allowEs30Shader: Boolean): OesHandles {
+            var prog = 0
+            if (allowEs30Shader) {
+                prog = tryLinkProgram(OES_VS_ES30, OES_FS_ES30)
+            }
+            if (prog == 0) {
+                prog = tryLinkProgram(OES_VS_ES20, OES_FS_ES20)
+            }
+            if (prog == 0) {
+                throw IllegalStateException("Failed to compile OpenGL OES video shader")
+            }
+            return OesHandles(
+                programId = prog,
+                aPosLoc = GLES20.glGetAttribLocation(prog, "aPosition"),
+                aTexLoc = GLES20.glGetAttribLocation(prog, "aTexCoord"),
+                uMvpLoc = GLES20.glGetUniformLocation(prog, "uMVPMatrix"),
+                uTexMatLoc = GLES20.glGetUniformLocation(prog, "uTexMatrix"),
+                uTexSamplerLoc = GLES20.glGetUniformLocation(prog, "sTexture"),
+                uTexelStepLoc = GLES20.glGetUniformLocation(prog, "uTexelStep"),
+                uUpscalerLoc = GLES20.glGetUniformLocation(prog, "uUpscaler"),
+                uBlurModeLoc = GLES20.glGetUniformLocation(prog, "uBlurMode"),
+                uShadowBoostLoc = GLES20.glGetUniformLocation(prog, "uShadowBoost"),
+                uFilmicLoc = GLES20.glGetUniformLocation(prog, "uFilmic"),
+                uVividLoc = GLES20.glGetUniformLocation(prog, "uVivid"),
+                uTempShiftLoc = GLES20.glGetUniformLocation(prog, "uTempShift"),
+                uSharpenLoc = GLES20.glGetUniformLocation(prog, "uSharpen")
+            )
+        }
+
+        fun buildRgba2dProgram(): Rgba2dHandles {
+            val prog = tryLinkProgram(RGBA_VS, RGBA_FS)
+            if (prog == 0) {
+                throw IllegalStateException("Failed to compile OpenGL RGBA overlay shader")
+            }
+            return Rgba2dHandles(
+                programId = prog,
+                aPosLoc = GLES20.glGetAttribLocation(prog, "aPosition"),
+                aTexLoc = GLES20.glGetAttribLocation(prog, "aTexCoord"),
+                uMvpLoc = GLES20.glGetUniformLocation(prog, "uMVPMatrix"),
+                uSamplerLoc = GLES20.glGetUniformLocation(prog, "sRgbaTex")
+            )
+        }
+
+        private fun tryLinkProgram(vsSrc: String, fsSrc: String): Int {
+            val vs = compileChecked(GLES20.GL_VERTEX_SHADER, vsSrc)
+            if (vs == 0) return 0
+            val fs = compileChecked(GLES20.GL_FRAGMENT_SHADER, fsSrc)
+            if (fs == 0) {
+                GLES20.glDeleteShader(vs)
+                return 0
+            }
             val prog = GLES20.glCreateProgram()
             GLES20.glAttachShader(prog, vs)
             GLES20.glAttachShader(prog, fs)
             GLES20.glLinkProgram(prog)
             GLES20.glDeleteShader(vs)
             GLES20.glDeleteShader(fs)
+
+            val linkStatus = IntArray(1)
+            GLES20.glGetProgramiv(prog, GLES20.GL_LINK_STATUS, linkStatus, 0)
+            if (linkStatus[0] == 0) {
+                GLES20.glDeleteProgram(prog)
+                return 0
+            }
             return prog
         }
 
-        private fun compileShader(type: Int, src: String): Int {
+        private fun compileChecked(type: Int, src: String): Int {
             val shader = GLES20.glCreateShader(type)
+            if (shader == 0) return 0
             GLES20.glShaderSource(shader, src)
             GLES20.glCompileShader(shader)
+            val compiled = IntArray(1)
+            GLES20.glGetShaderiv(shader, GLES20.GL_COMPILE_STATUS, compiled, 0)
+            if (compiled[0] == 0) {
+                GLES20.glDeleteShader(shader)
+                return 0
+            }
             return shader
+        }
+
+        fun uploadBitmapTexture2d(bitmap: Bitmap): Int {
+            val ids = IntArray(1)
+            GLES20.glGenTextures(1, ids, 0)
+            val texId = ids[0]
+            if (texId == 0) return 0
+            GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, texId)
+            GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
+            GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
+            GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
+            GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
+            GLUtils.texImage2D(GLES20.GL_TEXTURE_2D, 0, bitmap, 0)
+            return texId
+        }
+
+        fun deleteTexture2d(texId: Int) {
+            if (texId != 0) {
+                try { GLES20.glDeleteTextures(1, intArrayOf(texId), 0) } catch (_: Exception) {}
+            }
         }
 
         fun createFloatBuffer(coords: FloatArray): FloatBuffer =
