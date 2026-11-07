@@ -1,4 +1,5 @@
 /*
+ * ॐ नमः शिवाय (Om Namah Shivaya)
  * SolStream Studio — Ultra-Lightweight Mobile Gaming Broadcast Engine
  * Copyright (c) 2026 Sol (@Sol_CODM / github.com/PppP01). All rights reserved.
  * SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
@@ -22,19 +23,13 @@ import android.graphics.Typeface
 import android.media.ExifInterface
 import android.net.Uri
 import java.io.File
+import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.util.Locale
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.max
 import kotlin.math.min
 
-/**
- * Zero-permission graphic asset store for Starting Soon, BRB, transparent .PNG overlays,
- * 9:16 Shorts posters, and GPU-cached Live Text Banners.
- *
- * Uses Android's system Photo Picker / Document URI streams directly—requiring ZERO
- * READ_EXTERNAL_STORAGE or READ_MEDIA_IMAGES permissions.
- */
 object SolSceneAssetStore {
 
     enum class AssetSlot(val fileName: String, val maxDimensionPx: Int) {
@@ -74,13 +69,57 @@ object SolSceneAssetStore {
     }
 
     /**
-     * Imports a user-selected image URI safely off the UI thread, honoring EXIF orientation,
-     * preserving 8-bit PNG alpha transparency, and clamping dimensions to prevent RAM bloat.
+     * Atomically replaces [outFile] with [tempFile], falling back to stream copy and preserving
+     * any previous image if writing fails.
      */
+    internal fun replaceFileSafely(tempFile: File, outFile: File): Boolean {
+        if (!tempFile.exists() || tempFile.length() <= 64L) return false
+        val backupFile = File(outFile.parentFile, "${outFile.name}.bak")
+        try {
+            if (backupFile.exists()) backupFile.delete()
+            if (outFile.exists() && !outFile.renameTo(backupFile)) {
+                FileInputStream(outFile).use { fis ->
+                    FileOutputStream(backupFile).use { fos -> fis.copyTo(fos) }
+                }
+                outFile.delete()
+            }
+
+            val moved = tempFile.renameTo(outFile) || run {
+                FileInputStream(tempFile).use { fis ->
+                    FileOutputStream(outFile).use { fos ->
+                        fis.copyTo(fos)
+                        fos.flush()
+                    }
+                }
+                tempFile.delete()
+                outFile.exists() && outFile.length() > 64L
+            }
+
+            if (moved && outFile.exists() && outFile.length() > 64L) {
+                if (backupFile.exists()) backupFile.delete()
+                return true
+            }
+
+            if (backupFile.exists()) {
+                if (outFile.exists()) outFile.delete()
+                backupFile.renameTo(outFile)
+            }
+            return false
+        } catch (_: Exception) {
+            if (backupFile.exists() && (!outFile.exists() || outFile.length() <= 64L)) {
+                try { backupFile.renameTo(outFile) } catch (_: Exception) {}
+            }
+            return false
+        } finally {
+            if (tempFile.exists()) {
+                try { tempFile.delete() } catch (_: Exception) {}
+            }
+        }
+    }
+
     fun importAssetFromUri(context: Context, uri: Uri, slot: AssetSlot): Result<String> {
         val resolver = context.applicationContext.contentResolver
         return try {
-            // 1. Read EXIF rotation if present (prevents sideways phone gallery photos)
             val rotationDeg = try {
                 resolver.openInputStream(uri)?.use { exifStream ->
                     val exif = ExifInterface(exifStream)
@@ -95,7 +134,6 @@ object SolSceneAssetStore {
                 0f
             }
 
-            // 2. Probe dimensions without allocating pixel memory
             val boundsOpts = BitmapFactory.Options().apply { inJustDecodeBounds = true }
             resolver.openInputStream(uri)?.use { probeStream ->
                 BitmapFactory.decodeStream(probeStream, null, boundsOpts)
@@ -106,7 +144,6 @@ object SolSceneAssetStore {
                 return Result.failure(IllegalArgumentException("Selected file is not a valid image."))
             }
 
-            // 3. Compute power-of-2 sub-sampling so even 50 MP gallery photos decode in <12 MB RAM
             val maxTarget = slot.maxDimensionPx
             var sampleSize = 1
             while ((srcW / sampleSize) > maxTarget * 2 || (srcH / sampleSize) > maxTarget * 2) {
@@ -122,7 +159,6 @@ object SolSceneAssetStore {
                 BitmapFactory.decodeStream(imgStream, null, decodeOpts)
             } ?: return Result.failure(IllegalStateException("Could not decode selected image."))
 
-            // 4. Apply EXIF rotation and exact max-dimension clamp
             val finalBitmap = transformAndClampBitmap(decoded, rotationDeg, maxTarget)
             if (finalBitmap !== decoded) {
                 decoded.recycle()
@@ -130,18 +166,20 @@ object SolSceneAssetStore {
 
             val outFile = slotFile(context, slot)
             val tempFile = File(outFile.parentFile, "${slot.fileName}.tmp")
-            FileOutputStream(tempFile).use { fos ->
-                finalBitmap.compress(Bitmap.CompressFormat.PNG, 100, fos)
+            val compressedOk = FileOutputStream(tempFile).use { fos ->
+                val ok = finalBitmap.compress(Bitmap.CompressFormat.PNG, 100, fos)
                 fos.flush()
+                ok
             }
             val finalW = finalBitmap.width
             val finalH = finalBitmap.height
             finalBitmap.recycle()
 
-            if (outFile.exists()) outFile.delete()
-            tempFile.renameTo(outFile)
-            bumpRevision()
+            if (!compressedOk || !replaceFileSafely(tempFile, outFile)) {
+                return Result.failure(IllegalStateException("Failed to write image file to internal storage."))
+            }
 
+            bumpRevision()
             Result.success("${finalW}x${finalH} saved")
         } catch (e: Exception) {
             Result.failure(e)
@@ -168,9 +206,6 @@ object SolSceneAssetStore {
         return Bitmap.createBitmap(src, 0, 0, src.width, src.height, matrix, true)
     }
 
-    /**
-     * Loads a saved ARGB_8888 bitmap for OpenGL texture upload (guaranteed non-HARDWARE config).
-     */
     fun loadSavedBitmapForGl(context: Context, slot: AssetSlot): Bitmap? {
         val file = slotFile(context, slot)
         if (!file.exists() || file.length() <= 64L) return null
@@ -185,10 +220,6 @@ object SolSceneAssetStore {
         }
     }
 
-    /**
-     * Loads the user's saved scene image if present; otherwise generates a clean, lightweight
-     * esports broadcast slate ("STARTING SOON" or "BE RIGHT BACK") matched to stream orientation.
-     */
     fun loadOrGenerateSceneBitmap(
         context: Context,
         slot: AssetSlot,
@@ -285,10 +316,6 @@ object SolSceneAssetStore {
         return bmp
     }
 
-    /**
-     * Renders a compact, premultiplied-alpha 1280x92 GPU banner strip (<0.48 MB RAM)
-     * uploaded ONCE whenever text changes—zero per-frame CPU drawing overhead.
-     */
     fun buildLiveBannerBitmap(rawText: String): Bitmap? {
         val clean = rawText.trim()
         if (clean.isEmpty()) return null
@@ -333,7 +360,6 @@ object SolSceneAssetStore {
         }
         canvas.drawRoundRect(pillRect, 36f, 36f, strokePaint)
 
-        // Glowing crimson live dot on the left side of the pill
         val dotCx = pillRect.left + 32f
         val dotCy = texH * 0.5f
         val glowPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
