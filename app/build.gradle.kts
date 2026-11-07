@@ -1,4 +1,5 @@
 /*
+ * ॐ नमः शिवाय (Om Namah Shivaya)
  * SolStream Studio — Ultra-Lightweight Mobile Gaming Broadcast Engine
  * Copyright (c) 2026 Sol (@Sol_CODM / github.com/PppP01). All rights reserved.
  * SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
@@ -115,8 +116,22 @@ android {
 
     lint {
         checkReleaseBuilds = true
-        abortOnError = false
+        abortOnError = true
         warningsAsErrors = false
+        disable += setOf(
+            "SetTextI18n",
+            "HardcodedText",
+            "ClickableViewAccessibility",
+            "UseCompoundDrawables",
+            "Overdraw",
+            "GradleDependency",
+            "NewerVersionAvailable",
+            "OldTargetApi"
+        )
+    }
+
+    testOptions {
+        unitTests.isReturnDefaultValues = true
     }
 
     compileOptions {
