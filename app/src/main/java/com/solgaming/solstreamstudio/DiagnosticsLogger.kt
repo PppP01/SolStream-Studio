@@ -1,3 +1,10 @@
+/*
+ * SolStream Studio — Ultra-Lightweight Mobile Gaming Broadcast Engine
+ * Copyright (c) 2026 Sol (@Sol_CODM / github.com/PppP01). All rights reserved.
+ * SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+ * Commercial redistribution, rebranding, or app-store monetization prohibited without written license.
+ */
+
 package com.solgaming.solstreamstudio
 
 import android.content.Context
@@ -37,9 +44,12 @@ data class BenchmarkSummary(
 
 object DiagnosticsLogger {
     private const val MAX_EVENTS = 260
+    private const val MAX_CLIP_MARKERS = 60
     private const val BENCH_PREFS = "solstream_benchmarks"
     private const val KEY_LAST_CRASH = "last_privacy_safe_crash"
+
     private val events = ArrayDeque<DiagnosticEvent>(MAX_EVENTS)
+    private val clipHighlights = ArrayList<String>(MAX_CLIP_MARKERS)
     private val timeFmt = SimpleDateFormat("HH:mm:ss", Locale.US)
 
     @Volatile private var crashHandlerInstalled: Boolean = false
@@ -53,6 +63,8 @@ object DiagnosticsLogger {
     @Volatile var droppedVideoFrames: Int = 0
     @Volatile var reconnectAttempts: Int = 0
     @Volatile var activeEncoderDesc: String = "Idle"
+    @Volatile var activeAudioDspDesc: String = "32-Bit Float Studio"
+    @Volatile var activeSimulcastDesc: String = "Single Primary"
     @Volatile var lastQueueBytes: Long = -1L
     @Volatile var lastQueueFrames: Int = -1
     @Volatile var lastQueueCapacity: Int = -1
@@ -64,6 +76,7 @@ object DiagnosticsLogger {
     @Volatile var lastBitrateKbps: Int = 0
     @Volatile var avDriftMs: Long = 0L
     @Volatile var micStatusLabel: String = "IDLE"
+    @Volatile var lastBatteryPercent: Int = -1
 
     private fun redactSecrets(input: String): String {
         return input
@@ -137,10 +150,12 @@ object DiagnosticsLogger {
     fun startNewSession(context: Context, modeLabel: String, encoderDesc: String) {
         installPrivacySafeCrashHandler(context)
         events.clear()
+        clipHighlights.clear()
         sessionStartMs = System.currentTimeMillis()
         val temp = readBatteryTempC(context)
         startBatteryTempC = temp
         peakBatteryTempC = temp
+        lastBatteryPercent = readBatteryPercent(context)
         worstThermalStatus = readThermalStatus(context)
         ramSampleSumMb = 0L
         ramSampleCount = 0
@@ -158,9 +173,32 @@ object DiagnosticsLogger {
         log(
             "SESSION",
             "$modeLabel started ($encoderDesc).",
-            "startTemp=${formatTempC(temp)} thermal=${thermalStatusName(worstThermalStatus)}"
+            "startTemp=${formatTempC(temp)} batt=${if (lastBatteryPercent >= 0) "$lastBatteryPercent%" else "N/A"} thermal=${thermalStatusName(worstThermalStatus)}"
         )
     }
+
+    /**
+     * Records an exact VOD / Shorts highlight timestamp when the streamer taps '★ Mark Clip' in-game.
+     */
+    @Synchronized
+    fun markClipHighlight(streamElapsedSec: Long, label: String = "Clutch / Highlight"): String {
+        val hh = streamElapsedSec / 3600L
+        val mm = (streamElapsedSec % 3600L) / 60L
+        val ss = streamElapsedSec % 60L
+        val vodStamp = String.format(Locale.US, "%02d:%02d:%02d", hh, mm, ss)
+        val wallClock = timeFmt.format(Date())
+        val clipNum = clipHighlights.size + 1
+        val entry = "Clip #$clipNum @ Stream Time $vodStamp (Wall Clock $wallClock) — $label"
+        if (clipHighlights.size >= MAX_CLIP_MARKERS) {
+            clipHighlights.removeAt(0)
+        }
+        clipHighlights.add(entry)
+        log("CLIP_MARK", "Saved stream highlight marker #$clipNum at $vodStamp.", label)
+        return "#$clipNum @ $vodStamp"
+    }
+
+    @Synchronized
+    fun getClipHighlightCount(): Int = clipHighlights.size
 
     @Synchronized
     fun log(category: String, plainEnglish: String, technicalDetail: String = "") {
@@ -180,6 +218,7 @@ object DiagnosticsLogger {
     fun sampleDeviceHealth(context: Context): Pair<Float, Int> {
         val tempC = readBatteryTempC(context)
         val thermal = readThermalStatus(context)
+        val battPct = readBatteryPercent(context)
         val ramMb = readAppMemoryMb()
         synchronized(this) {
             if (tempC > 0f && (peakBatteryTempC <= 0f || tempC > peakBatteryTempC)) {
@@ -188,6 +227,7 @@ object DiagnosticsLogger {
             if (tempC > 0f && startBatteryTempC <= 0f) {
                 startBatteryTempC = tempC
             }
+            if (battPct >= 0) lastBatteryPercent = battPct
             if (thermal > worstThermalStatus) worstThermalStatus = thermal
             ramSampleSumMb += ramMb
             ramSampleCount++
@@ -208,6 +248,33 @@ object DiagnosticsLogger {
             if (tenths > 0) tenths / 10.0f else -1f
         } catch (_: Exception) {
             -1f
+        }
+    }
+
+    fun readBatteryPercent(context: Context): Int {
+        return try {
+            val intent = context.applicationContext.registerReceiver(
+                null,
+                IntentFilter(Intent.ACTION_BATTERY_CHANGED)
+            ) ?: return -1
+            val level = intent.getIntExtra(BatteryManager.EXTRA_LEVEL, -1)
+            val scale = intent.getIntExtra(BatteryManager.EXTRA_SCALE, -1)
+            if (level >= 0 && scale > 0) ((level * 100f) / scale.toFloat()).roundToInt() else -1
+        } catch (_: Exception) {
+            -1
+        }
+    }
+
+    fun isBatteryChargingOrPlugged(context: Context): Boolean {
+        return try {
+            val intent = context.applicationContext.registerReceiver(
+                null,
+                IntentFilter(Intent.ACTION_BATTERY_CHANGED)
+            ) ?: return false
+            val plugged = intent.getIntExtra(BatteryManager.EXTRA_PLUGGED, 0)
+            plugged != 0
+        } catch (_: Exception) {
+            false
         }
     }
 
@@ -273,6 +340,7 @@ object DiagnosticsLogger {
     fun audioDeviceTypeName(type: Int): String = when (type) {
         AudioDeviceInfo.TYPE_BUILTIN_MIC -> "Built-in Mic"
         AudioDeviceInfo.TYPE_WIRED_HEADSET -> "Wired Headset Mic"
+        AudioDeviceInfo.TYPE_WIRED_HEADPHONES -> "Wired Headphones"
         AudioDeviceInfo.TYPE_BLUETOOTH_SCO -> "Bluetooth HFP (Call-Mode)"
         AudioDeviceInfo.TYPE_BLUETOOTH_A2DP -> "Bluetooth A2DP"
         AudioDeviceInfo.TYPE_USB_DEVICE -> "USB Audio Mic"
@@ -307,7 +375,9 @@ object DiagnosticsLogger {
                 } else {
                     "none"
                 }
-                "#$idx src=$srcName silenced=$silenced rate=${c.format.sampleRate}Hz ch=${c.format.channelCount} dev=$devDesc"
+                val clientRate = c.clientFormat.sampleRate
+                val halRate = c.format.sampleRate
+                "#$idx src=$srcName silenced=$silenced appRate=${clientRate}Hz(hal=${halRate}Hz) ch=${c.clientFormat.channelCount} dev=$devDesc"
             }.joinToString(" | ")
         } catch (e: Exception) {
             "Audio config query unavailable (${e.javaClass.simpleName})"
@@ -366,9 +436,9 @@ object DiagnosticsLogger {
 
     @Synchronized
     fun buildShareableReport(context: Context): String {
-        val scan = CodecCapabilityProbe.scanDevice(context)
+        val scan = CodecCapabilityProbe.peekCachedOrPlaceholder(context)
         val avgRam = if (ramSampleCount > 0) (ramSampleSumMb / ramSampleCount).toInt() else readAppMemoryMb()
-        val headroom = readThermalHeadroom(context)
+        val thermalLoad = readThermalHeadroom(context)
         val liveTemp = readBatteryTempC(context)
         val displayStartTemp = if (sessionStartMs > 0L) startBatteryTempC else liveTemp
         val displayPeakTemp = if (sessionStartMs > 0L) peakBatteryTempC else liveTemp
@@ -377,25 +447,28 @@ object DiagnosticsLogger {
             .getString(KEY_LAST_CRASH, null)
 
         val sb = StringBuilder()
-        sb.appendLine("=== SOLSTREAM STUDIO — AUTOMATIC SESSION REPORT ===")
+        sb.appendLine("=== SOLSTREAM STUDIO ULTRA — AUTOMATIC SESSION REPORT ===")
         sb.appendLine("Privacy Guarantee: Stream keys, notifications, and voice audio are NEVER included.")
-        sb.appendLine("Device: ${scan.deviceModel} (${scan.socModel}) | Android ${scan.androidRelease} (API ${scan.sdkInt})")
-        sb.appendLine("Vault Security: ${KeystoreVault.getKeySecurityDescription()}")
-        sb.appendLine("Active Pipeline: $activeEncoderDesc")
+        sb.appendLine(
+            "Device: ${scan.deviceModel} (${scan.socModel}) | Android ${scan.androidRelease} (API ${scan.sdkInt}) | " +
+                "Display: ${scan.maxDisplayHz}Hz | GL: ${scan.maxGlEsVersion}"
+        )
+        sb.appendLine("Vault Security: ${KeystoreVault.getKeySecurityDescription()} | Targets: $activeSimulcastDesc")
+        sb.appendLine("Active Pipeline: $activeEncoderDesc | Audio DSP: $activeAudioDspDesc")
 
         val freshStr = if (freshCaptureFps >= 0) "$freshCaptureFps" else "N/A"
         val qpStr = if (lastAverageQp >= 0) "$lastAverageQp" else "N/A"
         val rttStr = if (lastRttMs >= 0L) "${lastRttMs} ms" else "N/A"
         sb.appendLine(
             "Latest Live Metrics: ${String.format(Locale.US, "%.2f", lastBitrateKbps / 1000.0)} Mbps | " +
-                "Out FPS: $lastEncodedFps (Fresh Capture FPS: $freshStr, Avg QP: $qpStr) | " +
+                "Out FPS: $lastEncodedFps (Fresh Game FPS: $freshStr, Skipped Idle: $repeatedFramesCount, Avg QP: $qpStr) | " +
                 "Send Queue: ${formatQueueSummary()} | RTMP Ping: $rttStr | " +
-                "A/V Drift: ${avDriftMs} ms | Mic: $micStatusLabel"
+                "A/V Sync Offset: ${avDriftMs} ms | Mic: $micStatusLabel"
         )
         sb.appendLine(
-            "Thermal & Memory: Start ${formatTempC(displayStartTemp)} -> Peak ${formatTempC(displayPeakTemp)} | " +
-                "Worst Thermal: ${thermalStatusName(worstThermalStatus)} | " +
-                "Headroom: ${if (headroom >= 0f) "${(headroom * 100).roundToInt()}%" else "N/A"} | " +
+            "Battery Temp & Memory: Start ${formatTempC(displayStartTemp)} -> Peak ${formatTempC(displayPeakTemp)} | " +
+                "Worst SoC Thermal: ${thermalStatusName(worstThermalStatus)} | " +
+                "Thermal Load (toward Severe): ${if (thermalLoad >= 0f) "${(thermalLoad * 100).roundToInt()}%" else "N/A"} | " +
                 describeDetailedMemory(avgRam)
         )
         sb.appendLine("Active Audio Policy: ${inspectActiveAudioRecordings(context)}")
@@ -403,6 +476,14 @@ object DiagnosticsLogger {
             sb.appendLine("Last Recorded Crash: $savedCrash")
         }
         sb.appendLine()
+
+        if (clipHighlights.isNotEmpty()) {
+            sb.appendLine("--- ★ SAVED STREAM CLIP HIGHLIGHTS (FOR SHORTS / VODS) ---")
+            for (clip in clipHighlights) {
+                sb.appendLine("• $clip")
+            }
+            sb.appendLine()
+        }
 
         val glip = loadBenchmark(context, "glip", "Glip Baseline")
         val sol = loadBenchmark(context, "sol", "SolStream Studio")
@@ -418,7 +499,7 @@ object DiagnosticsLogger {
                 sb.appendLine(
                     "• SolStream (${it.durationMinutes}m): Start ${formatTempC(it.startTempC)} -> Peak ${formatTempC(it.peakTempC)} | " +
                         "Worst Thermal: ${thermalStatusName(it.worstThermalLevel)} | App PSS: ${it.avgRamMb} MB | " +
-                        "Drops: ${it.droppedFrames} | Reconnects: ${it.reconnectCount}"
+                        "Sender Drops: ${it.droppedFrames} | Reconnects: ${it.reconnectCount}"
                 )
             }
             sb.appendLine()
