@@ -7,7 +7,9 @@
 
 package com.solgaming.solstreamstudio
 
+import android.media.MediaCodec
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -127,5 +129,144 @@ class SolStreamUnitTests {
         assertEquals("RNNOISE", updated.noiseSuppressMode)
         assertEquals(2, updated.rnnoiseLevel)
         assertEquals("SOL_LUXE", updated.voicePreset)
+    }
+
+    @Test
+    fun abrRecoveryCheck_rejectsMissingMinusOneTelemetryAndAcceptsCalmValidQueue() {
+        assertFalse(
+            "Unavailable (-1) queue metrics must never trigger ABR step-up",
+            SolStreamService.isQueueCalmForAbrRecovery(qFrames = -1, qBytes = -1L, droppedDelta = 0)
+        )
+        assertFalse(
+            "Non-zero dropped frame delta must block ABR step-up",
+            SolStreamService.isQueueCalmForAbrRecovery(qFrames = 2, qBytes = 10_000L, droppedDelta = 1)
+        )
+        assertFalse(
+            "High frame queue must block ABR step-up",
+            SolStreamService.isQueueCalmForAbrRecovery(qFrames = 14, qBytes = 50_000L, droppedDelta = 0)
+        )
+        assertTrue(
+            "Valid empty queue must allow ABR step-up",
+            SolStreamService.isQueueCalmForAbrRecovery(qFrames = 0, qBytes = 0L, droppedDelta = 0)
+        )
+        assertTrue(
+            "Valid low queue must allow ABR step-up",
+            SolStreamService.isQueueCalmForAbrRecovery(qFrames = 4, qBytes = 120_000L, droppedDelta = 0)
+        )
+    }
+
+    @Test
+    fun encoderFrameVerification_rejectsFormatChangedAndConfigBuffers() {
+        assertFalse(
+            "INFO_OUTPUT_FORMAT_CHANGED is not an encoded video frame",
+            CodecCapabilityProbe.isRealEncodedFrameOutput(MediaCodec.INFO_OUTPUT_FORMAT_CHANGED, 0, 0)
+        )
+        assertFalse(
+            "Codec config buffer is not an encoded video frame",
+            CodecCapabilityProbe.isRealEncodedFrameOutput(0, 64, MediaCodec.BUFFER_FLAG_CODEC_CONFIG)
+        )
+        assertFalse(
+            "Zero-byte buffer is not an encoded video frame",
+            CodecCapabilityProbe.isRealEncodedFrameOutput(0, 0, 0)
+        )
+        assertTrue(
+            "Non-empty keyframe buffer must be accepted as real encode output",
+            CodecCapabilityProbe.isRealEncodedFrameOutput(0, 4096, MediaCodec.BUFFER_FLAG_KEY_FRAME)
+        )
+    }
+
+    @Test
+    fun resolutionAndFpsResolver_stepsDownWhen1080p60UnsupportedOn1080p30Chip() {
+        val budgetChip = HardwareEncoderReport(
+            codecKey = "H264",
+            mimeType = "video/avc",
+            encoderName = "c2.mtk.avc.encoder",
+            supports4k60 = false,
+            supports4k30 = false,
+            supports1440p60 = false,
+            supports1440p30 = false,
+            supports1080p60 = false,
+            supports1080p30 = true,
+            supports720p60 = true,
+            supports720p30 = true,
+            supportsCbr = true,
+            supportsVbr = true,
+            complexityMin = 0,
+            complexityMax = 0,
+            verifiedSurfaceConfigure = true
+        )
+        val (w, h, fps) = SolVideoPipeline.resolveSupportedResolutionAndFps(
+            report = budgetChip,
+            reqWidth = 1920,
+            reqHeight = 1080,
+            reqFps = 60
+        )
+        assertEquals(1920, w)
+        assertEquals(1080, h)
+        assertEquals("Must step down to 30 FPS when 1080p60 is unsupported", 30, fps)
+    }
+
+    @Test
+    fun rnnoiseFallbackAndPartialFrames_attenuateNoiseEvenWhen480SampleNativePathSkipped() {
+        val dsp = MicDspProcessor(48000)
+        dsp.applySettings(
+            StreamSettings(
+                voicePreset = "NEURAL",
+                noiseSuppressMode = "RNNOISE",
+                rnnoiseLevel = 3,
+                hpfCutoffHz = 0,
+                transientTamerEnabled = false,
+                noiseGateEnabled = false,
+                compressorEnabled = false
+            )
+        )
+        val partialFrame = FloatArray(240) { 0.001f }
+        dsp.processMonoFrameInPlace(partialFrame, 240)
+        assertTrue("Partial frame fallback output must be finite", partialFrame.last().isFinite())
+        assertTrue("Light spectral fallback must attenuate stationary noise", abs(partialFrame.last()) < 0.001f)
+        dsp.release()
+    }
+
+    @Test
+    fun physicalRamNormalizer_maps7Point17GiBKernelMemTo8GbFlagshipTier() {
+        val s24FeKernelBytes = (7.17 * 1024.0 * 1024.0 * 1024.0).toLong()
+        assertEquals(8, CodecCapabilityProbe.normalizePhysicalRamGb(s24FeKernelBytes))
+
+        val twelveGbKernelBytes = (11.2 * 1024.0 * 1024.0 * 1024.0).toLong()
+        assertEquals(12, CodecCapabilityProbe.normalizePhysicalRamGb(twelveGbKernelBytes))
+    }
+
+    @Test
+    fun connectionGenerationGuard_rejectsLateSuccessCallbackAfterStop() {
+        assertFalse(
+            SolStreamService.shouldAcceptConnectionCallback(
+                isBroadcastActive = false,
+                callbackGen = 1L,
+                currentGen = 1L
+            )
+        )
+        assertFalse(
+            SolStreamService.shouldAcceptConnectionCallback(
+                isBroadcastActive = true,
+                callbackGen = 1L,
+                currentGen = 2L
+            )
+        )
+        assertFalse(
+            SolStreamService.shouldAcceptConnectionCallback(
+                isBroadcastActive = true,
+                callbackGen = 2L,
+                currentGen = 2L,
+                isTargetStopped = true
+            )
+        )
+        assertTrue(
+            SolStreamService.shouldAcceptConnectionCallback(
+                isBroadcastActive = true,
+                callbackGen = 2L,
+                currentGen = 2L,
+                isTargetStopped = false
+            )
+        )
     }
 }
