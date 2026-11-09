@@ -178,20 +178,19 @@ object KeystoreVault {
         }
     }
 
-    // === PRIMARY & SHORTS STREAM KEY VAULT ===
-    fun saveEndpointAndKey(context: Context, rtmpsUrl: String, plainStreamKey: String) {
+    // === PRIMARY & SHORTS STREAM KEY VAULT (RETURNS TRUE ONLY WHEN ENCRYPTION + STORAGE SUCCEED) ===
+    fun saveEndpointAndKey(context: Context, rtmpsUrl: String, plainStreamKey: String): Boolean {
         val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         val normUrl = normalizeIngestUrl(rtmpsUrl)
         val cleanKey = plainStreamKey.trim().trimStart('/')
         val editor = prefs.edit().putString(KEY_INGEST_URL, normUrl)
         if (cleanKey.isEmpty()) {
             editor.remove(KEY_ENC_STREAM_KEY)
-        } else {
-            encryptSecret(context, cleanKey)?.let { enc ->
-                editor.putString(KEY_ENC_STREAM_KEY, enc)
-            }
+            return editor.commit()
         }
-        editor.apply()
+        val enc = encryptSecret(context, cleanKey) ?: return false
+        editor.putString(KEY_ENC_STREAM_KEY, enc)
+        return editor.commit()
     }
 
     fun getRtmpsUrl(context: Context): String {
@@ -213,16 +212,17 @@ object KeystoreVault {
             .apply()
     }
 
-    fun saveShortsStreamKey(context: Context, shortsKey: String) {
+    fun saveShortsStreamKey(context: Context, shortsKey: String): Boolean {
         val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         val clean = shortsKey.trim().trimStart('/')
         val edit = prefs.edit()
         if (clean.isEmpty()) {
             edit.remove(KEY_ENC_SHORTS_KEY)
-        } else {
-            encryptSecret(context, clean)?.let { edit.putString(KEY_ENC_SHORTS_KEY, it) }
+            return edit.commit()
         }
-        edit.apply()
+        val enc = encryptSecret(context, clean) ?: return false
+        edit.putString(KEY_ENC_SHORTS_KEY, enc)
+        return edit.commit()
     }
 
     fun getShortsStreamKey(context: Context): String {
@@ -232,13 +232,17 @@ object KeystoreVault {
     }
 
     // === MULTI-PLATFORM SIMULCAST VAULT (TWITCH & KICK) ===
-    fun saveTwitchUrlAndKey(context: Context, url: String, key: String) {
+    fun saveTwitchUrlAndKey(context: Context, url: String, key: String): Boolean {
         val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         val edit = prefs.edit().putString(KEY_TWITCH_URL, normalizeIngestUrl(url.ifBlank { DEFAULT_TWITCH_RTMPS }))
         val clean = key.trim().trimStart('/')
-        if (clean.isEmpty()) edit.remove(KEY_ENC_TWITCH_KEY)
-        else encryptSecret(context, clean)?.let { edit.putString(KEY_ENC_TWITCH_KEY, it) }
-        edit.apply()
+        if (clean.isEmpty()) {
+            edit.remove(KEY_ENC_TWITCH_KEY)
+            return edit.commit()
+        }
+        val enc = encryptSecret(context, clean) ?: return false
+        edit.putString(KEY_ENC_TWITCH_KEY, enc)
+        return edit.commit()
     }
 
     fun getTwitchUrl(context: Context): String {
@@ -252,13 +256,17 @@ object KeystoreVault {
         return decryptSecret(blob)
     }
 
-    fun saveKickUrlAndKey(context: Context, url: String, key: String) {
+    fun saveKickUrlAndKey(context: Context, url: String, key: String): Boolean {
         val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         val edit = prefs.edit().putString(KEY_KICK_URL, normalizeIngestUrl(url.ifBlank { DEFAULT_KICK_RTMPS }))
         val clean = key.trim().trimStart('/')
-        if (clean.isEmpty()) edit.remove(KEY_ENC_KICK_KEY)
-        else encryptSecret(context, clean)?.let { edit.putString(KEY_ENC_KICK_KEY, it) }
-        edit.apply()
+        if (clean.isEmpty()) {
+            edit.remove(KEY_ENC_KICK_KEY)
+            return edit.commit()
+        }
+        val enc = encryptSecret(context, clean) ?: return false
+        edit.putString(KEY_ENC_KICK_KEY, enc)
+        return edit.commit()
     }
 
     fun getKickUrl(context: Context): String {
