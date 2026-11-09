@@ -14,6 +14,7 @@ import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.io.File
 import kotlin.math.abs
 import kotlin.math.sin
 
@@ -268,5 +269,91 @@ class SolStreamUnitTests {
                 isTargetStopped = false
             )
         )
+    }
+
+    @Test
+    fun probeTargetSelector_picksSupportedResolutionAndFpsPairTogether() {
+        // Chip supports 1440p30 and 1080p60, but NOT 1440p60 -> must pick 1920x1080@60, never 2560x1440@60
+        val (w, h, fps) = CodecCapabilityProbe.selectValidProbeTarget(
+            ok1440p60 = false,
+            ok1440p30 = true,
+            ok1080p60 = true,
+            ok1080p30 = true,
+            ok720p60 = true
+        )
+        assertEquals(1920, w)
+        assertEquals(1080, h)
+        assertEquals(60, fps)
+    }
+
+    @Test
+    fun sceneAssetReplaceSafely_commitsValidTempAndPreservesExistingOnInvalidTemp() {
+        val tmpDir = File(System.getProperty("java.io.tmpdir"), "sol_scene_test_${System.nanoTime()}")
+        tmpDir.mkdirs()
+        try {
+            val outFile = File(tmpDir, "scene_brb.png")
+            val originalContent = ByteArray(256) { 0x42 }
+            outFile.writeBytes(originalContent)
+
+            // Invalid/missing temp file must fail and leave original outFile untouched
+            val invalidTemp = File(tmpDir, "missing.tmp")
+            assertFalse(SolSceneAssetStore.replaceFileSafely(invalidTemp, outFile))
+            assertTrue(outFile.exists())
+            assertEquals(256L, outFile.length())
+
+            // Valid temp file must atomically replace outFile
+            val validTemp = File(tmpDir, "valid.tmp")
+            val newContent = ByteArray(512) { 0x7A }
+            validTemp.writeBytes(newContent)
+            assertTrue(SolSceneAssetStore.replaceFileSafely(validTemp, outFile))
+            assertEquals(512L, outFile.length())
+        } finally {
+            tmpDir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun overlayQueueTagFormatter_displaysNaForUnavailableMinusOneQueue() {
+        assertEquals("Q:N/A", SolStreamService.formatOverlayQueueTag(-1))
+        assertEquals("Q:0f", SolStreamService.formatOverlayQueueTag(0))
+        assertEquals("Q:12f", SolStreamService.formatOverlayQueueTag(12))
+    }
+
+    @Test
+    fun sparkAndHammerBlanker_clampsMultiStrikeImpulsesWithoutOpeningSpeechGate() {
+        val dsp = MicDspProcessor(48000)
+        dsp.applySettings(
+            MicDspProcessor.applyPresetToSettings(
+                StreamSettings(voiceGenderProfile = "MALE", micGainPercent = 100),
+                "SOL_LUXE"
+            )
+        )
+
+        // Prime calm room floor
+        val quietFrame = FloatArray(480) { 0.0005f }
+        repeat(5) { dsp.processMonoFrameInPlace(quietFrame.clone(), 480) }
+
+        // Simulate 6 rapid mosquito-racket high-slew electric zaps ("phat-phat-phat") across frames
+        for (zap in 1..6) {
+            val sparkFrame = FloatArray(480) { idx ->
+                if (idx in 40..95) {
+                    if (idx % 2 == 0) 0.85f else -0.85f
+                } else {
+                    0.0005f
+                }
+            }
+            dsp.processMonoFrameInPlace(sparkFrame, 480)
+            var peakAfterBlanker = 0f
+            for (i in 40..95) {
+                val a = abs(sparkFrame[i])
+                if (a > peakAfterBlanker) peakAfterBlanker = a
+            }
+            assertTrue(
+                "Zap #$zap must be heavily attenuated by Spark/Hammer Blanker (was $peakAfterBlanker)",
+                peakAfterBlanker < 0.25f
+            )
+            assertFalse("Short electric zap #$zap must not open the vocal VAD speech gate", dsp.vadSpeechActive)
+        }
+        dsp.release()
     }
 }
