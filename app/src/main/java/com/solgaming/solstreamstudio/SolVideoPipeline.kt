@@ -40,6 +40,7 @@ import java.nio.FloatBuffer
 import java.util.Locale
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
@@ -422,14 +423,16 @@ class SolVideoPipeline(private val context: Context) {
             )
         }, "SolVideoDrain").apply { start() }
 
-        // Initialize primaryReady = false; only set true AFTER EGL + SurfaceTexture + VirtualDisplay succeed!
+        // Initialize primaryReady = false inside AtomicReference; only set true AFTER EGL + SurfaceTexture + VirtualDisplay succeed!
         val eglLatch = CountDownLatch(1)
-        @Volatile var eglInitResult = EglInitResult(
-            primaryReady = false,
-            companionReady = false,
-            actualGlMajor = if (preferEs30) 3 else 2,
-            actualIs10Bit = false,
-            engineSummary = "Initializing"
+        val eglInitRef = AtomicReference(
+            EglInitResult(
+                primaryReady = false,
+                companionReady = false,
+                actualGlMajor = if (preferEs30) 3 else 2,
+                actualIs10Bit = false,
+                engineSummary = "Initializing"
+            )
         )
 
         val compSurf = compConfigured?.inputSurface
@@ -451,7 +454,7 @@ class SolVideoPipeline(private val context: Context) {
                 targetFps = targetFps,
                 originTimeNs = originTimeNs,
                 onEglInitialized = { res ->
-                    eglInitResult = res
+                    eglInitRef.set(res)
                     eglLatch.countDown()
                 }
             )
@@ -462,6 +465,7 @@ class SolVideoPipeline(private val context: Context) {
         } catch (_: Exception) {
             false
         }
+        val eglInitResult = eglInitRef.get()
 
         if (!latchCompleted || !eglInitResult.primaryReady) {
             DiagnosticsLogger.log(
@@ -614,7 +618,6 @@ class SolVideoPipeline(private val context: Context) {
             return scan.hevcHardware
         }
         if (scan.h264Hardware?.verifiedRealEncode == true) return scan.h264Hardware
-        // Fallback to surface-configured hardware encoder if probe ran in fast metadata mode
         if (primary != null && primary.verifiedSurfaceConfigure) return primary
         if (scan.hevcHardware?.verifiedSurfaceConfigure == true && requestedCodec != "H264") {
             return scan.hevcHardware
@@ -731,7 +734,6 @@ class SolVideoPipeline(private val context: Context) {
                             setInteger(MediaFormat.KEY_COLOR_TRANSFER, MediaFormat.COLOR_TRANSFER_SDR_VIDEO)
                         }
 
-                        // KEY_PRIORITY = 1 gives foreground CODM 120-185 FPS gameplay priority on shared SoC bus!
                         setInteger(MediaFormat.KEY_OPERATING_RATE, fps)
                         setInteger(MediaFormat.KEY_PRIORITY, 1)
                         setInteger(MediaFormat.KEY_MAX_B_FRAMES, bFrames)
