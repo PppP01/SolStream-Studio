@@ -1,4 +1,5 @@
 /*
+ * ॐ नमः शिवाय (Om Namah Shivaya)
  * SolStream Studio — Ultra-Lightweight Mobile Gaming Broadcast Engine
  * Copyright (c) 2026 Sol (@Sol_CODM / github.com/PppP01). All rights reserved.
  * SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
@@ -62,6 +63,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var scanSummary: DeviceScanSummary
     private var micOptions: List<MicInputOption> = emptyList()
     private var showStreamKeyPlain = false
+    private var userModifiedSettingsBeforeScan = false
     private var pendingAssetPickSlot: SolSceneAssetStore.AssetSlot = SolSceneAssetStore.AssetSlot.BRB_SCENE
     private var benchmarkTargetAppName: String = "Glip / Other App"
 
@@ -167,7 +169,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var tvMicTestStatus: TextView
     private lateinit var btnApplyAdvisor: Button
 
-    // Card 5: Launch, Reports & Benchmark
+    // Card 5: Launch, Reports, Benchmark & Support
     private lateinit var btnGoLive: Button
     private lateinit var btnGlipBench: Button
 
@@ -241,13 +243,16 @@ class MainActivity : AppCompatActivity() {
         }
         refreshAllUi()
 
-        // Complete full multi-encoder hardware verification asynchronously in background
+        // Complete full multi-encoder hardware verification asynchronously in background.
+        // Guards against overwriting any settings the user manually changed before the scan finished!
         CodecCapabilityProbe.scanDeviceAsync(this, forceRefresh = false) { verifiedScan ->
             if (!isFinishing && !isDestroyed) {
                 scanSummary = verifiedScan
                 if (!KeystoreVault.hasCompletedInitialAutoScan(this)) {
-                    settings = applyTierDefaultsToSettings(settings, verifiedScan.recommendedTier, verifiedScan)
-                    KeystoreVault.saveSettings(this, settings)
+                    if (!userModifiedSettingsBeforeScan && !SolStreamService.isBroadcastLive) {
+                        settings = applyTierDefaultsToSettings(settings, verifiedScan.recommendedTier, verifiedScan)
+                        KeystoreVault.saveSettings(this, settings)
+                    }
                     KeystoreVault.markInitialAutoScanDone(this)
                 }
                 tvHeaderSubtitle.text =
@@ -280,9 +285,9 @@ class MainActivity : AppCompatActivity() {
                 @Suppress("DEPRECATION")
                 packageManager.getPackageInfo(packageName, 0)
             }
-            info.versionName?.removeSuffix("-debug") ?: "1.1.0"
+            info.versionName?.removeSuffix("-debug") ?: "1.1.2"
         } catch (_: Exception) {
-            "1.1.0"
+            "1.1.2"
         }
     }
 
@@ -606,7 +611,6 @@ class MainActivity : AppCompatActivity() {
         btnFraming = actionButton("", "#283593") { cycleFraming() }
         btnSmartZoom = actionButton("", "#1C2836") { cycleSmartZoom() }
 
-        // Stackable Visual Switches (Combine any 1, 2, 3, or all 4 live!)
         cardVideo.addView(buttonRow(btnCodec, btnResolution))
         cardVideo.addView(buttonRow(btnFps, btnOrientationFlip))
         cardVideo.addView(buttonRow(btnBitrateDown, btnBitrateCycle, btnBitrateUp))
@@ -733,7 +737,7 @@ class MainActivity : AppCompatActivity() {
         // === CARD 4: 15-STAGE SOL LUXE AUDIO, 250% GAME SOUNDSTAGE & 10s CALIBRATOR ===
         val cardAudio = sectionCard("4. 15-Stage SOL LUXE Voice Studio & 250% Game Soundstage")
         cardAudio.addView(
-            bodyText("Processes ONLY your voice in 32-bit float (64-bit Double EQ) + C 48kHz RNNoise before mixing onto stereo game audio. Never alters your earphones!")
+            bodyText("Processes ONLY your voice in 32-bit float (64-bit Double EQ) + C 48kHz RNNoise + Spark/Hammer Blanker before mixing onto stereo game audio. Never alters your earphones!")
         )
 
         btnMicDevice = actionButton("", "#1C2836") { cycleMicInputDevice() }
@@ -879,7 +883,7 @@ class MainActivity : AppCompatActivity() {
         cardAudio.addView(btnApplyAdvisor)
         container.addView(cardAudio)
 
-        // === CARD 5: LAUNCH BROADCAST, ARCHIVED SESSION REPORTS & COMPETITOR BENCHMARK ===
+        // === CARD 5: LAUNCH BROADCAST, ARCHIVED SESSION REPORTS, BENCHMARK & SUPPORT ===
         val cardLaunch = sectionCard("5. Launch Broadcast, Report History & App Benchmark")
 
         btnGoLive = actionButton("GO LIVE — START STREAM", "#00C853") {
@@ -907,11 +911,16 @@ class MainActivity : AppCompatActivity() {
                 actionButton("Check GitHub Update", "#263238") { checkGitHubReleaseUpdate() }
             )
         )
+        cardLaunch.addView(
+            actionButton("❤️ Enjoying SolStream? Subscribe to @Sol_CODM to Support!", "#AD1457") {
+                openDeveloperYouTubeChannel()
+            }
+        )
         container.addView(cardLaunch)
 
         // === FOOTER ===
         val footer = TextView(this).apply {
-            text = "Made by Sol (@Sol_CODM) • SolStream Studio Ultra • Zero-Ad No-Root Broadcast Engine"
+            text = "ॐ नमः शिवाय\nMade by Sol (@Sol_CODM) • SolStream Studio Ultra • Zero-Ad No-Root Broadcast Engine"
             setTextColor(Color.parseColor("#78909C"))
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
             gravity = Gravity.CENTER
@@ -985,7 +994,7 @@ class MainActivity : AppCompatActivity() {
                 width = if (scan.hevcHardware?.supports1440p60 == true) 2560 else 1920,
                 height = if (scan.hevcHardware?.supports1440p60 == true) 1440 else 1080,
                 fps = 60,
-                targetBitrateKbps = 24000,
+                targetBitrateKbps = 20000,
                 audioBitrateKbps = 320,
                 upscalerMode = "LANCZOS",
                 noiseSuppressMode = "RNNOISE",
@@ -1200,7 +1209,7 @@ class MainActivity : AppCompatActivity() {
 
         // Individual Voice Stage Switches
         btnStageHpf.text = if (settings.hpfCutoffHz == 0) "1. HPF Rumble: OFF" else "1. HPF Rumble: ${settings.hpfCutoffHz} Hz"
-        btnStageTransient.text = "2. Grip Transient Tamer: ${onOff(settings.transientTamerEnabled)}"
+        btnStageTransient.text = "2. Spark/Hammer & Grip Blanker: ${onOff(settings.transientTamerEnabled)}"
         btnStageGate.text = "3. Idle Breath Expander: ${onOff(settings.noiseGateEnabled)}"
         btnStageEq.text = "4. ${settings.voiceGenderProfile} 3-Band EQ: ${onOff(settings.voiceEqEnabled)}"
         btnStageDeEss.text = "5. Split-Band De-Esser: ${onOff(settings.deEsserEnabled)}"
@@ -1241,6 +1250,7 @@ class MainActivity : AppCompatActivity() {
         requiresRestartIfLive: Boolean = false,
         userToggledSharp: Boolean = false
     ) {
+        userModifiedSettingsBeforeScan = true
         settings = newSettings
         KeystoreVault.saveSettings(this, settings)
         if (SolStreamService.isBroadcastLive) {
@@ -1535,9 +1545,10 @@ class MainActivity : AppCompatActivity() {
 
             [VOICE & GAME SOUNDSTAGE TERMS]
             • Voice Profile (Neutral / Male / Female): Tunes chest warmth (115/135/165 Hz), mud cut, and De-Esser frequencies to match your vocal cords.
-            • SOL LUXE (Studio + Velvet): Our flagship 10-stage broadcast voice chain combining Native C RNNoise, 3-band EQ, Split-Band De-Esser, Velvet tube warmth, Whisper Lift, 3:1 Compressor, and Slow AGC.
-            • Native C RNNoise: Real 48 kHz neural network compiled in C that erases ceiling-fan wind and room hum while keeping your natural voice intact.
-            • HPF (High-Pass Filter): Cuts deep rumble below 75–120 Hz (finger taps on glass and fan wind).
+            • SOL LUXE (Studio + Velvet): Our flagship 10-stage broadcast voice chain combining Native C RNNoise, Spark/Hammer Blanker, 3-band EQ, Split-Band De-Esser, Velvet tube warmth, Whisper Lift, 3:1 Compressor, and Slow AGC.
+            • Native C RNNoise: Real 48 kHz neural network compiled in C that erases ceiling-fan wind, AC hum, and drill whine while keeping your natural voice intact.
+            • Spark/Hammer & Grip Blanker: Sub-millisecond slew detector that clamps multi-strike mosquito-racket zaps ("phat-phat-phat"), construction hammering, and finger taps by up to 92% before they reach the stream.
+            • HPF (High-Pass Filter): Cuts deep rumble below 75–120 Hz (wall vibration, finger taps on glass, and fan wind).
             • Split-Band De-Esser: Softens harsh "S" and "SH" sounds without making your voice sound muffled.
             • Speech-Gated Slow AGC: Gently evens out quiet vs. loud speech and freezes when you stop talking so background noise is never boosted.
             • VAD Auto-Ducking: Automatically dips ONLY the stream's game volume by 20–50% during the exact moments you speak, then glides back to 100%.
@@ -1564,23 +1575,41 @@ class MainActivity : AppCompatActivity() {
             .show()
     }
 
-    // === VAULT & KEY VISIBILITY ACTIONS ===
-    private fun saveVaultInputs(showToast: Boolean) {
+    // === VAULT & KEY VISIBILITY ACTIONS (VERIFIES ENCRYPTION + STORAGE SUCCEEDED) ===
+    private fun saveVaultInputs(showToast: Boolean): Boolean {
         val rawUrl = etRtmpsUrl.text?.toString() ?: KeystoreVault.DEFAULT_YOUTUBE_RTMPS
         val normalizedUrl = KeystoreVault.normalizeIngestUrl(rawUrl)
         val cleanKey = etStreamKey.text?.toString()?.trim()?.trimStart('/') ?: ""
         etRtmpsUrl.setText(normalizedUrl)
-        KeystoreVault.saveEndpointAndKey(this, normalizedUrl, cleanKey)
 
-        KeystoreVault.saveShortsStreamKey(this, etShortsKey.text?.toString() ?: "")
-        KeystoreVault.saveTwitchUrlAndKey(this, KeystoreVault.DEFAULT_TWITCH_RTMPS, etTwitchKey.text?.toString() ?: "")
-        KeystoreVault.saveKickUrlAndKey(this, KeystoreVault.DEFAULT_KICK_RTMPS, etKickKey.text?.toString() ?: "")
+        val okPrimary = KeystoreVault.saveEndpointAndKey(this, normalizedUrl, cleanKey)
+        val okShorts = KeystoreVault.saveShortsStreamKey(this, etShortsKey.text?.toString() ?: "")
+        val okTwitch = KeystoreVault.saveTwitchUrlAndKey(
+            this,
+            KeystoreVault.DEFAULT_TWITCH_RTMPS,
+            etTwitchKey.text?.toString() ?: ""
+        )
+        val okKick = KeystoreVault.saveKickUrlAndKey(
+            this,
+            KeystoreVault.DEFAULT_KICK_RTMPS,
+            etKickKey.text?.toString() ?: ""
+        )
+        val allSavedOk = okPrimary && okShorts && okTwitch && okKick
 
         val bannerTxt = etBannerText.text?.toString()?.trim()?.take(80) ?: ""
         if (bannerTxt != settings.liveBannerText) {
             settings = settings.copy(liveBannerText = bannerTxt)
             KeystoreVault.saveSettings(this, settings)
             SolSceneAssetStore.bumpRevision()
+        }
+
+        if (!allSavedOk) {
+            Toast.makeText(
+                this,
+                "Warning: Android Keystore encryption failed—new Stream Key could not be saved!",
+                Toast.LENGTH_LONG
+            ).show()
+            return false
         }
 
         if (showToast) {
@@ -1591,6 +1620,7 @@ class MainActivity : AppCompatActivity() {
             }
             Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
         }
+        return true
     }
 
     private fun clearStreamKeyInput() {
@@ -1651,6 +1681,18 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun openDeveloperYouTubeChannel() {
+        Toast.makeText(
+            this,
+            "Opening @Sol_CODM on YouTube — thank you for subscribing & supporting!",
+            Toast.LENGTH_LONG
+        ).show()
+        try {
+            startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("https://www.youtube.com/@Sol_CODM?sub_confirmation=1")))
+        } catch (_: Exception) {
+        }
+    }
+
     // === DIRECT PERMISSION & SETTINGS TELEPORTERS ===
     private fun openAccessibilitySettingsDirect() {
         try {
@@ -1698,7 +1740,9 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
-        saveVaultInputs(showToast = false)
+        if (!saveVaultInputs(showToast = false)) {
+            return
+        }
         if (KeystoreVault.buildActivePrimaryEndpoint(this, settings).isNullOrBlank()) {
             Toast.makeText(this, "Please paste or type your Stream Key first!", Toast.LENGTH_LONG).show()
             return
@@ -2142,7 +2186,7 @@ class MainActivity : AppCompatActivity() {
             • Wired 3.5mm & USB-C Headsets work automatically in full stereo!
 
             3. KEEPING BATTLE ROYALE (BR) COOL ON 4+ HOUR STREAMS:
-            • Open-world BR pushes 2x more GPU load than 5v5 MP. Keep 'GPU Crisp Sharpen' OFF for BR, or use 1080p60 (44% less heat than 1440p60) when room fan speed is low!
+            • Open-world BR pushes 2x more GPU load than 5v5 MP. Keep in-game CODM graphics on Low + Ultra FPS and 'GPU Crisp Sharpen' OFF for BR, or use 1080p60 (44% less heat than 1440p60) when room fan speed is low!
         """.trimIndent()
 
         AlertDialog.Builder(this)
