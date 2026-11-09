@@ -61,8 +61,9 @@ import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.math.roundToInt
 
-class SolStreamService : AccessibilityService(), ConnectChecker {
+class SolStreamService : AccessibilityService() {
 
     companion object {
         const val ACTION_START_STREAM = "com.solgaming.solstreamstudio.START_STREAM"
@@ -79,6 +80,7 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
         private const val NOTIF_ID = 4102
         private const val WAKELOCK_LEASE_MS = 12 * 60 * 60 * 1000L
         private const val SCENE_SAVER_BITRATE_BPS = 1_500_000
+        private const val SEVERE_COOLDOWN_HYSTERESIS_MS = 60_000L
 
         private const val REPORT_HISTORY_FILE = "solstream_report_history.txt"
         private const val REPORT_DELIMITER = "\n==================== SAVED SESSION ARCHIVE ====================\n"
@@ -120,7 +122,7 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
 
         /**
          * Verifies that a connection callback belongs to the currently active broadcast session
-         * and that the target has not been cancelled/stopped.
+         * and that the originating client has not been cancelled/stopped.
          */
         internal fun shouldAcceptConnectionCallback(
             isBroadcastActive: Boolean,
@@ -129,6 +131,14 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
             isTargetStopped: Boolean = false
         ): Boolean {
             return isBroadcastActive && !isTargetStopped && callbackGen > 0L && callbackGen == currentGen
+        }
+
+        /**
+         * Formats queue frame count for the floating overlay header, reporting Q:N/A when telemetry
+         * is unavailable (-1) rather than falsely implying Q:0f.
+         */
+        internal fun formatOverlayQueueTag(qFrames: Int): String {
+            return if (qFrames >= 0) "Q:${qFrames}f" else "Q:N/A"
         }
 
         @Synchronized
@@ -319,6 +329,107 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
     }
 
     /**
+     * Dedicated per-session ConnectChecker adapter for the primary RtmpClient.
+     * Captures its own [generationId] and [client] instance so delayed callbacks from a stopped
+     * stream can never mutate the state of a newer stream session.
+     */
+    private inner class PrimaryRtmpCallback(val generationId: Long) : ConnectChecker {
+        val client = RtmpClient(this)
+        @Volatile var isStopped = false
+
+        private fun isActivePrimarySession(): Boolean {
+            return shouldAcceptConnectionCallback(
+                isBroadcastActive = isBroadcastLive,
+                callbackGen = generationId,
+                currentGen = sessionGeneration.get(),
+                isTargetStopped = isStopped
+            ) && (rtmpClient === client)
+        }
+
+        fun markStoppedAndDisconnectAsync() {
+            isStopped = true
+            Thread({
+                try { client.disconnect() } catch (_: Exception) {}
+            }, "SolPrimaryDisc_$generationId").start()
+        }
+
+        override fun onConnectionStarted(url: String) {
+            if (!isActivePrimarySession()) return
+            connectionStateLabel = if (usingBackupEndpoint) "CONNECTING (BACKUP)" else "CONNECTING"
+            val serverTag = if (usingBackupEndpoint) "Backup RTMPS server" else "Primary RTMPS server"
+            DiagnosticsLogger.log("NETWORK", "Connecting to $serverTag (TLS Host Verified)...")
+            mainHandler.post {
+                if (!isActivePrimarySession()) return@post
+                updateGhostPillAppearance()
+                refreshForegroundNotification(force = false)
+            }
+        }
+
+        override fun onConnectionSuccess() {
+            if (!isActivePrimarySession()) {
+                markStoppedAndDisconnectAsync()
+                return
+            }
+
+            awaitingKeyframeAfterConnect = true
+            isRtmpConnected = true
+            reconnectCount = 0
+            stalledZeroSendTicks = 0
+            audioRestartAttempts = 0
+            lastFailHandledElapsedMs = -10_000L
+            connectionStateLabel = if (usingBackupEndpoint) "LIVE (BACKUP)" else "LIVE"
+
+            client.setReTries(maxReconnects)
+            sendCachedHeadersToClient(client)
+            videoPipeline?.requestSyncFrame()
+            val serverTag = if (usingBackupEndpoint) "Backup RTMPS" else "Primary RTMPS"
+            DiagnosticsLogger.log("NETWORK", "Connected to $serverTag ingest. Stream is LIVE.")
+            mainHandler.post {
+                if (!isActivePrimarySession()) return@post
+                updateGhostPillAppearance()
+                if (isOverlayExpanded) refreshExpandedOverlayText()
+                refreshForegroundNotification(force = true)
+                onStateChangedListener?.invoke()
+            }
+        }
+
+        override fun onNewBitrate(bitrate: Long) {
+            if (!isActivePrimarySession()) return
+            lastMeasuredOutBps = bitrate
+        }
+
+        override fun onConnectionFailed(reason: String) {
+            if (!isActivePrimarySession()) {
+                markStoppedAndDisconnectAsync()
+                return
+            }
+            isRtmpConnected = false
+            awaitingKeyframeAfterConnect = true
+            if (needsProjectionReapproval) return
+            scheduleSequentialReconnect(this, reason)
+        }
+
+        override fun onDisconnect() {
+            if (!isActivePrimarySession()) return
+            isRtmpConnected = false
+            awaitingKeyframeAfterConnect = true
+        }
+
+        override fun onAuthError() {
+            if (!isActivePrimarySession()) return
+            isRtmpConnected = false
+            DiagnosticsLogger.log("AUTH_ERR", "Server rejected the Stream Key (Auth Error). Verify your key in Pre-Stream Studio.")
+            mainHandler.post {
+                if (!isActivePrimarySession()) return@post
+                Toast.makeText(this@SolStreamService, "Stream Key rejected by server!", Toast.LENGTH_LONG).show()
+                stopLiveBroadcast("Authentication error")
+            }
+        }
+
+        override fun onAuthSuccess() {}
+    }
+
+    /**
      * Independent secondary RTMPS transport node for single-encode Simulcast (Twitch / Kick)
      * or Dual-Format 9:16 Shorts Companion streaming, guarded by session generation & stop state.
      */
@@ -478,6 +589,7 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
         }
 
         override fun onDisconnect() {
+            if (!isActiveTarget()) return
             isConnected = false
             awaitingKeyframe = true
         }
@@ -497,7 +609,8 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
     @Volatile private var activeClientGeneration = 0L
 
     private var windowManager: WindowManager? = null
-    private var rtmpClient: RtmpClient? = null
+    @Volatile private var primaryCallbackNode: PrimaryRtmpCallback? = null
+    @Volatile private var rtmpClient: RtmpClient? = null
     private var telemetryBridge: RtmpTelemetryBridge? = null
     private val simulcastNodes = CopyOnWriteArrayList<AuxiliaryRtmpTarget>()
     private var companionNode: AuxiliaryRtmpTarget? = null
@@ -510,6 +623,8 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
     private var wakeLockAcquiredAtMs: Long = 0L
     private var wifiLock: WifiManager.WifiLock? = null
     private var thermalListener: PowerManager.OnThermalStatusChangedListener? = null
+    private var lastLoggedThermalListenerStatus: Int = PowerManager.THERMAL_STATUS_NONE
+    private var severeThermalEnteredElapsedMs: Long = 0L
     private var netCallback: ConnectivityManager.NetworkCallback? = null
     private var lastValidatedNetworkHandle: Long = -1L
 
@@ -536,6 +651,14 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
 
     private var audioRestartAttempts = 0
     private var audioRestartInProgress = false
+    private val debouncedMicSwitchRunnable = Runnable {
+        if (isBroadcastLive) {
+            audioEngine?.updateLiveSettings(activeSettings)
+            applyGameGain250(activeSettings)
+            refreshExpandedOverlayText()
+            onStateChangedListener?.invoke()
+        }
+    }
 
     private var stopConfirmTapTimeMs = 0L
     private var savedPreBrbBitrateBps = 20_000_000
@@ -871,7 +994,7 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
                 val nowMonoUs = SystemClock.elapsedRealtimeNanos() / 1000L
                 lastAudioClockOffsetUs = info.presentationTimeUs - nowMonoUs
                 hasAudioOffset = true
-                if (isRtmpConnected) {
+                if (isRtmpConnected && rtmpClient === client) {
                     try {
                         client.sendAudio(aacBuf.duplicate(), info)
                     } catch (_: Exception) {
@@ -911,7 +1034,11 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
         mainHandler.postDelayed({
             audioRestartInProgress = false
             if (!isBroadcastLive) return@postDelayed
-            try { audioEngine?.stopStreamingAudio() } catch (_: Exception) {}
+            val oldAudio = audioEngine
+            audioEngine = null
+            Thread({
+                try { oldAudio?.stopStreamingAudio() } catch (_: Exception) {}
+            }, "SolOldAudioStop").start()
             val ok = attachAndStartAudioEngine(proj, client, sessionOriginNs / 1000L)
             if (ok) {
                 DiagnosticsLogger.log("AUDIO_RESTART", "Audio studio recovered cleanly.")
@@ -944,6 +1071,7 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
         lastFailHandledElapsedMs = -10_000L
         currentRetryDelayMs = 2000L
         stalledZeroSendTicks = 0
+        severeThermalEnteredElapsedMs = 0L
         audioRestartAttempts = 0
         audioRestartInProgress = false
         brbAutoMutedMic = false
@@ -995,13 +1123,15 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
         val originNs = System.nanoTime()
         sessionOriginNs = originNs
 
-        val client = RtmpClient(this)
+        val primaryCb = PrimaryRtmpCallback(currentGen)
+        val client = primaryCb.client
         client.tlsHostVerification = true
         client.setReTries(maxReconnects)
         try {
             client.resizeCache(120)
         } catch (_: Exception) {
         }
+        primaryCallbackNode = primaryCb
         rtmpClient = client
         telemetryBridge = RtmpTelemetryBridge(client)
 
@@ -1035,7 +1165,9 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
                 cachedSpsBytes = copyBufferBytes(sps)
                 cachedPpsBytes = copyBufferBytes(pps)
                 cachedVpsBytes = copyBufferBytes(vps)
-                sendCachedHeadersToClient(client)
+                if (rtmpClient === client) {
+                    sendCachedHeadersToClient(client)
+                }
                 for (aux in simulcastNodes) {
                     aux.pushHeaders(cachedSpsBytes, cachedPpsBytes, cachedVpsBytes)
                 }
@@ -1044,7 +1176,7 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
                 val nowMonoUs = SystemClock.elapsedRealtimeNanos() / 1000L
                 lastVideoClockOffsetUs = info.presentationTimeUs - nowMonoUs
                 hasVideoOffset = true
-                if (isRtmpConnected) {
+                if (isRtmpConnected && rtmpClient === client) {
                     if (awaitingKeyframeAfterConnect) {
                         val isKey = (info.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0
                         if (isKey) {
@@ -1077,7 +1209,6 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
             return
         }
 
-        // Sync actual resolved dimensions/FPS back to activeSettings
         activeSettings = activeSettings.copy(
             width = activeVideo.outWidth,
             height = activeVideo.outHeight,
@@ -1154,20 +1285,20 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
 
         val connectTarget = primaryEndpoint
         Thread({
-            if (!shouldAcceptConnectionCallback(isBroadcastLive, currentGen, sessionGeneration.get())) {
+            if (!shouldAcceptConnectionCallback(isBroadcastLive, currentGen, sessionGeneration.get(), primaryCb.isStopped)) {
                 return@Thread
             }
             try {
                 client.connect(connectTarget)
-                if (!shouldAcceptConnectionCallback(isBroadcastLive, currentGen, sessionGeneration.get())) {
-                    try { client.disconnect() } catch (_: Exception) {}
+                if (!shouldAcceptConnectionCallback(isBroadcastLive, currentGen, sessionGeneration.get(), primaryCb.isStopped)) {
+                    primaryCb.markStoppedAndDisconnectAsync()
                 }
             } catch (e: Exception) {
-                if (shouldAcceptConnectionCallback(isBroadcastLive, currentGen, sessionGeneration.get())) {
+                if (shouldAcceptConnectionCallback(isBroadcastLive, currentGen, sessionGeneration.get(), primaryCb.isStopped)) {
                     DiagnosticsLogger.log("NET_ERR", "RTMPS connection exception (${e.javaClass.simpleName}).", e.message ?: "")
                 }
             }
-        }, "SolRtmpsConnect").start()
+        }, "SolRtmpsConnect_$currentGen").start()
 
         for (aux in simulcastNodes) {
             aux.startAsync()
@@ -1183,7 +1314,11 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
         if (!isBroadcastLive || needsProjectionReapproval) return
         needsProjectionReapproval = true
         connectionStateLabel = "VIDEO RESET (RE-APPROVE)"
-        videoPipeline?.stopPipeline()
+        val pipeToStop = videoPipeline
+        videoPipeline = null
+        Thread({
+            try { pipeToStop?.stopPipeline() } catch (_: Exception) {}
+        }, "SolFatalVideoStop").start()
         updateGhostPillAppearance()
         if (isOverlayExpanded) refreshExpandedOverlayText()
         refreshForegroundNotification(force = true)
@@ -1199,7 +1334,11 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
         if (!isBroadcastLive) return
         needsProjectionReapproval = true
         connectionStateLabel = "CAPTURE PAUSED (RE-APPROVE)"
-        videoPipeline?.stopPipeline()
+        val pipeToStop = videoPipeline
+        videoPipeline = null
+        Thread({
+            try { pipeToStop?.stopPipeline() } catch (_: Exception) {}
+        }, "SolProjStopVideo").start()
         updateGhostPillAppearance()
         if (isOverlayExpanded) refreshExpandedOverlayText()
         refreshForegroundNotification(force = true)
@@ -1212,7 +1351,7 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
     }
 
     fun stopLiveBroadcast(reason: String = "User stopped stream") {
-        if (!isBroadcastLive && rtmpClient == null) return
+        if (!isBroadcastLive && rtmpClient == null && videoPipeline == null && audioEngine == null) return
         val wasLive = isBroadcastLive
         sessionGeneration.incrementAndGet()
         activeClientGeneration = 0L
@@ -1234,33 +1373,33 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
         onStateChangedListener?.invoke()
     }
 
+    /**
+     * Non-blocking resource teardown: detaches active references immediately on the main thread
+     * and performs blocking thread joins & codec/socket/projection teardown on a background worker
+     * so stopping a stream never blocks the service main thread.
+     */
     private fun cleanupResources() {
+        val primaryNodeToClose = primaryCallbackNode
+        primaryCallbackNode = null
         val clientToClose = rtmpClient
         rtmpClient = null
         telemetryBridge = null
-        if (clientToClose != null) {
-            Thread({
-                try { clientToClose.disconnect() } catch (_: Exception) {}
-            }, "SolRtmpsDisconnect").start()
-        }
 
-        for (aux in simulcastNodes) {
-            aux.stopAsync()
-        }
+        val auxListToClose = simulcastNodes.toList()
         simulcastNodes.clear()
-        companionNode?.stopAsync()
+        val compToClose = companionNode
         companionNode = null
 
-        audioEngine?.onFatalAudioError = null
-        try { audioEngine?.stopStreamingAudio() } catch (_: Exception) {}
+        val audioToClose = audioEngine
         audioEngine = null
+        audioToClose?.onFatalAudioError = null
 
-        videoPipeline?.onFatalPipelineError = null
-        videoPipeline?.onCompanionPipelineStopped = null
-        try { videoPipeline?.stopPipeline() } catch (_: Exception) {}
+        val videoToClose = videoPipeline
         videoPipeline = null
+        videoToClose?.onFatalPipelineError = null
+        videoToClose?.onCompanionPipelineStopped = null
 
-        try { mediaProjection?.stop() } catch (_: Exception) {}
+        val projToClose = mediaProjection
         mediaProjection = null
 
         cachedSpsBytes = null
@@ -1269,85 +1408,51 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
         compCachedSpsBytes = null
         compCachedPpsBytes = null
         compCachedVpsBytes = null
+
         releaseLocksAndThermalMonitor()
         try { stopForeground(STOP_FOREGROUND_REMOVE) } catch (_: Exception) {}
+
+        for (aux in auxListToClose) {
+            aux.stopAsync()
+        }
+        compToClose?.stopAsync()
+
+        Thread({
+            if (primaryNodeToClose != null) {
+                primaryNodeToClose.isStopped = true
+                try { primaryNodeToClose.client.disconnect() } catch (_: Exception) {}
+            } else if (clientToClose != null) {
+                try { clientToClose.disconnect() } catch (_: Exception) {}
+            }
+            try { audioToClose?.stopStreamingAudio() } catch (_: Exception) {}
+            try { videoToClose?.stopPipeline() } catch (_: Exception) {}
+            try { projToClose?.stop() } catch (_: Exception) {}
+        }, "SolAsyncStopCleanup").start()
     }
 
     private fun isCurrentSessionActive(): Boolean {
+        val node = primaryCallbackNode
         return shouldAcceptConnectionCallback(
             isBroadcastActive = isBroadcastLive,
             callbackGen = activeClientGeneration,
-            currentGen = sessionGeneration.get()
+            currentGen = sessionGeneration.get(),
+            isTargetStopped = (node?.isStopped == true)
         )
     }
 
-    // === PRIMARY CONNECTCHECKER CALLBACKS ===
-    override fun onConnectionStarted(url: String) {
-        if (!isCurrentSessionActive()) return
-        connectionStateLabel = if (usingBackupEndpoint) "CONNECTING (BACKUP)" else "CONNECTING"
-        val serverTag = if (usingBackupEndpoint) "Backup RTMPS server" else "Primary RTMPS server"
-        DiagnosticsLogger.log("NETWORK", "Connecting to $serverTag (TLS Host Verified)...")
-        mainHandler.post {
-            if (!isCurrentSessionActive()) return@post
-            updateGhostPillAppearance()
-            refreshForegroundNotification(force = false)
-        }
-    }
-
-    override fun onConnectionSuccess() {
-        val client = rtmpClient
-        if (!isCurrentSessionActive() || client == null) {
-            isRtmpConnected = false
-            if (client != null) {
-                Thread({
-                    try { client.disconnect() } catch (_: Exception) {}
-                }, "SolLateStopDisconnect").start()
-            }
+    private fun scheduleSequentialReconnect(originNode: PrimaryRtmpCallback, reason: String) {
+        if (!shouldAcceptConnectionCallback(isBroadcastLive, originNode.generationId, sessionGeneration.get(), originNode.isStopped)) {
             return
         }
-
-        awaitingKeyframeAfterConnect = true
-        isRtmpConnected = true
-        reconnectCount = 0
-        stalledZeroSendTicks = 0
-        audioRestartAttempts = 0
-        lastFailHandledElapsedMs = -10_000L
-        connectionStateLabel = if (usingBackupEndpoint) "LIVE (BACKUP)" else "LIVE"
-
-        client.setReTries(maxReconnects)
-        sendCachedHeadersToClient(client)
-        videoPipeline?.requestSyncFrame()
-        val serverTag = if (usingBackupEndpoint) "Backup RTMPS" else "Primary RTMPS"
-        DiagnosticsLogger.log("NETWORK", "Connected to $serverTag ingest. Stream is LIVE.")
-        mainHandler.post {
-            if (!isCurrentSessionActive()) return@post
-            updateGhostPillAppearance()
-            if (isOverlayExpanded) refreshExpandedOverlayText()
-            refreshForegroundNotification(force = true)
-            onStateChangedListener?.invoke()
-        }
-    }
-
-    override fun onNewBitrate(bitrate: Long) {
-        if (!isCurrentSessionActive()) return
-        lastMeasuredOutBps = bitrate
-    }
-
-    override fun onConnectionFailed(reason: String) {
-        isRtmpConnected = false
-        awaitingKeyframeAfterConnect = true
-        if (!isCurrentSessionActive() || needsProjectionReapproval) return
-        scheduleSequentialReconnect(reason)
-    }
-
-    private fun scheduleSequentialReconnect(reason: String) {
         val nowElapsed = SystemClock.elapsedRealtime()
         if (nowElapsed - lastFailHandledElapsedMs < max(800L, currentRetryDelayMs - 250L)) {
             return
         }
 
-        val client = rtmpClient ?: return
-        val expectedGen = activeClientGeneration
+        val client = originNode.client
+        if (rtmpClient !== client) return
+        val expectedGen = originNode.generationId
+
         if (reconnectCount < maxReconnects) {
             reconnectCount++
             DiagnosticsLogger.reconnectAttempts = reconnectCount
@@ -1370,9 +1475,10 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
                 reason
             )
 
-            // Run reConnect on a dedicated background thread so RtmpSender's internal thread never deadlocks!
             Thread({
-                if (!shouldAcceptConnectionCallback(isBroadcastLive, expectedGen, sessionGeneration.get())) {
+                if (!shouldAcceptConnectionCallback(isBroadcastLive, expectedGen, sessionGeneration.get(), originNode.isStopped) ||
+                    rtmpClient !== client
+                ) {
                     return@Thread
                 }
                 sendCachedHeadersToClient(client)
@@ -1390,27 +1496,15 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
             }
         } else {
             DiagnosticsLogger.log("NET_FAIL", "Stream disconnected after $maxReconnects retries.", reason)
-            mainHandler.post { stopLiveBroadcast("Network connection lost") }
+            mainHandler.post {
+                if (shouldAcceptConnectionCallback(isBroadcastLive, expectedGen, sessionGeneration.get(), originNode.isStopped)) {
+                    stopLiveBroadcast("Network connection lost")
+                }
+            }
         }
     }
 
-    override fun onDisconnect() {
-        isRtmpConnected = false
-        awaitingKeyframeAfterConnect = true
-    }
-
-    override fun onAuthError() {
-        if (!isCurrentSessionActive()) return
-        DiagnosticsLogger.log("AUTH_ERR", "Server rejected the Stream Key (Auth Error). Verify your key in Pre-Stream Studio.")
-        mainHandler.post {
-            Toast.makeText(this, "Stream Key rejected by server!", Toast.LENGTH_LONG).show()
-            stopLiveBroadcast("Authentication error")
-        }
-    }
-
-    override fun onAuthSuccess() {}
-
-    // === SOLSTREAM HEALTH, ZOMBIE-SOCKET WATCHDOG, THERMAL 30FPS RELIEF & ABR 2.0 ===
+    // === SOLSTREAM HEALTH, ZOMBIE-SOCKET WATCHDOG, 60S THERMAL HYSTERESIS & ABR 2.0 ===
     private fun runHealthAndRecoveryTick() {
         val (_, thermal) = DiagnosticsLogger.sampleDeviceHealth(this)
         if (!isBroadcastLive || !isCurrentSessionActive()) return
@@ -1421,7 +1515,6 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
             videoPipeline?.requestSyncFrame()
         }
 
-        // Low-Battery Unplugged Guard (15% & 5% alerts)
         val battPct = DiagnosticsLogger.lastBatteryPercent
         val plugged = DiagnosticsLogger.isBatteryChargingOrPlugged(this)
         if (!plugged && battPct in 1..15) {
@@ -1448,7 +1541,6 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
             DiagnosticsLogger.avDriftMs = (lastAudioClockOffsetUs - lastVideoClockOffsetUs) / 1000L
         }
 
-        // 1. Poll sender queue frames, bytes, capacity, RTT & dropped frames (preserving -1 if unavailable)
         val tel = telemetryBridge?.poll() ?: SenderTelemetry(-1L, -1, -1, -1, -1L, false)
         DiagnosticsLogger.lastQueueBytes = tel.queueBytes
         DiagnosticsLogger.lastQueueFrames = tel.queueFrames
@@ -1464,12 +1556,13 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
             0
         }
 
-        // 2. 6-Second Zombie-Socket Watchdog (Fixes silent sent=0kbps router blackhole!)
+        // 6-Second Zombie-Socket Watchdog
         val qFrames = tel.queueFrames
         val qBytes = tel.queueBytes
         val outBps = lastMeasuredOutBps
         val queueSeverelyBackedUp = (qFrames >= 75) || (qBytes >= 2_500_000L) || (droppedDelta >= 15)
-        if (isRtmpConnected && queueSeverelyBackedUp && outBps == 0L) {
+        val activeNode = primaryCallbackNode
+        if (isRtmpConnected && activeNode != null && queueSeverelyBackedUp && outBps == 0L) {
             stalledZeroSendTicks++
             if (stalledZeroSendTicks >= 3) {
                 stalledZeroSendTicks = 0
@@ -1478,17 +1571,19 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
                     "Detected silent Wi-Fi/router stall (0 kbps sent with full queue); forcing clean reconnect...",
                     "qFrames=$qFrames qBytes=${if (qBytes >= 0) "${qBytes / 1024}KB" else "N/A"} dropsDelta=$droppedDelta"
                 )
-                scheduleSequentialReconnect("Silent socket stall (0 kbps sent)")
+                scheduleSequentialReconnect(activeNode, "Silent socket stall (0 kbps sent)")
                 return
             }
         } else {
             stalledZeroSendTicks = 0
         }
 
-        // 3. Smart Severe-Thermal Relief
+        // Smart Severe-Thermal Relief with 60-Second Cooldown Hysteresis (prevents 60<->30 FPS bouncing!)
         val vPipe = videoPipeline
+        val nowElapsed = SystemClock.elapsedRealtime()
         if (vPipe != null) {
             if (thermal >= PowerManager.THERMAL_STATUS_SEVERE) {
+                severeThermalEnteredElapsedMs = nowElapsed
                 if (companionNode != null && !vPipe.companionPausedByThermal) {
                     vPipe.companionPausedByThermal = true
                     DiagnosticsLogger.log("THERMAL", "Paused secondary 9:16 companion stream first to protect main broadcast & CODM FPS.")
@@ -1506,18 +1601,25 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
                     activeSettings = activeSettings.copy(gpuSharpen = false)
                 }
             } else if (thermal <= PowerManager.THERMAL_STATUS_MODERATE) {
-                if (vPipe.companionPausedByThermal) {
-                    vPipe.companionPausedByThermal = false
-                    DiagnosticsLogger.log("THERMAL", "SoC cooled to Moderate; resumed secondary 9:16 companion stream.")
-                }
-                if (!userManuallyOverrode30FpsSaver && vPipe.thermalThrottle30Fps) {
-                    vPipe.thermalThrottle30Fps = false
-                    DiagnosticsLogger.log("THERMAL", "SoC cooled to Moderate; restored full 60 FPS broadcast cadence.")
+                val cooldownElapsed = nowElapsed - severeThermalEnteredElapsedMs
+                val hysteresisSatisfied = (severeThermalEnteredElapsedMs == 0L) ||
+                    (cooldownElapsed >= SEVERE_COOLDOWN_HYSTERESIS_MS) ||
+                    (thermal <= PowerManager.THERMAL_STATUS_LIGHT)
+
+                if (hysteresisSatisfied) {
+                    if (vPipe.companionPausedByThermal) {
+                        vPipe.companionPausedByThermal = false
+                        DiagnosticsLogger.log("THERMAL", "SoC cooled to Moderate for 60s; resumed secondary 9:16 companion stream.")
+                    }
+                    if (!userManuallyOverrode30FpsSaver && vPipe.thermalThrottle30Fps) {
+                        vPipe.thermalThrottle30Fps = false
+                        DiagnosticsLogger.log("THERMAL", "SoC cooled to Moderate for 60s; restored full 60 FPS broadcast cadence.")
+                    }
                 }
             }
         }
 
-        // 4. Dynamic-Floor Queue-Aware ABR 2.0 (Never mistakes -1 for calm!)
+        // Dynamic-Floor Queue-Aware ABR 2.0
         if (vPipe != null && vPipe.brbBlackoutActive) {
             congestedTicks = 0
             stableTicks = 0
@@ -1642,12 +1744,17 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
             wakeLockAcquiredAtMs = SystemClock.elapsedRealtime()
 
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                lastLoggedThermalListenerStatus = pm.currentThermalStatus
                 val listener = PowerManager.OnThermalStatusChangedListener { status ->
-                    if (status >= PowerManager.THERMAL_STATUS_MODERATE) {
-                        DiagnosticsLogger.log(
-                            "THERMAL_EVENT",
-                            "Android thermal status changed to ${DiagnosticsLogger.thermalStatusName(status)}."
-                        )
+                    if (status != lastLoggedThermalListenerStatus) {
+                        val prev = lastLoggedThermalListenerStatus
+                        lastLoggedThermalListenerStatus = status
+                        if (status >= PowerManager.THERMAL_STATUS_MODERATE || prev >= PowerManager.THERMAL_STATUS_MODERATE) {
+                            DiagnosticsLogger.log(
+                                "THERMAL_EVENT",
+                                "Android thermal status changed to ${DiagnosticsLogger.thermalStatusName(status)}."
+                            )
+                        }
                     }
                 }
                 thermalListener = listener
@@ -1832,7 +1939,7 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
 
         tvHeaderStats = TextView(this).apply {
             setTextColor(Color.parseColor("#00E5FF"))
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 10.8f)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 10.6f)
             typeface = Typeface.MONOSPACE
         }
         tvBadges = TextView(this).apply {
@@ -1970,7 +2077,11 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
             if (opts.isNotEmpty()) {
                 val curIdx = opts.indexOfFirst { it.deviceId == activeSettings.micDeviceId }
                 val nextOpt = opts[(curIdx + 1) % opts.size]
-                saveAndSyncLiveAudio(activeSettings.copy(micDeviceId = nextOpt.deviceId))
+                activeSettings = activeSettings.copy(micDeviceId = nextOpt.deviceId)
+                KeystoreVault.saveSettings(this, activeSettings)
+                btnLiveMicInput?.text = "Mic: ${nextOpt.label.take(14)}"
+                mainHandler.removeCallbacks(debouncedMicSwitchRunnable)
+                mainHandler.postDelayed(debouncedMicSwitchRunnable, 420L)
             }
         }
 
@@ -2241,10 +2352,16 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
         val outMbps = lastMeasuredOutBps / 1_000_000.0
         val encFps = videoPipeline?.actualEncodedFps ?: 0
         val freshFps = videoPipeline?.actualFreshCaptureFps ?: 0
-        val qFrames = DiagnosticsLogger.lastQueueFrames
-        val qTag = if (qFrames >= 0) "Q:${qFrames}f" else "Q:0f"
+        val qTag = formatOverlayQueueTag(DiagnosticsLogger.lastQueueFrames)
         val tempC = DiagnosticsLogger.readBatteryTempC(this)
-        val tempTag = if (tempC > 0f) String.format(Locale.US, "%.1f°C", tempC) else ""
+        val socLoad = DiagnosticsLogger.readThermalHeadroom(this)
+        val tempTag = buildString {
+            if (tempC > 0f) append(String.format(Locale.US, "%.1f°C", tempC))
+            if (socLoad > 0f) {
+                if (isNotEmpty()) append(" ")
+                append("SoC:${(socLoad * 100).roundToInt()}%")
+            }
+        }
 
         tvHeaderStats?.text = String.format(
             Locale.US,
