@@ -76,6 +76,7 @@ class MicDspProcessor(private val sampleRate: Int = 48000) {
     }
 
     private val hpfFilter = Biquad64()
+    private val vocalBodyDetector = Biquad64() // 220 Hz vocal-cord fundamental detector for Spark/Hammer rejection
     private val eqLowWarmth = Biquad64()
     private val eqMudCut = Biquad64()
     private val eqPresence = Biquad64()
@@ -89,13 +90,22 @@ class MicDspProcessor(private val sampleRate: Int = 48000) {
     private var configuredHpfHz = -1
     private var configuredGender = ""
 
+    // Multi-strike mosquito-racket spark ("phat-phat-phat") & construction hammer/drill blanker state
     private var muteSmoothGain = 1.0f
+    private var prevRawSample = 0.0f
+    private var slewFastEnv = 0.0f
+    private var slewSlowEnv = 0.0015f
     private var transientFastEnv = 0.0f
-    private var transientSlowEnv = 0.01f
+    private var transientSlowEnv = 0.008f
+    private var vocalBodyEnv = 0.002f
+    private var sparkBlankerHoldSamples = 0
+
+    // VAD & Breath Expander state (with 30 ms consecutive vocal confirmation so short sparks never open gate)
     private var gateGain = 1.0f
     private var gateHoldSamples = 0
+    private var consecutiveSpeechFrames = 0
 
-    // Stationary light spectral fallback state
+    // Stationary light spectral fallback & construction high-band tamer state
     private var noiseFloorEnv = 0.0018f
     private var suppressSmoothGain = 1.0f
     private var lpNoiseState = 0.0f
@@ -109,6 +119,7 @@ class MicDspProcessor(private val sampleRate: Int = 48000) {
     private var slowAgcGain = 1.0f
 
     init {
+        configureBandPass(vocalBodyDetector, 220.0, 0.90)
         updateGenderTunedFiltersIfNeeded(voiceGenderProfile)
         updateHpfIfNeeded(hpfCutoffHz)
     }
@@ -165,10 +176,6 @@ class MicDspProcessor(private val sampleRate: Int = 48000) {
         }
     }
 
-    /**
-     * Thread-safe native RNNoise execution locked against [release] so a delayed audio thread
-     * can never access a freed C DenoiseState pointer.
-     */
     private fun runNativeRnnoiseLocked(buffer: FloatArray, wetStrength: Float): Float {
         if (!SolNativeRnnoise.isLibraryLoaded) return -1.0f
         synchronized(nativeLock) {
@@ -288,8 +295,10 @@ class MicDspProcessor(private val sampleRate: Int = 48000) {
         updateHpfIfNeeded(hpfHz)
         updateGenderTunedFiltersIfNeeded(voiceGenderProfile)
 
-        // === PASS 1: Smooth Anti-Click Mute + Pre-Gain + 64-Bit HPF + Grip/Plosive Transient Tamer ===
+        // === PASS 1: Smooth Mute + Pre-Gain + 64-Bit HPF + Multi-Strike Spark/Hammer Blanker ===
         val baseGain = micGainLinear
+        var impulseSamplesInFrame = 0
+
         for (i in 0 until count) {
             muteSmoothGain += 0.015f * (targetMute - muteSmoothGain)
             val rawIn = buffer[i]
@@ -301,12 +310,53 @@ class MicDspProcessor(private val sampleRate: Int = 48000) {
 
             if (useTransient) {
                 val absS = abs(s)
-                transientFastEnv += (if (absS > transientFastEnv) 0.28f else 0.012f) * (absS - transientFastEnv)
-                transientSlowEnv += 0.003f * (absS - transientSlowEnv)
-                val impulseCeiling = max(0.18f, transientSlowEnv * 4.2f)
-                if (transientFastEnv > impulseCeiling) {
-                    s *= (impulseCeiling / transientFastEnv).coerceIn(0.35f, 1.0f)
+                val slew = abs(s - prevRawSample)
+                prevRawSample = s
+
+                // Track 220 Hz vocal-cord fundamental vs sub-millisecond spark/hammer slew
+                val vocalFund = abs(vocalBodyDetector.process(s))
+                vocalBodyEnv += (if (vocalFund > vocalBodyEnv) 0.08f else 0.004f) * (vocalFund - vocalBodyEnv)
+                slewFastEnv += (if (slew > slewFastEnv) 0.45f else 0.03f) * (slew - slewFastEnv)
+                transientFastEnv += (if (absS > transientFastEnv) 0.35f else 0.015f) * (absS - transientFastEnv)
+
+                // Detect electric spark ("phat-phat-phat") or hammer strike:
+                // Sharp vertical jump where high-frequency slew dominates over 220 Hz vocal-cord body
+                val slewCeiling = max(0.012f, slewSlowEnv * 3.4f)
+                val ampCeiling = max(0.035f, transientSlowEnv * 3.8f)
+                val lacksVocalBody = vocalBodyEnv < (transientFastEnv * 0.38f)
+                val isSparkOrHammer = (slewFastEnv > slewCeiling && lacksVocalBody) ||
+                    (transientFastEnv > ampCeiling && lacksVocalBody)
+
+                if (isSparkOrHammer) {
+                    // Hold blanker for 6 ms (288 samples) per strike & FREEZE slow baselines
+                    // so rapid bursts of 3-6 mosquito zaps in 2-4s never adapt the baseline upward!
+                    sparkBlankerHoldSamples = 288
+                    impulseSamplesInFrame++
+                } else {
+                    if (sparkBlankerHoldSamples > 0) {
+                        sparkBlankerHoldSamples--
+                        impulseSamplesInFrame++
+                    } else {
+                        // Only update slow baseline during non-impulse samples!
+                        transientSlowEnv += 0.0025f * (absS - transientSlowEnv)
+                        slewSlowEnv += 0.0025f * (slew - slewSlowEnv)
+                    }
                 }
+
+                if (sparkBlankerHoldSamples > 0) {
+                    // If user is speaking, shave spark down to vocal body; if silent, clamp by up to 92% (-22 dB)
+                    val safeCeiling = if (vadSpeechActive) {
+                        max(vocalBodyEnv * 1.6f, transientSlowEnv * 1.8f)
+                    } else {
+                        max(0.004f, transientSlowEnv * 1.15f)
+                    }
+                    if (absS > safeCeiling) {
+                        val atten = (safeCeiling / max(absS, 1e-5f)).coerceIn(0.08f, 1.0f)
+                        s *= atten
+                    }
+                }
+            } else {
+                prevRawSample = s
             }
 
             if (abs(s) < 1e-20f) s = 0f
@@ -367,58 +417,80 @@ class MicDspProcessor(private val sampleRate: Int = 48000) {
         lastPeakDb = linearToDb(framePeak)
         lastRmsDb = linearToDb(rms)
 
+        // Do not let short spark/hammer frames pollute the stationary room noise-floor tracker
+        val frameHadImpulse = impulseSamplesInFrame > (count / 6)
         val likelyQuiet = if (neuralVadProb >= 0f) {
-            neuralVadProb < 0.25f && rms < noiseFloorEnv * 1.8f
+            neuralVadProb < 0.25f && rms < noiseFloorEnv * 1.8f && !frameHadImpulse
         } else {
-            rms < noiseFloorEnv * 1.6f
+            rms < noiseFloorEnv * 1.6f && !frameHadImpulse
         }
         if (likelyQuiet) {
             noiseFloorEnv = 0.96f * noiseFloorEnv + 0.04f * max(rms, 0.00010f)
-        } else {
+        } else if (!frameHadImpulse) {
             noiseFloorEnv = min(0.035f, noiseFloorEnv * 1.0003f)
         }
         lastNoiseFloorDb = linearToDb(noiseFloorEnv)
 
         val zcrRatio = zeroCrossings.toFloat() / count.toFloat()
         val snrRatio = rms / max(noiseFloorEnv, 0.00015f)
-        val energySpeech = (rms > 0.0065f) && (snrRatio > 2.4f) && (zcrRatio < 0.44f)
-        val speechDetected = (muteSmoothGain > 0.05f) && (
-            (neuralVadProb >= 0.48f && rms > 0.0035f) ||
+        // True human speech has strong 220 Hz vocal-cord body and moderate zero-crossing rate (<0.42),
+        // whereas mosquito zaps & construction drills have high ZCR and weak vocal body
+        val hasVocalHarmonics = vocalBodyEnv > (rms * 0.22f) && zcrRatio < 0.42f
+        val energySpeech = (rms > 0.0065f) && (snrRatio > 2.4f) && hasVocalHarmonics
+        val rawFrameSpeech = (muteSmoothGain > 0.05f) && !frameHadImpulse && (
+            (neuralVadProb >= 0.52f && rms > 0.0035f && zcrRatio < 0.46f) ||
                 (neuralVadProb < 0f && energySpeech) ||
-                (snrRatio > 3.6f && rms > 0.009f)
+                (snrRatio > 3.8f && rms > 0.0095f && hasVocalHarmonics)
             )
-        lastVadProbability = if (neuralVadProb >= 0f) neuralVadProb else if (speechDetected) 0.85f else 0.05f
+
+        if (rawFrameSpeech) {
+            consecutiveSpeechFrames = min(50, consecutiveSpeechFrames + 1)
+        } else {
+            consecutiveSpeechFrames = max(0, consecutiveSpeechFrames - 1)
+        }
+
+        // Require at least 2 consecutive frames (20 ms) of vocal-cord speech (or high neural VAD)
+        // before triggering the 160 ms gate hold, so a 5-15 ms mosquito zap NEVER opens the gate!
+        val confirmedSpeech = rawFrameSpeech && (consecutiveSpeechFrames >= 2 || neuralVadProb >= 0.68f)
+        lastVadProbability = if (neuralVadProb >= 0f) neuralVadProb else if (confirmedSpeech) 0.85f else 0.05f
 
         val holdDurationSamples = (sampleRate * 0.16f).toInt()
-        if (speechDetected) {
+        if (confirmedSpeech) {
             gateHoldSamples = holdDurationSamples
         } else if (gateHoldSamples > 0) {
             gateHoldSamples = max(0, gateHoldSamples - count)
         }
-        val activeSpeech = speechDetected || gateHoldSamples > 0
+        val activeSpeech = confirmedSpeech || gateHoldSamples > 0
         vadSpeechActive = activeSpeech
 
-        // Fallback to Light Spectral Cut whenever RNNOISE did not run on the current frame
-        // (e.g., partial !=480 frame, native handle failure, or JVM unit test)
-        val runLightSpectral = nsLevel > 0 && !ranNativeRnnoise &&
-            (nsMode == "LIGHT" || nsMode == "RNNOISE" || (nsMode == "HW_NS" && !platformHwNsAttached))
+        // Fallback to Light Spectral Cut whenever RNNOISE did not run on the current frame,
+        // OR apply extra high-band construction/grinder taming when non-speech high-ZCR noise is present
+        val highFreqDrillNoise = !activeSpeech && useTransient && zcrRatio > 0.34f && snrRatio > 1.6f
+        val runLightSpectral = (nsLevel > 0 && !ranNativeRnnoise &&
+            (nsMode == "LIGHT" || nsMode == "RNNOISE" || (nsMode == "HW_NS" && !platformHwNsAttached))) ||
+            highFreqDrillNoise
 
         val targetSuppressGain = if (runLightSpectral) {
-            val strength = when (nsLevel) {
-                1 -> 0.50f
-                2 -> 0.76f
-                else -> 0.86f
+            val strength = when {
+                nsLevel == 1 -> 0.50f
+                nsLevel == 2 -> 0.76f
+                nsLevel >= 3 -> 0.86f
+                else -> 0.65f
             }
-            val cleanRatio = ((snrRatio - 1.2f) / 3.5f).coerceIn(0f, 1f)
-            (1.0f - strength * (1.0f - cleanRatio)).coerceIn(0.16f, 1.0f)
+            val cleanRatio = if (highFreqDrillNoise && !activeSpeech) {
+                0.0f
+            } else {
+                ((snrRatio - 1.2f) / 3.5f).coerceIn(0f, 1f)
+            }
+            (1.0f - strength * (1.0f - cleanRatio)).coerceIn(0.14f, 1.0f)
         } else {
             1.0f
         }
 
-        // Speech-Gated Slow Broadcast AGC (strictly frozen during silence so idle hiss is NEVER boosted!)
+        // Speech-Gated Slow Broadcast AGC (strictly frozen during silence/sparks so noise is NEVER boosted!)
         val useSlowAgc = slowAgcEnabled
         if (useSlowAgc) {
-            if (speechDetected && rms > 0.011f) {
+            if (confirmedSpeech && rms > 0.011f) {
                 val targetSpeechRms = 0.145f
                 val desiredAgc = (targetSpeechRms / rms).coerceIn(0.63f, 1.95f)
                 val agcRate = if (desiredAgc < slowAgcGain) 0.06f else 0.02f
@@ -436,7 +508,7 @@ class MicDspProcessor(private val sampleRate: Int = 48000) {
         val useWhisper = whisperLiftEnabled
         val useComp = compressorEnabled
 
-        val targetGate = if (!useGate || activeSpeech) 1.0f else 0.24f
+        val targetGate = if (!useGate || activeSpeech) 1.0f else if (frameHadImpulse) 0.10f else 0.22f
         val targetAirMix = if (useVelvet && activeSpeech) 1.0f else 0.0f
         var targetCompBlockGain = 1.0f
         var minCompGainInFrame = 1.0f
@@ -446,14 +518,15 @@ class MicDspProcessor(private val sampleRate: Int = 48000) {
             var s = buffer[i]
 
             if (runLightSpectral) {
-                suppressSmoothGain += 0.008f * (targetSuppressGain - suppressSmoothGain)
+                suppressSmoothGain += 0.010f * (targetSuppressGain - suppressSmoothGain)
                 lpNoiseState += 0.22f * (s - lpNoiseState)
                 val highBand = s - lpNoiseState
+                // High-frequency band (mosquito spark crackle / drill whine) gets squared attenuation
                 s = (lpNoiseState * suppressSmoothGain) + (highBand * suppressSmoothGain * suppressSmoothGain)
             }
 
             if (useGate) {
-                val gCoeff = if (targetGate > gateGain) 0.028f else 0.0012f
+                val gCoeff = if (targetGate > gateGain) 0.028f else if (frameHadImpulse) 0.015f else 0.0014f
                 gateGain += gCoeff * (targetGate - gateGain)
                 s *= gateGain
             }
