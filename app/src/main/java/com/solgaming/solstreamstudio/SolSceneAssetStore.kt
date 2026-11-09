@@ -69,51 +69,89 @@ object SolSceneAssetStore {
     }
 
     /**
-     * Atomically replaces [outFile] with [tempFile], falling back to stream copy and preserving
-     * any previous image if writing fails.
+     * Atomically replaces [outFile] with [tempFile]. If direct rename fails, copies into a separate
+     * staging file first and unconditionally restores [backupFile] if any step fails or throws,
+     * so a partially written destination file can never block rollback.
      */
     internal fun replaceFileSafely(tempFile: File, outFile: File): Boolean {
         if (!tempFile.exists() || tempFile.length() <= 64L) return false
+        val expectedLength = tempFile.length()
         val backupFile = File(outFile.parentFile, "${outFile.name}.bak")
+        val copyStageFile = File(outFile.parentFile, "${outFile.name}.stage")
+
         try {
             if (backupFile.exists()) backupFile.delete()
-            if (outFile.exists() && !outFile.renameTo(backupFile)) {
-                FileInputStream(outFile).use { fis ->
-                    FileOutputStream(backupFile).use { fos -> fis.copyTo(fos) }
+            if (copyStageFile.exists()) copyStageFile.delete()
+
+            if (outFile.exists()) {
+                val backedUp = outFile.renameTo(backupFile) || run {
+                    FileInputStream(outFile).use { fis ->
+                        FileOutputStream(backupFile).use { fos ->
+                            fis.copyTo(fos)
+                            fos.flush()
+                        }
+                    }
+                    backupFile.exists() && backupFile.length() == outFile.length() && outFile.delete()
                 }
-                outFile.delete()
+                if (!backedUp) {
+                    return false
+                }
             }
 
-            val moved = tempFile.renameTo(outFile) || run {
+            val movedDirectly = tempFile.renameTo(outFile) &&
+                outFile.exists() &&
+                outFile.length() == expectedLength
+
+            val committed = if (movedDirectly) {
+                true
+            } else {
                 FileInputStream(tempFile).use { fis ->
-                    FileOutputStream(outFile).use { fos ->
+                    FileOutputStream(copyStageFile).use { fos ->
                         fis.copyTo(fos)
                         fos.flush()
                     }
                 }
-                tempFile.delete()
-                outFile.exists() && outFile.length() > 64L
+                val stageValid = copyStageFile.exists() && copyStageFile.length() == expectedLength
+                if (outFile.exists()) outFile.delete()
+                stageValid && copyStageFile.renameTo(outFile) &&
+                    outFile.exists() &&
+                    outFile.length() == expectedLength
             }
 
-            if (moved && outFile.exists() && outFile.length() > 64L) {
+            if (committed) {
                 if (backupFile.exists()) backupFile.delete()
                 return true
             }
 
-            if (backupFile.exists()) {
-                if (outFile.exists()) outFile.delete()
-                backupFile.renameTo(outFile)
-            }
+            restoreBackupUnconditionally(backupFile, outFile)
             return false
         } catch (_: Exception) {
-            if (backupFile.exists() && (!outFile.exists() || outFile.length() <= 64L)) {
-                try { backupFile.renameTo(outFile) } catch (_: Exception) {}
-            }
+            restoreBackupUnconditionally(backupFile, outFile)
             return false
         } finally {
             if (tempFile.exists()) {
                 try { tempFile.delete() } catch (_: Exception) {}
             }
+            if (copyStageFile.exists()) {
+                try { copyStageFile.delete() } catch (_: Exception) {}
+            }
+        }
+    }
+
+    private fun restoreBackupUnconditionally(backupFile: File, outFile: File) {
+        if (!backupFile.exists()) return
+        try {
+            if (outFile.exists()) outFile.delete()
+            if (!backupFile.renameTo(outFile)) {
+                FileInputStream(backupFile).use { fis ->
+                    FileOutputStream(outFile).use { fos ->
+                        fis.copyTo(fos)
+                        fos.flush()
+                    }
+                }
+                backupFile.delete()
+            }
+        } catch (_: Exception) {
         }
     }
 
