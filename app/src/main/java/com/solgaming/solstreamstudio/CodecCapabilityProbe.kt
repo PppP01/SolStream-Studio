@@ -35,6 +35,7 @@ import org.json.JSONObject
 import java.util.Locale
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.locks.ReentrantLock
 import kotlin.math.max
 import kotlin.math.min
@@ -132,7 +133,8 @@ data class HardwareEncoderReport(
     val complexityMin: Int,
     val complexityMax: Int,
     val verifiedSurfaceConfigure: Boolean,
-    val verifiedRealEncode: Boolean = false
+    val verifiedRealEncode: Boolean = false,
+    val advertisedByMetadata: Boolean = true
 ) {
     fun alignDimensions(rawWidth: Int, rawHeight: Int): Pair<Int, Int> {
         val wAlign = max(2, if (widthAlignment % 2 == 0) widthAlignment else widthAlignment * 2)
@@ -168,6 +170,7 @@ data class HardwareEncoderReport(
         put("complexityMax", complexityMax)
         put("verifiedSurfaceConfigure", verifiedSurfaceConfigure)
         put("verifiedRealEncode", verifiedRealEncode)
+        put("advertisedByMetadata", advertisedByMetadata)
     }
 
     companion object {
@@ -200,7 +203,8 @@ data class HardwareEncoderReport(
                 complexityMin = obj.optInt("complexityMin", 0),
                 complexityMax = obj.optInt("complexityMax", 0),
                 verifiedSurfaceConfigure = obj.optBoolean("verifiedSurfaceConfigure", true),
-                verifiedRealEncode = obj.optBoolean("verifiedRealEncode", false)
+                verifiedRealEncode = obj.optBoolean("verifiedRealEncode", false),
+                advertisedByMetadata = obj.optBoolean("advertisedByMetadata", true)
             )
         }
     }
@@ -340,15 +344,18 @@ object CodecCapabilityProbe {
     private const val CACHE_PREFS = "solstream_hw_probe_cache_v3"
     private const val KEY_FINGERPRINT = "cached_fingerprint"
     private const val KEY_PAYLOAD = "cached_scan_json"
-    private const val CACHE_SCHEMA_TAG = "ultra_v112_r1"
+    private const val CACHE_SCHEMA_TAG = "ultra_v112_r2"
 
     private val scanLock = ReentrantLock()
+    private val activeHardwareProbeRunning = AtomicBoolean(false)
     private val probeExecutor = Executors.newSingleThreadExecutor { r ->
         Thread(r, "SolHwProbeWorker").apply { isDaemon = true }
     }
     private val mainHandler = Handler(Looper.getMainLooper())
 
     @Volatile private var cachedScan: DeviceScanSummary? = null
+
+    fun isHardwareProbeCurrentlyRunning(): Boolean = activeHardwareProbeRunning.get()
 
     internal fun normalizePhysicalRamGb(totalBytes: Long): Int {
         if (totalBytes <= 0L) return 8
@@ -366,22 +373,33 @@ object CodecCapabilityProbe {
 
     /**
      * Selects a valid (width, height, fps) combination that the encoder metadata actually claims
-     * to support together, preventing mismatched tests like 1440p60 on a 1440p30 + 1080p60 chip.
+     * to support together, including explicit 720p30, aligned 480p, and aligned 360p fallbacks.
+     * Returns null if not even 360p is advertised.
      */
     internal fun selectValidProbeTarget(
         ok1440p60: Boolean,
         ok1440p30: Boolean,
         ok1080p60: Boolean,
         ok1080p30: Boolean,
-        ok720p60: Boolean
-    ): Triple<Int, Int, Int> {
+        ok720p60: Boolean,
+        ok720p30: Boolean = true,
+        ok480p: Boolean = true,
+        ok360p: Boolean = true,
+        aligned480W: Int = 854,
+        aligned480H: Int = 480,
+        aligned360W: Int = 640,
+        aligned360H: Int = 360
+    ): Triple<Int, Int, Int>? {
         return when {
             ok1440p60 -> Triple(2560, 1440, 60)
             ok1080p60 -> Triple(1920, 1080, 60)
             ok1440p30 -> Triple(2560, 1440, 30)
             ok1080p30 -> Triple(1920, 1080, 30)
             ok720p60 -> Triple(1280, 720, 60)
-            else -> Triple(1280, 720, 30)
+            ok720p30 -> Triple(1280, 720, 30)
+            ok480p -> Triple(aligned480W, aligned480H, 30)
+            ok360p -> Triple(aligned360W, aligned360H, 30)
+            else -> null
         }
     }
 
@@ -419,8 +437,9 @@ object CodecCapabilityProbe {
 
     /**
      * Non-blocking scan getter for SolVideoPipeline.startPipeline(): returns cached or persisted
-     * scan immediately; if a background scan is currently running on the UI thread caller, performs
-     * a fast metadata-only scan without waiting on the background lock so the UI never freezes.
+     * verified scan immediately; if an initial background scan is still running on first launch,
+     * waits briefly up to 350 ms on a worker thread or falls back to an honest metadata-only scan
+     * (where verifiedSurfaceConfigure = false and advertisedByMetadata = true).
      */
     fun getBestAvailableScanNonBlocking(context: Context): DeviceScanSummary {
         val appCtx = context.applicationContext
@@ -429,18 +448,15 @@ object CodecCapabilityProbe {
             cachedScan = it
             return it
         }
-        val isUiThread = (Looper.myLooper() == Looper.getMainLooper())
-        if (!isUiThread) {
-            return scanDevice(appCtx, forceRefresh = false)
-        }
-        return if (scanLock.tryLock(60, TimeUnit.MILLISECONDS)) {
+        val waitMs = if (Looper.myLooper() == Looper.getMainLooper()) 80L else 400L
+        return if (scanLock.tryLock(waitMs, TimeUnit.MILLISECONDS)) {
             try {
                 cachedScan ?: loadPersistedCache(appCtx) ?: performFastMetadataScan(appCtx)
             } finally {
                 scanLock.unlock()
             }
         } else {
-            performFastMetadataScan(appCtx)
+            cachedScan ?: loadPersistedCache(appCtx) ?: performFastMetadataScan(appCtx)
         }
     }
 
@@ -450,6 +466,12 @@ object CodecCapabilityProbe {
         onComplete: (DeviceScanSummary) -> Unit
     ) {
         val appCtx = context.applicationContext
+        // Never run hardware MediaCodec probing while a live broadcast is active!
+        if (SolStreamService.isBroadcastLive) {
+            val safeLiveSummary = cachedScan ?: loadPersistedCache(appCtx) ?: performFastMetadataScan(appCtx)
+            onComplete(safeLiveSummary)
+            return
+        }
         if (!forceRefresh) {
             cachedScan?.let {
                 onComplete(it)
@@ -469,6 +491,10 @@ object CodecCapabilityProbe {
 
     fun scanDevice(context: Context, forceRefresh: Boolean = false): DeviceScanSummary {
         val appCtx = context.applicationContext
+        // Never allocate test MediaCodec encoders while a livestream is actively encoding!
+        if (SolStreamService.isBroadcastLive) {
+            return cachedScan ?: loadPersistedCache(appCtx) ?: performFastMetadataScan(appCtx)
+        }
         if (!forceRefresh) {
             cachedScan?.let { return it }
             loadPersistedCache(appCtx)?.let { persisted ->
@@ -477,7 +503,6 @@ object CodecCapabilityProbe {
             }
         }
 
-        // Never block the main UI thread if a background worker is already holding scanLock
         if (Looper.myLooper() == Looper.getMainLooper()) {
             if (!scanLock.tryLock(80, TimeUnit.MILLISECONDS)) {
                 return cachedScan ?: loadPersistedCache(appCtx) ?: performFastMetadataScan(appCtx)
@@ -486,7 +511,11 @@ object CodecCapabilityProbe {
             scanLock.lock()
         }
 
+        activeHardwareProbeRunning.set(true)
         try {
+            if (SolStreamService.isBroadcastLive) {
+                return cachedScan ?: loadPersistedCache(appCtx) ?: performFastMetadataScan(appCtx)
+            }
             if (!forceRefresh) {
                 cachedScan?.let { return it }
                 loadPersistedCache(appCtx)?.let { persisted ->
@@ -499,11 +528,13 @@ object CodecCapabilityProbe {
             savePersistedCache(appCtx, summary)
             return summary
         } finally {
+            activeHardwareProbeRunning.set(false)
             scanLock.unlock()
         }
     }
 
     private fun performFastMetadataScan(appCtx: Context): DeviceScanSummary {
+        // Honest metadata-only scan: does NOT set verifiedSurfaceConfigure = true and does NOT overwrite persisted cache
         return executeFullHardwareScan(appCtx, runEglEncodeVerification = false)
     }
 
@@ -523,10 +554,13 @@ object CodecCapabilityProbe {
 
         val modelStr = "${Build.MANUFACTURER} ${Build.MODEL}"
         val av1Usable = av1 != null && av1.verifiedRealEncode && (av1.supports1440p60 || av1.supports1080p60)
+        val hevcEligible = hevc != null && (hevc.verifiedRealEncode || hevc.verifiedSurfaceConfigure || (!runEglEncodeVerification && hevc.advertisedByMetadata))
+        val h264Eligible = h264 != null && (h264.verifiedRealEncode || h264.verifiedSurfaceConfigure || (!runEglEncodeVerification && h264.advertisedByMetadata))
+
         val hevc4k60 = hevc?.supports4k60 == true && hevc.verifiedRealEncode
-        val hevc1440p60 = hevc?.supports1440p60 == true && hevc.verifiedSurfaceConfigure
-        val hevc1080p60 = hevc?.supports1080p60 == true && hevc.verifiedSurfaceConfigure
-        val h2641080p60 = h264?.supports1080p60 == true && h264.verifiedSurfaceConfigure
+        val hevc1440p60 = hevc?.supports1440p60 == true && hevcEligible
+        val hevc1080p60 = hevc?.supports1080p60 == true && hevcEligible
+        val h2641080p60 = h264?.supports1080p60 == true && h264Eligible
 
         val recTier: DeviceTier = when {
             (hevc4k60 || av1Usable) &&
@@ -548,7 +582,7 @@ object CodecCapabilityProbe {
         }
 
         val recCodec = when {
-            hevc != null && (hevc.verifiedRealEncode || hevc.verifiedSurfaceConfigure) -> "HEVC"
+            hevcEligible -> "HEVC"
             else -> "H264"
         }
 
@@ -732,6 +766,7 @@ object CodecCapabilityProbe {
         var score = 0
         if (r.verifiedRealEncode) score += 2000
         if (r.verifiedSurfaceConfigure) score += 400
+        if (r.advertisedByMetadata) score += 50
         if (r.supports4k60) score += 120
         if (r.supports1440p60) score += 80
         if (r.supports1080p60) score += 40
@@ -766,7 +801,7 @@ object CodecCapabilityProbe {
             var ok1080p60 = vCaps.areSizeAndRateSupported(1920, 1080, 60.0)
             var ok1080p30 = vCaps.areSizeAndRateSupported(1920, 1080, 30.0)
             var ok720p60 = vCaps.areSizeAndRateSupported(1280, 720, 60.0)
-            val ok720p30 = vCaps.areSizeAndRateSupported(1280, 720, 30.0)
+            var ok720p30 = vCaps.areSizeAndRateSupported(1280, 720, 30.0)
 
             val perfPoints = vCaps.supportedPerformancePoints
             if (!perfPoints.isNullOrEmpty()) {
@@ -777,6 +812,7 @@ object CodecCapabilityProbe {
                 val pp1080p60 = MediaCodecInfo.VideoCapabilities.PerformancePoint(1920, 1080, 60)
                 val pp1080p30 = MediaCodecInfo.VideoCapabilities.PerformancePoint(1920, 1080, 30)
                 val pp720p60 = MediaCodecInfo.VideoCapabilities.PerformancePoint(1280, 720, 60)
+                val pp720p30 = MediaCodecInfo.VideoCapabilities.PerformancePoint(1280, 720, 30)
                 ok4k60 = ok4k60 && perfPoints.any { it.covers(pp4k60) }
                 ok4k30 = ok4k30 && perfPoints.any { it.covers(pp4k30) }
                 ok1440p60 = ok1440p60 && perfPoints.any { it.covers(pp1440p60) }
@@ -784,6 +820,7 @@ object CodecCapabilityProbe {
                 ok1080p60 = ok1080p60 && perfPoints.any { it.covers(pp1080p60) }
                 ok1080p30 = ok1080p30 && perfPoints.any { it.covers(pp1080p30) }
                 ok720p60 = ok720p60 && perfPoints.any { it.covers(pp720p60) }
+                ok720p30 = ok720p30 && perfPoints.any { it.covers(pp720p30) }
             }
 
             val wAlign = max(2, vCaps.widthAlignment)
@@ -795,6 +832,21 @@ object CodecCapabilityProbe {
 
             val ok480p = vCaps.isSizeSupported(aligned480W, aligned480H)
             val ok360p = vCaps.isSizeSupported(aligned360W, aligned360H)
+
+            val probeTarget = selectValidProbeTarget(
+                ok1440p60 = ok1440p60,
+                ok1440p30 = ok1440p30,
+                ok1080p60 = ok1080p60,
+                ok1080p30 = ok1080p30,
+                ok720p60 = ok720p60,
+                ok720p30 = ok720p30,
+                ok480p = ok480p,
+                ok360p = ok360p,
+                aligned480W = aligned480W,
+                aligned480H = aligned480H,
+                aligned360W = aligned360W,
+                aligned360H = aligned360H
+            ) ?: return null
 
             val profileLevels = caps.profileLevels
             val hdr10Supported = profileLevels?.any { pl ->
@@ -826,33 +878,31 @@ object CodecCapabilityProbe {
                 1
             }
 
-            // Select (testW, testH, testFps) together as a valid supported tuple!
-            val (testW, testH, testFps) = selectValidProbeTarget(
-                ok1440p60 = ok1440p60,
-                ok1440p30 = ok1440p30,
-                ok1080p60 = ok1080p60,
-                ok1080p30 = ok1080p30,
-                ok720p60 = ok720p60
-            )
-
-            val (surfaceOk, realEncodeOk) = if (runEglEncodeVerification) {
+            // Distinguish honest metadata-only scans (surfaceOk = false) from real surface/frame verification!
+            val (surfaceOk, realEncodeOk) = if (runEglEncodeVerification && !SolStreamService.isBroadcastLive) {
                 verifyHardwareSurfaceEncoder(
                     encoderName = info.name,
                     mime = mime,
-                    width = testW,
-                    height = testH,
-                    fps = testFps
+                    width = probeTarget.first,
+                    height = probeTarget.second,
+                    fps = probeTarget.third
                 )
             } else {
-                true to false
+                false to false
             }
 
-            val verified4k60 = if (ok4k60 && surfaceOk && runEglEncodeVerification) {
+            val capGate = if (runEglEncodeVerification && !SolStreamService.isBroadcastLive) {
+                surfaceOk
+            } else {
+                true
+            }
+
+            val verified4k60 = if (ok4k60 && surfaceOk && runEglEncodeVerification && !SolStreamService.isBroadcastLive) {
                 verifyHardwareSurfaceEncoder(info.name, mime, 3840, 2160, 60).second
             } else {
                 false
             }
-            val verified4k30 = if ((ok4k30 || ok4k60) && surfaceOk && runEglEncodeVerification) {
+            val verified4k30 = if ((ok4k30 || ok4k60) && surfaceOk && runEglEncodeVerification && !SolStreamService.isBroadcastLive) {
                 verified4k60 || verifyHardwareSurfaceEncoder(info.name, mime, 3840, 2160, 30).second
             } else {
                 false
@@ -864,21 +914,21 @@ object CodecCapabilityProbe {
                 encoderName = info.name,
                 supports4k60 = verified4k60,
                 supports4k30 = verified4k30,
-                supports1440p60 = ok1440p60 && surfaceOk,
-                supports1440p30 = (ok1440p30 || ok1440p60) && surfaceOk,
-                supports1080p60 = ok1080p60 && surfaceOk,
-                supports1080p30 = (ok1080p30 || ok1080p60) && surfaceOk,
-                supports720p60 = ok720p60 && surfaceOk,
-                supports720p30 = (ok720p30 || ok720p60) && surfaceOk,
-                supports480p = ok480p && surfaceOk,
-                supports360p = ok360p && surfaceOk,
+                supports1440p60 = ok1440p60 && capGate,
+                supports1440p30 = (ok1440p30 || ok1440p60) && capGate,
+                supports1080p60 = ok1080p60 && capGate,
+                supports1080p30 = (ok1080p30 || ok1080p60) && capGate,
+                supports720p60 = ok720p60 && capGate,
+                supports720p30 = (ok720p30 || ok720p60) && capGate,
+                supports480p = ok480p && capGate,
+                supports360p = ok360p && capGate,
                 supportsCbr = eCaps?.isBitrateModeSupported(
                     MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR
                 ) ?: false,
                 supportsVbr = eCaps?.isBitrateModeSupported(
                     MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR
                 ) ?: true,
-                supports10BitHdr = hdr10Supported && surfaceOk,
+                supports10BitHdr = hdr10Supported && capGate,
                 supportsRoi = roiSupported,
                 widthAlignment = wAlign,
                 heightAlignment = hAlign,
@@ -887,7 +937,8 @@ object CodecCapabilityProbe {
                 complexityMin = eCaps?.complexityRange?.lower ?: 0,
                 complexityMax = eCaps?.complexityRange?.upper ?: 0,
                 verifiedSurfaceConfigure = surfaceOk,
-                verifiedRealEncode = realEncodeOk
+                verifiedRealEncode = realEncodeOk,
+                advertisedByMetadata = true
             )
         } catch (_: Exception) {
             null
@@ -916,7 +967,9 @@ object CodecCapabilityProbe {
             val safeBps = when {
                 width >= 3840 -> 24_000_000
                 width >= 2560 -> 16_000_000
-                else -> 10_000_000
+                width >= 1920 -> 10_000_000
+                width >= 1280 -> 5_000_000
+                else -> 2_000_000
             }
             val format = MediaFormat.createVideoFormat(mime, width, height).apply {
                 setInteger(
@@ -1056,7 +1109,7 @@ object CodecCapabilityProbe {
         val result = mutableListOf(
             MicInputOption(
                 deviceId = -1,
-                label = "Auto (Phone Mic when BT Calls OFF)",
+                label = "Auto (Phone Studio Mic Locked)",
                 isBluetooth = false,
                 deviceInfo = null
             )
