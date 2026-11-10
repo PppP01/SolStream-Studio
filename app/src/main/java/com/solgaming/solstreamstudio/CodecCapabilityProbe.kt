@@ -374,7 +374,6 @@ object CodecCapabilityProbe {
     /**
      * Selects a valid (width, height, fps) combination that the encoder metadata actually claims
      * to support together, including explicit 720p30, aligned 480p, and aligned 360p fallbacks.
-     * Returns null if not even 360p is advertised.
      */
     internal fun selectValidProbeTarget(
         ok1440p60: Boolean,
@@ -389,7 +388,7 @@ object CodecCapabilityProbe {
         aligned480H: Int = 480,
         aligned360W: Int = 640,
         aligned360H: Int = 360
-    ): Triple<Int, Int, Int>? {
+    ): Triple<Int, Int, Int> {
         return when {
             ok1440p60 -> Triple(2560, 1440, 60)
             ok1080p60 -> Triple(1920, 1080, 60)
@@ -399,7 +398,7 @@ object CodecCapabilityProbe {
             ok720p30 -> Triple(1280, 720, 30)
             ok480p -> Triple(aligned480W, aligned480H, 30)
             ok360p -> Triple(aligned360W, aligned360H, 30)
-            else -> null
+            else -> Triple(aligned360W, aligned360H, 30)
         }
     }
 
@@ -642,7 +641,7 @@ object CodecCapabilityProbe {
         } catch (_: Exception) {
         }
 
-        var maxHz = 60
+        var maxHz = 120
         var activeHz = 60
         try {
             val dm = context.getSystemService(Context.DISPLAY_SERVICE) as DisplayManager
@@ -833,6 +832,10 @@ object CodecCapabilityProbe {
             val ok480p = vCaps.isSizeSupported(aligned480W, aligned480H)
             val ok360p = vCaps.isSizeSupported(aligned360W, aligned360H)
 
+            val anySizeSupported = ok1440p60 || ok1440p30 || ok1080p60 || ok1080p30 ||
+                ok720p60 || ok720p30 || ok480p || ok360p
+            if (!anySizeSupported) return null
+
             val probeTarget = selectValidProbeTarget(
                 ok1440p60 = ok1440p60,
                 ok1440p30 = ok1440p30,
@@ -846,7 +849,7 @@ object CodecCapabilityProbe {
                 aligned480H = aligned480H,
                 aligned360W = aligned360W,
                 aligned360H = aligned360H
-            ) ?: return null
+            )
 
             val profileLevels = caps.profileLevels
             val hdr10Supported = profileLevels?.any { pl ->
