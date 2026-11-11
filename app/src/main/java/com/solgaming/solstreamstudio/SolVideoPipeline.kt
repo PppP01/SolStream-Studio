@@ -31,6 +31,8 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.HandlerThread
+import android.os.PerformanceHintManager
+import android.os.Process
 import android.util.DisplayMetrics
 import android.view.Surface
 import android.view.WindowManager
@@ -90,10 +92,10 @@ class SolVideoPipeline(private val context: Context) {
         }
 
     // Live-adjustable visual & filter states (0-ms hot-swap inside OpenGL render loop)
-    @Volatile var liveFramingMode = "FIT"
+    @Volatile var liveFramingMode = "FIT"        // "FIT", "STRETCH", "SMART", "FILL"
     @Volatile var liveSmartZoomPercent = 108
     @Volatile var liveLandscapeFlip = 0
-    @Volatile var liveUpscalerMode = "BICUBIC"
+    @Volatile var liveUpscalerMode = "BICUBIC"   // "BILINEAR", "BICUBIC", "LANCZOS"
     @Volatile var liveCinematicFilmic = false
     @Volatile var liveAmoledVivid = false
     @Volatile var liveShadowBoost = false
@@ -110,6 +112,9 @@ class SolVideoPipeline(private val context: Context) {
 
     /** Automatic Severe-Thermal cooldown relief: steps 60 FPS pacing down to 30 FPS temporarily. */
     @Volatile var thermalThrottle30Fps = false
+
+    /** Stage-1 Moderate-Warmth (>=44.0°C / 90% SoC load) repeat-frame 1-tap GPU cooler (keeps 100% quality on fresh frames). */
+    @Volatile var thermalModerateCoolerActive = false
 
     /** Pauses secondary 9:16 Dual-Format companion rendering first if Severe warmth occurs. */
     @Volatile var companionPausedByThermal = false
@@ -137,6 +142,7 @@ class SolVideoPipeline(private val context: Context) {
     @Volatile private var pendingCaptureHeight = 0
 
     private val codecReleaseLock = Any()
+    private val projectionCallbackLock = Any()
     private var maxHardwareBitrateBps = 100_000_000
     private var primarySupportsRoi = false
     private var primaryOutW = 1920
@@ -217,6 +223,29 @@ class SolVideoPipeline(private val context: Context) {
         }
     }
 
+    /**
+     * Immediately marks the video pipeline stopped and unregisters the MediaProjection callback
+     * before async network/audio teardown begins, preventing false [CAPTURE_STOP] logs on user stop.
+     */
+    fun prepareForImmediateStop() {
+        isRunning = false
+        unregisterProjectionCallbackImmediately()
+    }
+
+    private fun unregisterProjectionCallbackImmediately() {
+        synchronized(projectionCallbackLock) {
+            val cb = projectionCallback
+            val proj = projectionRef
+            projectionCallback = null
+            projectionRef = null
+            if (cb != null && proj != null) {
+                try { proj.unregisterCallback(cb) } catch (_: Exception) {}
+            }
+            try { callbackHandlerThread?.quitSafely() } catch (_: Exception) {}
+            callbackHandlerThread = null
+        }
+    }
+
     private fun pushHardwareRoiIfSupported(codec: MediaCodec, width: Int, height: Int, mode: String) {
         if (!primarySupportsRoi || Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return
         val m = mode.uppercase(Locale.US)
@@ -264,6 +293,7 @@ class SolVideoPipeline(private val context: Context) {
         if (isRunning) return null
         applyLiveVisualSettings(settings)
         thermalThrottle30Fps = false
+        thermalModerateCoolerActive = false
         companionPausedByThermal = false
         lastSentVideoPtsUs = -1L
         actualEncodedFps = 0
@@ -271,80 +301,130 @@ class SolVideoPipeline(private val context: Context) {
         actualFreshCaptureFps = 0
         configuredKeyframeSec = settings.keyframeIntervalSec.coerceIn(1, 4)
 
-        // Non-blocking scan getter so stream startup NEVER waits on a background hardware probe!
         val scan = CodecCapabilityProbe.getBestAvailableScanNonBlocking(context)
         val effectiveCodecReq = if (settings.simulcastTwitchEnabled || settings.simulcastKickEnabled) {
             "H264"
         } else {
             settings.codec
         }
-        val chosenReport = resolveSafeHardwareEncoder(scan, effectiveCodecReq)
-        if (chosenReport == null) {
+        val candidateReports = resolveCandidateHardwareEncoders(scan, effectiveCodecReq)
+        if (candidateReports.isEmpty()) {
             DiagnosticsLogger.log(
                 "VIDEO_ERR",
-                "No verified hardware video encoder matched $effectiveCodecReq. Software fallback is blocked to protect CODM FPS.",
+                "No hardware video encoder matched $effectiveCodecReq. Software fallback is blocked to protect CODM FPS.",
                 "requested=$effectiveCodecReq"
             )
             return null
         }
-
-        val requestedFps = if (settings.fps <= 30) 30 else 60
-        val (baseLong, baseShort, targetFps) = resolveSupportedResolutionAndFps(
-            report = chosenReport,
-            reqWidth = settings.width,
-            reqHeight = settings.height,
-            reqFps = requestedFps
-        )
-        val rawOutW = if (settings.isVertical) baseShort else baseLong
-        val rawOutH = if (settings.isVertical) baseLong else baseShort
-        val (outWidth, outHeight) = chosenReport.alignDimensions(rawOutW, rawOutH)
-        primaryOutW = outWidth
-        primaryOutH = outHeight
-        primarySupportsRoi = chosenReport.supportsRoi
-
-        val chipMaxBps = chosenReport.maxBitrateMbps.coerceIn(8, 100) * 1_000_000
-        maxHardwareBitrateBps = min(100_000_000, max(25_000_000, chipMaxBps))
-        val startBps = (settings.targetBitrateKbps.coerceIn(500, 100_000) * 1000L)
-            .coerceIn(500_000L, maxHardwareBitrateBps.toLong())
-            .toInt()
-        currentBitrateBps = startBps
 
         val preferEs30 = when (settings.glEngineMode.uppercase(Locale.US)) {
             "ES20" -> false
             "ES30" -> true
             else -> scan.supportsGlEs30
         }
-
-        val wantHdr10 = settings.hdr10Enabled &&
+        val canRecord10BitEgl = settings.hdr10Enabled &&
             preferEs30 &&
-            chosenReport.supports10BitHdr &&
             !settings.simulcastTwitchEnabled &&
             !settings.simulcastKickEnabled &&
             canCreateRecordable10BitEglConfig()
 
-        val configured = configureHardwareSurfaceEncoder(
-            report = chosenReport,
-            width = outWidth,
-            height = outHeight,
-            fps = targetFps,
-            bitrateBps = startBps,
-            wantVbr = settings.useVbr && !settings.simulcastTwitchEnabled && !settings.simulcastKickEnabled,
-            wantHdr10 = wantHdr10,
-            settings = settings
-        ) ?: return null
+        val requestedFps = if (settings.fps <= 30) 30 else 60
 
-        val codec = configured.codec
-        val encoderInputSurface = configured.inputSurface
+        var chosenReport: HardwareEncoderReport? = null
+        var configured: ConfiguredEncoder? = null
+        var outWidth = 1920
+        var outHeight = 1080
+        var targetFps = requestedFps
+        var startBps = 12_000_000
+
+        // Live Hardware Encoder & Resolution Fallback Ladder (tries lower tier or alternate HW codec if initial config fails)
+        outerLoop@ for ((reportIdx, candidate) in candidateReports.withIndex()) {
+            val (initialLong, initialShort, initialFps) = resolveSupportedResolutionAndFps(
+                report = candidate,
+                reqWidth = settings.width,
+                reqHeight = settings.height,
+                reqFps = requestedFps
+            )
+            val ladder = buildResolutionFallbackLadder(
+                report = candidate,
+                startLong = initialLong,
+                startShort = initialShort,
+                startFps = initialFps
+            )
+            val chipMaxBps = candidate.maxBitrateMbps.coerceIn(8, 100) * 1_000_000
+            val candidateMaxBps = min(100_000_000, max(25_000_000, chipMaxBps))
+            val wantHdr10 = canRecord10BitEgl && candidate.supports10BitHdr
+
+            for ((tierIdx, tier) in ladder.withIndex()) {
+                val (tierLong, tierShort, tierFps) = tier
+                val rawW = if (settings.isVertical) tierShort else tierLong
+                val rawH = if (settings.isVertical) tierLong else tierShort
+                val (alignedW, alignedH) = candidate.alignDimensions(rawW, rawH)
+
+                val scaledKbps = if (tierIdx == 0) {
+                    settings.targetBitrateKbps.coerceIn(500, 100_000)
+                } else {
+                    when {
+                        tierLong >= 2560 -> min(settings.targetBitrateKbps, 18_000)
+                        tierLong >= 1920 -> min(settings.targetBitrateKbps, 12_000)
+                        tierLong >= 1280 -> min(settings.targetBitrateKbps, 6_000)
+                        else -> min(settings.targetBitrateKbps, 2_500)
+                    }.coerceAtLeast(500)
+                }
+                val tierBps = (scaledKbps * 1000L).coerceIn(500_000L, candidateMaxBps.toLong()).toInt()
+
+                val attemptCfg = configureHardwareSurfaceEncoder(
+                    report = candidate,
+                    width = alignedW,
+                    height = alignedH,
+                    fps = tierFps,
+                    bitrateBps = tierBps,
+                    wantVbr = settings.useVbr && !settings.simulcastTwitchEnabled && !settings.simulcastKickEnabled,
+                    wantHdr10 = wantHdr10 && tierIdx == 0,
+                    settings = settings
+                )
+                if (attemptCfg != null) {
+                    chosenReport = candidate
+                    configured = attemptCfg
+                    outWidth = alignedW
+                    outHeight = alignedH
+                    targetFps = tierFps
+                    maxHardwareBitrateBps = candidateMaxBps
+                    startBps = tierBps
+                    if (reportIdx > 0 || tierIdx > 0) {
+                        DiagnosticsLogger.log(
+                            "VIDEO_FALLBACK",
+                            "Hardware encoder automatically stepped to ${candidate.codecKey} (${candidate.encoderName}) ${alignedW}x${alignedH}@${tierFps}fps.",
+                            "req=${settings.width}x${settings.height}@$requestedFps"
+                        )
+                    }
+                    break@outerLoop
+                }
+            }
+        }
+
+        val finalReport = chosenReport ?: return null
+        val finalConfigured = configured ?: return null
+
+        primaryOutW = outWidth
+        primaryOutH = outHeight
+        primarySupportsRoi = finalReport.supportsRoi
+        currentBitrateBps = startBps
+
+        val codec = finalConfigured.codec
+        val encoderInputSurface = finalConfigured.inputSurface
         videoCodecInstance = codec
 
         var compConfigured: ConfiguredEncoder? = null
-        val compReport = scan.hevcHardware?.takeIf { it.verifiedRealEncode || it.verifiedSurfaceConfigure } ?: chosenReport
+        val compReport = scan.hevcHardware?.takeIf {
+            it.verifiedRealEncode || it.verifiedSurfaceConfigure || it.advertisedByMetadata
+        } ?: finalReport
         val (compAlignedW, compAlignedH) = compReport.alignDimensions(1080, 1920)
         val compFps = if (compReport.supports1080p60 && targetFps >= 60) 60 else 30
 
         if (enableDualCompanion &&
             !settings.isVertical &&
-            !configured.actualIsHdr10 &&
+            !finalConfigured.actualIsHdr10 &&
             onCompanionConfig != null &&
             onCompanionVideo != null &&
             scan.supportsDualFormatCompanion()
@@ -373,49 +453,51 @@ class SolVideoPipeline(private val context: Context) {
         pendingCaptureHeight = 0
 
         // Android 14+ strict invariant: register MediaProjection.Callback BEFORE createVirtualDisplay()
-        val cbThread = HandlerThread("SolProjectionCb").apply { start() }
-        callbackHandlerThread = cbThread
-        val cb = object : MediaProjection.Callback() {
-            override fun onStop() {
-                if (isRunning) {
-                    DiagnosticsLogger.log(
-                        "CAPTURE_STOP",
-                        "Android stopped screen capture (phone locked or permission ended). Re-approval needed to resume video.",
-                        "MediaProjection.Callback.onStop"
-                    )
-                    onProjectionStoppedBySystem()
+        synchronized(projectionCallbackLock) {
+            val cbThread = HandlerThread("SolProjectionCb").apply { start() }
+            callbackHandlerThread = cbThread
+            val cb = object : MediaProjection.Callback() {
+                override fun onStop() {
+                    if (isRunning) {
+                        DiagnosticsLogger.log(
+                            "CAPTURE_STOP",
+                            "Android stopped screen capture (phone locked or permission ended). Re-approval needed to resume video.",
+                            "MediaProjection.Callback.onStop"
+                        )
+                        onProjectionStoppedBySystem()
+                    }
                 }
-            }
 
-            override fun onCapturedContentResize(width: Int, height: Int) {
-                val safeW = evenDimension(width)
-                val safeH = evenDimension(height)
-                if (isRunning && safeW >= 128 && safeH >= 128) {
-                    pendingCaptureWidth = safeW
-                    pendingCaptureHeight = safeH
+                override fun onCapturedContentResize(width: Int, height: Int) {
+                    val safeW = evenDimension(width)
+                    val safeH = evenDimension(height)
+                    if (isRunning && safeW >= 128 && safeH >= 128) {
+                        pendingCaptureWidth = safeW
+                        pendingCaptureHeight = safeH
+                    }
                 }
-            }
 
-            override fun onCapturedContentVisibilityChanged(isVisible: Boolean) {
-                if (isRunning && !isVisible) {
-                    DiagnosticsLogger.log(
-                        "CAPTURE_VIS",
-                        "Single-app capture target moved to background; holding steady broadcast cadence.",
-                        "visible=false"
-                    )
+                override fun onCapturedContentVisibilityChanged(isVisible: Boolean) {
+                    if (isRunning && !isVisible) {
+                        DiagnosticsLogger.log(
+                            "CAPTURE_VIS",
+                            "Single-app capture target moved to background; holding steady broadcast cadence.",
+                            "visible=false"
+                        )
+                    }
                 }
             }
+            projectionRef = mediaProjection
+            projectionCallback = cb
+            mediaProjection.registerCallback(cb, Handler(cbThread.looper))
         }
-        projectionRef = mediaProjection
-        projectionCallback = cb
-        mediaProjection.registerCallback(cb, Handler(cbThread.looper))
 
         isRunning = true
 
         drainThread = Thread({
             runEncoderDrainLoop(
                 codec = codec,
-                codecKey = chosenReport.codecKey,
+                codecKey = finalReport.codecKey,
                 originTimeUs = originTimeNs / 1000L,
                 isPrimaryStream = true,
                 onVideoConfig = onVideoConfig,
@@ -423,7 +505,6 @@ class SolVideoPipeline(private val context: Context) {
             )
         }, "SolVideoDrain").apply { start() }
 
-        // Initialize primaryReady = false inside AtomicReference; only set true AFTER EGL + SurfaceTexture + VirtualDisplay succeed!
         val eglLatch = CountDownLatch(1)
         val eglInitRef = AtomicReference(
             EglInitResult(
@@ -444,7 +525,7 @@ class SolVideoPipeline(private val context: Context) {
                 companionWidth = compAlignedW,
                 companionHeight = compAlignedH,
                 preferGlEs30 = preferEs30,
-                use10BitEgl = configured.actualIsHdr10,
+                use10BitEgl = finalConfigured.actualIsHdr10,
                 initialCapWidth = capWidth,
                 initialCapHeight = capHeight,
                 densityDpi = densityDpi,
@@ -501,14 +582,14 @@ class SolVideoPipeline(private val context: Context) {
             releaseCompanionCodecSafely()
         }
 
-        val finalHdrActive = configured.actualIsHdr10 && eglInitResult.actualIs10Bit
+        val finalHdrActive = finalConfigured.actualIsHdr10 && eglInitResult.actualIs10Bit
         return ActiveVideoInfo(
-            codecKey = chosenReport.codecKey,
-            encoderName = chosenReport.encoderName,
+            codecKey = finalReport.codecKey,
+            encoderName = finalReport.encoderName,
             outWidth = outWidth,
             outHeight = outHeight,
             fps = targetFps,
-            isVbr = configured.actualIsVbr,
+            isVbr = finalConfigured.actualIsVbr,
             isHdr10 = finalHdrActive,
             glEngineLabel = eglInitResult.engineSummary,
             companionActive = verifiedCompanionActive
@@ -542,12 +623,11 @@ class SolVideoPipeline(private val context: Context) {
     }
 
     /**
-     * Thread-safe pipeline shutdown: joins worker threads and only releases codecs/VirtualDisplay
-     * on the caller thread if the corresponding worker thread has terminated; otherwise the worker
-     * thread's own finally block releases its resources upon exit.
+     * Thread-safe pipeline shutdown: unregisters MediaProjection callback first so no late
+     * [CAPTURE_STOP] event fires, then joins worker threads and releases codecs/VirtualDisplay safely.
      */
     fun stopPipeline() {
-        isRunning = false
+        prepareForImmediateStop()
         val rt = renderThread
         val dt = drainThread
         val cdt = companionDrainThread
@@ -575,15 +655,6 @@ class SolVideoPipeline(private val context: Context) {
             releaseCompanionCodecSafely()
         }
 
-        projectionCallback?.let { cb ->
-            try { projectionRef?.unregisterCallback(cb) } catch (_: Exception) {}
-        }
-        projectionCallback = null
-        projectionRef = null
-
-        try { callbackHandlerThread?.quitSafely() } catch (_: Exception) {}
-        callbackHandlerThread = null
-
         actualEncodedFps = 0
         actualEncodedBitrateBps = 0
         actualFreshCaptureFps = 0
@@ -608,22 +679,29 @@ class SolVideoPipeline(private val context: Context) {
         }
     }
 
-    private fun resolveSafeHardwareEncoder(
+    /**
+     * Builds an ordered list of candidate hardware encoders (verifiedRealEncode -> verifiedSurfaceConfigure -> advertisedByMetadata)
+     * so startPipeline() can fall back to an alternate hardware encoder (e.g., HEVC -> H.264) if needed.
+     */
+    private fun resolveCandidateHardwareEncoders(
         scan: DeviceScanSummary,
         requestedCodec: String
-    ): HardwareEncoderReport? {
-        val primary = scan.findReport(requestedCodec)
-        if (primary != null && primary.verifiedRealEncode) return primary
-        if (scan.hevcHardware?.verifiedRealEncode == true && requestedCodec != "H264") {
-            return scan.hevcHardware
+    ): List<HardwareEncoderReport> {
+        val rawCandidates = buildList {
+            scan.findReport(requestedCodec)?.let { add(it) }
+            if (requestedCodec != "H264") {
+                scan.hevcHardware?.let { add(it) }
+            }
+            scan.h264Hardware?.let { add(it) }
+            scan.hevcHardware?.let { add(it) }
+        }.distinctBy { it.encoderName }
+
+        val realVerified = rawCandidates.filter { it.verifiedRealEncode }
+        val surfaceVerified = rawCandidates.filter { !it.verifiedRealEncode && it.verifiedSurfaceConfigure }
+        val metadataAdvertised = rawCandidates.filter {
+            !it.verifiedRealEncode && !it.verifiedSurfaceConfigure && it.advertisedByMetadata
         }
-        if (scan.h264Hardware?.verifiedRealEncode == true) return scan.h264Hardware
-        if (primary != null && primary.verifiedSurfaceConfigure) return primary
-        if (scan.hevcHardware?.verifiedSurfaceConfigure == true && requestedCodec != "H264") {
-            return scan.hevcHardware
-        }
-        return scan.h264Hardware?.takeIf { it.verifiedSurfaceConfigure }
-            ?: scan.hevcHardware?.takeIf { it.verifiedSurfaceConfigure }
+        return realVerified + surfaceVerified + metadataAdvertised
     }
 
     private fun selectSupportedProfileLevel(
@@ -744,11 +822,24 @@ class SolVideoPipeline(private val context: Context) {
                         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && settings.lowLatencyCodecHint && bFrames == 0) {
                             setInteger(MediaFormat.KEY_LATENCY, 1)
                         }
-                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && settings.qpMaxCap in 24..51 && attempt == 1) {
-                            val qpCap = settings.qpMaxCap
-                            setInteger(MediaFormat.KEY_VIDEO_QP_I_MAX, qpCap)
-                            setInteger(MediaFormat.KEY_VIDEO_QP_P_MAX, qpCap)
-                            setInteger(MediaFormat.KEY_VIDEO_QP_B_MAX, qpCap)
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                            // Command GraphicBufferSource not to silently drop incoming surface frames
+                            setInteger(MediaFormat.KEY_ALLOW_FRAME_DROP, 0)
+                            if (attempt == 1) {
+                                // Prevent encoder from wasting heat/power encoding below lossless QP 14 (fixes Avg QP: 5)
+                                val qpMin = 14
+                                setInteger(MediaFormat.KEY_VIDEO_QP_I_MIN, qpMin)
+                                setInteger(MediaFormat.KEY_VIDEO_QP_P_MIN, qpMin)
+                                setInteger(MediaFormat.KEY_VIDEO_QP_B_MIN, qpMin)
+                                if (settings.qpMaxCap in 24..51) {
+                                    val qpCap = settings.qpMaxCap
+                                    setInteger(MediaFormat.KEY_VIDEO_QP_I_MAX, qpCap)
+                                    setInteger(MediaFormat.KEY_VIDEO_QP_P_MAX, qpCap)
+                                    setInteger(MediaFormat.KEY_VIDEO_QP_B_MAX, qpCap)
+                                }
+                            }
+                        } else {
+                            setInteger("allow-frame-drop", 0)
                         }
                         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                             setInteger(
@@ -787,9 +878,10 @@ class SolVideoPipeline(private val context: Context) {
                 val inputSurface = created.createInputSurface()
                 created.start()
 
+                val outFmt = try { created.outputFormat } catch (_: Exception) { null }
                 val actualMode = try {
-                    if (created.outputFormat.containsKey(MediaFormat.KEY_BITRATE_MODE)) {
-                        created.outputFormat.getInteger(MediaFormat.KEY_BITRATE_MODE)
+                    if (outFmt != null && outFmt.containsKey(MediaFormat.KEY_BITRATE_MODE)) {
+                        outFmt.getInteger(MediaFormat.KEY_BITRATE_MODE)
                     } else {
                         requestedMode
                     }
@@ -797,6 +889,22 @@ class SolVideoPipeline(private val context: Context) {
                     requestedMode
                 }
                 val isActualVbr = actualMode == MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR
+
+                // Verify the encoder did not silently downgrade HDR10 (HLG/BT.2020) back to 8-bit SDR
+                val verifiedHdrOutput = if (tryHdrThisAttempt) {
+                    try {
+                        val trf = if (outFmt != null && outFmt.containsKey(MediaFormat.KEY_COLOR_TRANSFER)) {
+                            outFmt.getInteger(MediaFormat.KEY_COLOR_TRANSFER)
+                        } else {
+                            MediaFormat.COLOR_TRANSFER_HLG
+                        }
+                        trf == MediaFormat.COLOR_TRANSFER_HLG || trf == MediaFormat.COLOR_TRANSFER_ST2084
+                    } catch (_: Exception) {
+                        true
+                    }
+                } else {
+                    false
+                }
 
                 if (attempt > 1) {
                     DiagnosticsLogger.log(
@@ -809,14 +917,14 @@ class SolVideoPipeline(private val context: Context) {
                     codec = created,
                     inputSurface = inputSurface,
                     actualIsVbr = isActualVbr,
-                    actualIsHdr10 = tryHdrThisAttempt
+                    actualIsHdr10 = verifiedHdrOutput
                 )
             } catch (e: Exception) {
                 try { codec?.release() } catch (_: Exception) {}
                 if (attempt == 3) {
                     DiagnosticsLogger.log(
                         "VIDEO_ERR",
-                        "Hardware encoder ${report.encoderName} rejected configuration.",
+                        "Hardware encoder ${report.encoderName} rejected ${width}x${height}@${fps} configuration.",
                         "${e.javaClass.simpleName}: ${e.message}"
                     )
                 }
@@ -922,6 +1030,7 @@ class SolVideoPipeline(private val context: Context) {
         var oesProg = 0
         var rgbaProg = 0
         var initNotified = false
+        var adpfSession: PerformanceHintManager.Session? = null
 
         var sceneTexId = 0
         var loadedSceneSlotKey = ""
@@ -932,6 +1041,17 @@ class SolVideoPipeline(private val context: Context) {
         var seenAssetRevision = -1
 
         try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                try {
+                    val phm = context.getSystemService(PerformanceHintManager::class.java)
+                    adpfSession = phm?.createHintSession(
+                        intArrayOf(Process.myTid()),
+                        1_000_000_000L / max(30, targetFps).toLong()
+                    )
+                } catch (_: Throwable) {
+                }
+            }
+
             eglDisplay = EGL14.eglGetDisplay(EGL14.EGL_DEFAULT_DISPLAY)
             if (eglDisplay == EGL14.EGL_NO_DISPLAY) {
                 throw IllegalStateException("EGL_DEFAULT_DISPLAY unavailable")
@@ -1050,7 +1170,6 @@ class SolVideoPipeline(private val context: Context) {
                 virtualDisplay = createdVd
             }
 
-            // Signal startup readiness ONLY AFTER EGL + shaders + SurfaceTexture + VirtualDisplay all succeeded!
             val summary = "OpenGL ES $glClientVer.0" + (if (actual10BitEgl) " (10-Bit HDR)" else "")
             activeGlEngineSummary = summary
             initNotified = true
@@ -1063,7 +1182,7 @@ class SolVideoPipeline(private val context: Context) {
                     engineSummary = summary
                 )
             )
-            DiagnosticsLogger.log("GL_INIT", "Initialized $activeGlEngineSummary direct TBDR render pipeline.")
+            DiagnosticsLogger.log("GL_INIT", "Initialized $activeGlEngineSummary SolCore Ultra render pipeline.")
 
             val fullQuadVerts = GlShaderBank.createFloatBuffer(
                 floatArrayOf(-1f, -1f, 1f, -1f, -1f, 1f, 1f, 1f)
@@ -1115,6 +1234,7 @@ class SolVideoPipeline(private val context: Context) {
                     continue
                 }
 
+                val workStartNs = System.nanoTime()
                 nextRenderNs += frameIntervalNs
                 if (nowNs - nextRenderNs > frameIntervalNs * 2) {
                     nextRenderNs = nowNs + frameIntervalNs
@@ -1149,6 +1269,7 @@ class SolVideoPipeline(private val context: Context) {
                         false
                     }
                 }
+                var isFreshGameFrame = false
                 if (pullNewTexture) {
                     st.updateTexImage()
                     st.getTransformMatrix(stMatrix)
@@ -1156,6 +1277,7 @@ class SolVideoPipeline(private val context: Context) {
                     if (curTs != lastSurfaceTsNs) {
                         lastSurfaceTsNs = curTs
                         freshFramesInWindow++
+                        isFreshGameFrame = true
                     } else {
                         repeatedFramesTotal++
                     }
@@ -1284,6 +1406,7 @@ class SolVideoPipeline(private val context: Context) {
                     overlayTexId = overlayTexId,
                     bannerTexId = bannerTexId,
                     hasFirstFrame = hasFirstFrame,
+                    isFreshGameFrame = isFreshGameFrame,
                     srcW = activeCapW,
                     srcH = activeCapH,
                     dstW = outWidth,
@@ -1327,6 +1450,7 @@ class SolVideoPipeline(private val context: Context) {
                             overlayTexId = overlayTexId,
                             bannerTexId = bannerTexId,
                             hasFirstFrame = hasFirstFrame,
+                            isFreshGameFrame = isFreshGameFrame,
                             srcW = activeCapW,
                             srcH = activeCapH,
                             dstW = companionWidth,
@@ -1351,6 +1475,13 @@ class SolVideoPipeline(private val context: Context) {
                         }
                     }
                 }
+
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && adpfSession != null) {
+                    try {
+                        adpfSession.reportActualWorkDuration(System.nanoTime() - workStartNs)
+                    } catch (_: Throwable) {
+                    }
+                }
             }
         } catch (e: Exception) {
             if (!initNotified) {
@@ -1372,6 +1503,9 @@ class SolVideoPipeline(private val context: Context) {
             }
         } finally {
             renderThread = null
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                try { adpfSession?.close() } catch (_: Throwable) {}
+            }
             releaseVirtualDisplaySafely()
             try { captureSurface?.release() } catch (_: Exception) {}
             try { surfaceTexture?.release() } catch (_: Exception) {}
@@ -1411,6 +1545,7 @@ class SolVideoPipeline(private val context: Context) {
         overlayTexId: Int,
         bannerTexId: Int,
         hasFirstFrame: Boolean,
+        isFreshGameFrame: Boolean,
         srcW: Int,
         srcH: Int,
         dstW: Int,
@@ -1461,6 +1596,7 @@ class SolVideoPipeline(private val context: Context) {
                             srcW = srcW,
                             srcH = srcH,
                             isBlurPass = true,
+                            isFreshFrame = isFreshGameFrame,
                             isHdr10 = isHdr10Surface
                         )
                     }
@@ -1477,6 +1613,7 @@ class SolVideoPipeline(private val context: Context) {
                         srcW = srcW,
                         srcH = srcH,
                         isBlurPass = true,
+                        isFreshFrame = isFreshGameFrame,
                         isHdr10 = isHdr10Surface
                     )
                 }
@@ -1503,6 +1640,7 @@ class SolVideoPipeline(private val context: Context) {
             srcW = srcW,
             srcH = srcH,
             isBlurPass = false,
+            isFreshFrame = isFreshGameFrame,
             isHdr10 = isHdr10Surface
         )
 
@@ -1529,6 +1667,7 @@ class SolVideoPipeline(private val context: Context) {
                 srcW = srcW,
                 srcH = srcH,
                 isBlurPass = true,
+                isFreshFrame = isFreshGameFrame,
                 isHdr10 = isHdr10Surface
             )
             GLES20.glDisable(GLES20.GL_SCISSOR_TEST)
@@ -1553,6 +1692,7 @@ class SolVideoPipeline(private val context: Context) {
         srcW: Int,
         srcH: Int,
         isBlurPass: Boolean,
+        isFreshFrame: Boolean,
         isHdr10: Boolean
     ) {
         GLES20.glUseProgram(h.programId)
@@ -1564,24 +1704,47 @@ class SolVideoPipeline(private val context: Context) {
         GLES20.glUniformMatrix4fv(h.uTexMatLoc, 1, false, texMatrix, 0)
         GLES20.glUniform2f(h.uTexelStepLoc, 1.0f / srcW.toFloat(), 1.0f / srcH.toFloat())
 
-        val upscalerVal = when (liveUpscalerMode) {
+        // Repeat-Frame 1-Tap Cooler: when Stage-1 Moderate Warmth cooler is active (>=44.0°C & >=90% SoC),
+        // repeat ticks use 1-tap hardware fetch while every fresh game frame gets full Bicubic/Lanczos!
+        val rawUpscalerVal = when (liveUpscalerMode) {
             "BILINEAR" -> 0.0f
             "LANCZOS" -> 2.0f
             else -> 1.0f
         }
+        val effectiveUpscalerVal = if (isBlurPass || (thermalModerateCoolerActive && !isFreshFrame)) {
+            0.0f
+        } else {
+            rawUpscalerVal
+        }
+
         val tempShift = when (liveColorTempFilter) {
             "WARM" -> 1.0f
             "COOL" -> -1.0f
             else -> 0.0f
         }
 
-        GLES20.glUniform1f(h.uUpscalerLoc, if (isBlurPass) 0.0f else upscalerVal)
+        val shadowVal = if (!isBlurPass && !isHdr10 && liveShadowBoost) 1.0f else 0.0f
+        val filmicVal = if (!isBlurPass && !isHdr10 && liveCinematicFilmic) 1.0f else 0.0f
+        val vividVal = if (!isBlurPass && !isHdr10 && liveAmoledVivid) 1.0f else 0.0f
+        val tempVal = if (!isBlurPass && !isHdr10) tempShift else 0.0f
+        val sharpVal = if (!isBlurPass && liveGpuSharpen) 0.34f else 0.0f
+
+        val fastPassthrough = !isBlurPass &&
+            effectiveUpscalerVal < 0.5f &&
+            shadowVal < 0.5f &&
+            filmicVal < 0.5f &&
+            vividVal < 0.5f &&
+            kotlin.math.abs(tempVal) < 0.1f &&
+            sharpVal < 0.01f
+
+        GLES20.glUniform1f(h.uFastPassthroughLoc, if (fastPassthrough) 1.0f else 0.0f)
+        GLES20.glUniform1f(h.uUpscalerLoc, effectiveUpscalerVal)
         GLES20.glUniform1f(h.uBlurModeLoc, if (isBlurPass) 1.0f else 0.0f)
-        GLES20.glUniform1f(h.uShadowBoostLoc, if (!isBlurPass && !isHdr10 && liveShadowBoost) 1.0f else 0.0f)
-        GLES20.glUniform1f(h.uFilmicLoc, if (!isBlurPass && !isHdr10 && liveCinematicFilmic) 1.0f else 0.0f)
-        GLES20.glUniform1f(h.uVividLoc, if (!isBlurPass && !isHdr10 && liveAmoledVivid) 1.0f else 0.0f)
-        GLES20.glUniform1f(h.uTempShiftLoc, if (!isBlurPass && !isHdr10) tempShift else 0.0f)
-        GLES20.glUniform1f(h.uSharpenLoc, if (!isBlurPass && liveGpuSharpen) 0.34f else 0.0f)
+        GLES20.glUniform1f(h.uShadowBoostLoc, shadowVal)
+        GLES20.glUniform1f(h.uFilmicLoc, filmicVal)
+        GLES20.glUniform1f(h.uVividLoc, vividVal)
+        GLES20.glUniform1f(h.uTempShiftLoc, tempVal)
+        GLES20.glUniform1f(h.uSharpenLoc, sharpVal)
 
         verts.position(0)
         GLES20.glEnableVertexAttribArray(h.aPosLoc)
@@ -1645,26 +1808,36 @@ class SolVideoPipeline(private val context: Context) {
     ) {
         val srcAspect = srcW.toFloat() / srcH.toFloat()
         val dstAspect = dstW.toFloat() / dstH.toFloat()
+        val sameOrientation = (srcW >= srcH) == (dstW >= dstH)
 
         var scaleX = 1.0f
         var scaleY = 1.0f
 
-        if (mode == "FILL") {
-            if (srcAspect > dstAspect) {
-                scaleX = srcAspect / dstAspect
-            } else {
-                scaleY = dstAspect / srcAspect
+        when {
+            // STRETCH (Full 16:9 Zero-Bars): maps all 4 corners of phone screen directly to all 4 corners
+            // of 360p, 480p, 720p, 1080p, 1440p, or 4K landscape stream with zero black bars & 100% HUD!
+            mode == "STRETCH" && sameOrientation -> {
+                scaleX = 1.0f
+                scaleY = 1.0f
             }
-        } else {
-            if (srcAspect > dstAspect) {
-                scaleY = dstAspect / srcAspect
-            } else {
-                scaleX = srcAspect / dstAspect
+            mode == "FILL" -> {
+                if (srcAspect > dstAspect) {
+                    scaleX = srcAspect / dstAspect
+                } else {
+                    scaleY = dstAspect / srcAspect
+                }
             }
-            if (mode == "SMART") {
-                val zoom = (smartZoomPct.coerceIn(100, 125)) / 100.0f
-                scaleX *= zoom
-                scaleY *= zoom
+            else -> {
+                if (srcAspect > dstAspect) {
+                    scaleY = dstAspect / srcAspect
+                } else {
+                    scaleX = srcAspect / dstAspect
+                }
+                if (mode == "SMART") {
+                    val zoom = (smartZoomPct.coerceIn(100, 125)) / 100.0f
+                    scaleX *= zoom
+                    scaleY *= zoom
+                }
             }
         }
 
@@ -1684,8 +1857,9 @@ class SolVideoPipeline(private val context: Context) {
         onEncodedVideo: (ByteBuffer, MediaCodec.BufferInfo) -> Unit
     ) {
         val bufferInfo = MediaCodec.BufferInfo()
-        val packetPool = Array(16) { ByteBuffer.allocateDirect(1_048_576) }
-        val infoPool = Array(16) { MediaCodec.BufferInfo() }
+        // Trimmed 6-slot direct buffer pool (saves ~11-15 MB idle PSS while keeping zero-GC operation)
+        val packetPool = Array(6) { ByteBuffer.allocateDirect(786_432) }
+        val infoPool = Array(6) { MediaCodec.BufferInfo() }
         var poolIdx = 0
 
         var ptsBaseLocked = false
@@ -1813,7 +1987,7 @@ class SolVideoPipeline(private val context: Context) {
                         actualEncodedFps = ((framesInWindow * 1000L) / elapsedMs).toInt()
                         actualEncodedBitrateBps = ((bytesInWindow * 8000L) / elapsedMs).toInt()
                         DiagnosticsLogger.lastEncodedFps = actualEncodedFps
-                        DiagnosticsLogger.lastBitrateKbps = actualEncodedBitrateBps / 1000
+                        DiagnosticsLogger.recordBitrateSample(actualEncodedBitrateBps / 1000)
                         if (qpCountInWindow > 0) {
                             DiagnosticsLogger.lastAverageQp = (qpSumInWindow / qpCountInWindow).toInt()
                         }
@@ -2069,6 +2243,32 @@ class SolVideoPipeline(private val context: Context) {
             if (report.supports480p) return Triple(854, 480, 30)
             return Triple(1280, 720, 30)
         }
+
+        /**
+         * Builds a descending resolution/FPS fallback ladder starting from (startLong, startShort, startFps)
+         * so if a hardware encoder rejects its top advertised profile during live startup, startPipeline()
+         * automatically retries lower supported profiles before failing.
+         */
+        internal fun buildResolutionFallbackLadder(
+            report: HardwareEncoderReport,
+            startLong: Int,
+            startShort: Int,
+            startFps: Int
+        ): List<Triple<Int, Int, Int>> {
+            val allTiers = buildList {
+                add(Triple(startLong, startShort, startFps))
+                if (startLong >= 2560 && startFps >= 60 && (report.supports1440p30 || report.supports1440p60)) {
+                    add(Triple(2560, 1440, 30))
+                }
+                if (report.supports1080p60 && startFps >= 60) add(Triple(1920, 1080, 60))
+                if (report.supports1080p30 || report.supports1080p60) add(Triple(1920, 1080, 30))
+                if (report.supports720p60 && startFps >= 60) add(Triple(1280, 720, 60))
+                if (report.supports720p30 || report.supports720p60) add(Triple(1280, 720, 30))
+                if (report.supports480p) add(Triple(854, 480, 30))
+                if (report.supports360p) add(Triple(640, 360, 30))
+            }
+            return allTiers.distinct()
+        }
     }
 
     private object GlShaderBank {
@@ -2081,6 +2281,7 @@ class SolVideoPipeline(private val context: Context) {
             val uTexMatLoc: Int,
             val uTexSamplerLoc: Int,
             val uTexelStepLoc: Int,
+            val uFastPassthroughLoc: Int,
             val uUpscalerLoc: Int,
             val uBlurModeLoc: Int,
             val uShadowBoostLoc: Int,
@@ -2098,20 +2299,33 @@ class SolVideoPipeline(private val context: Context) {
             val uSamplerLoc: Int
         )
 
+        // Precomputed Vertex-Stage Cardinal Neighbor UV Offsets (computed 4 times/frame instead of 3.68M times/frame!)
         private const val OES_VS_ES30 = """#version 300 es
+            precision highp float;
             uniform mat4 uMVPMatrix;
             uniform mat4 uTexMatrix;
+            uniform vec2 uTexelStep;
             in vec4 aPosition;
             in vec4 aTexCoord;
             out vec2 vTexCoord;
+            out vec2 vUvN;
+            out vec2 vUvS;
+            out vec2 vUvE;
+            out vec2 vUvW;
             void main() {
                 gl_Position = uMVPMatrix * aPosition;
-                vTexCoord = (uTexMatrix * aTexCoord).xy;
+                vec2 uv = (uTexMatrix * aTexCoord).xy;
+                vTexCoord = uv;
+                vUvN = uv + vec2(0.0, uTexelStep.y);
+                vUvS = uv - vec2(0.0, uTexelStep.y);
+                vUvE = uv + vec2(uTexelStep.x, 0.0);
+                vUvW = uv - vec2(uTexelStep.x, 0.0);
             }
         """
 
         private const val OES_FS_BODY_CORE = """
             uniform vec2 uTexelStep;
+            uniform float uFastPassthrough;
             uniform float uUpscaler;
             uniform float uBlurMode;
             uniform float uShadowBoost;
@@ -2120,14 +2334,14 @@ class SolVideoPipeline(private val context: Context) {
             uniform float uTempShift;
             uniform float uSharpen;
 
-            vec3 applyOrderedVisualFilters(vec3 baseCol, vec2 uv) {
+            vec3 applyOrderedVisualFilters(vec3 baseCol) {
                 vec3 col = baseCol;
 
                 if (uSharpen > 0.01) {
-                    vec3 n = TEX_FETCH(sTexture, uv + vec2(0.0, uTexelStep.y)).rgb;
-                    vec3 s = TEX_FETCH(sTexture, uv - vec2(0.0, uTexelStep.y)).rgb;
-                    vec3 e = TEX_FETCH(sTexture, uv + vec2(uTexelStep.x, 0.0)).rgb;
-                    vec3 w = TEX_FETCH(sTexture, uv - vec2(uTexelStep.x, 0.0)).rgb;
+                    vec3 n = TEX_FETCH(sTexture, vUvN).rgb;
+                    vec3 s = TEX_FETCH(sTexture, vUvS).rgb;
+                    vec3 e = TEX_FETCH(sTexture, vUvE).rgb;
+                    vec3 w = TEX_FETCH(sTexture, vUvW).rgb;
                     vec3 minN = min(min(n, s), min(e, min(w, col)));
                     vec3 maxN = max(max(n, s), max(e, max(w, col)));
                     vec3 contrastHeadroom = clamp(min(minN, 1.0 - maxN) / max(maxN, vec3(0.001)), 0.0, 1.0);
@@ -2198,10 +2412,10 @@ class SolVideoPipeline(private val context: Context) {
                 }
 
                 vec3 c0 = TEX_FETCH(sTexture, uv).rgb;
-                vec3 cn = TEX_FETCH(sTexture, uv + vec2(0.0, uTexelStep.y)).rgb;
-                vec3 cs = TEX_FETCH(sTexture, uv - vec2(0.0, uTexelStep.y)).rgb;
-                vec3 ce = TEX_FETCH(sTexture, uv + vec2(uTexelStep.x, 0.0)).rgb;
-                vec3 cw = TEX_FETCH(sTexture, uv - vec2(uTexelStep.x, 0.0)).rgb;
+                vec3 cn = TEX_FETCH(sTexture, vUvN).rgb;
+                vec3 cs = TEX_FETCH(sTexture, vUvS).rgb;
+                vec3 ce = TEX_FETCH(sTexture, vUvE).rgb;
+                vec3 cw = TEX_FETCH(sTexture, vUvW).rgb;
                 vec3 d1 = TEX_FETCH(sTexture, uv + uTexelStep).rgb;
                 vec3 d2 = TEX_FETCH(sTexture, uv - uTexelStep).rgb;
                 vec3 d3 = TEX_FETCH(sTexture, uv + vec2(uTexelStep.x, -uTexelStep.y)).rgb;
@@ -2217,27 +2431,46 @@ class SolVideoPipeline(private val context: Context) {
             #extension GL_OES_EGL_image_external_essl3 : require
             precision highp float;
             in vec2 vTexCoord;
+            in vec2 vUvN;
+            in vec2 vUvS;
+            in vec2 vUvE;
+            in vec2 vUvW;
             uniform samplerExternalOES sTexture;
             out vec4 fragColor;
             ${OES_FS_BODY_CORE.replace("TEX_FETCH", "texture")}
             void main() {
+                if (uFastPassthrough > 0.5) {
+                    fragColor = vec4(texture(sTexture, vTexCoord).rgb, 1.0);
+                    return;
+                }
                 vec3 col = sampleGameSpatial(vTexCoord);
                 if (uBlurMode < 0.5) {
-                    col = applyOrderedVisualFilters(col, vTexCoord);
+                    col = applyOrderedVisualFilters(col);
                 }
                 fragColor = vec4(col, 1.0);
             }
         """
 
         private const val OES_VS_ES20 = """
+            precision highp float;
             uniform mat4 uMVPMatrix;
             uniform mat4 uTexMatrix;
+            uniform vec2 uTexelStep;
             attribute vec4 aPosition;
             attribute vec4 aTexCoord;
             varying vec2 vTexCoord;
+            varying vec2 vUvN;
+            varying vec2 vUvS;
+            varying vec2 vUvE;
+            varying vec2 vUvW;
             void main() {
                 gl_Position = uMVPMatrix * aPosition;
-                vTexCoord = (uTexMatrix * aTexCoord).xy;
+                vec2 uv = (uTexMatrix * aTexCoord).xy;
+                vTexCoord = uv;
+                vUvN = uv + vec2(0.0, uTexelStep.y);
+                vUvS = uv - vec2(0.0, uTexelStep.y);
+                vUvE = uv + vec2(uTexelStep.x, 0.0);
+                vUvW = uv - vec2(uTexelStep.x, 0.0);
             }
         """
 
@@ -2245,12 +2478,20 @@ class SolVideoPipeline(private val context: Context) {
             #extension GL_OES_EGL_image_external : require
             precision highp float;
             varying vec2 vTexCoord;
+            varying vec2 vUvN;
+            varying vec2 vUvS;
+            varying vec2 vUvE;
+            varying vec2 vUvW;
             uniform samplerExternalOES sTexture;
             ${OES_FS_BODY_CORE.replace("TEX_FETCH", "texture2D")}
             void main() {
+                if (uFastPassthrough > 0.5) {
+                    gl_FragColor = vec4(texture2D(sTexture, vTexCoord).rgb, 1.0);
+                    return;
+                }
                 vec3 col = sampleGameSpatial(vTexCoord);
                 if (uBlurMode < 0.5) {
-                    col = applyOrderedVisualFilters(col, vTexCoord);
+                    col = applyOrderedVisualFilters(col);
                 }
                 gl_FragColor = vec4(col, 1.0);
             }
@@ -2295,6 +2536,7 @@ class SolVideoPipeline(private val context: Context) {
                 uTexMatLoc = GLES20.glGetUniformLocation(prog, "uTexMatrix"),
                 uTexSamplerLoc = GLES20.glGetUniformLocation(prog, "sTexture"),
                 uTexelStepLoc = GLES20.glGetUniformLocation(prog, "uTexelStep"),
+                uFastPassthroughLoc = GLES20.glGetUniformLocation(prog, "uFastPassthrough"),
                 uUpscalerLoc = GLES20.glGetUniformLocation(prog, "uUpscaler"),
                 uBlurModeLoc = GLES20.glGetUniformLocation(prog, "uBlurMode"),
                 uShadowBoostLoc = GLES20.glGetUniformLocation(prog, "uShadowBoost"),
