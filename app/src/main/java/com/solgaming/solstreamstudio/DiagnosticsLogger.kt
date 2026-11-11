@@ -103,7 +103,7 @@ object DiagnosticsLogger {
 
     @Volatile var sessionStartMs: Long = 0L
     @Volatile var activePipelineDesc: String = "Idle (Not Streaming)"
-    @Volatile var activeAudioDspDesc: String = "SOL LUXE 32-Bit Float + C RNNoise"
+    @Volatile var activeAudioDspDesc: String = "SolLuxe 32-Bit Float + C RNNoise"
     @Volatile var activeSimulcastDesc: String = "Primary Only"
     @Volatile var startTempC: Float = 0f
     @Volatile var peakTempC: Float = 0f
@@ -119,6 +119,8 @@ object DiagnosticsLogger {
     @Volatile var droppedVideoFrames: Int = 0
     @Volatile var reconnectAttempts: Int = 0
     @Volatile var lastBitrateKbps: Int = 0
+    @Volatile private var bitrateSamplesSumKbps: Long = 0L
+    @Volatile private var bitrateSamplesCount: Long = 0L
     @Volatile var lastEncodedFps: Int = 0
     @Volatile var freshCaptureFps: Int = 0
     @Volatile var repeatedFramesCount: Long = 0L
@@ -129,6 +131,7 @@ object DiagnosticsLogger {
     @Volatile var lastRttMs: Long = -1L
     @Volatile var avDriftMs: Long = 0L
     @Volatile var micStatusLabel: String = "Ready"
+    @Volatile var lastActiveAudioPolicySnapshot: String = ""
 
     fun installPrivacySafeCrashHandler(context: Context) {
         if (crashHandlerInstalled) return
@@ -160,6 +163,24 @@ object DiagnosticsLogger {
         return input
             .replace(secretUrlRegex, "$1[REDACTED_KEY]")
             .replace(queryKeyRegex, "$1[REDACTED]")
+    }
+
+    @Synchronized
+    fun recordBitrateSample(kbps: Int) {
+        lastBitrateKbps = kbps
+        if (kbps > 0) {
+            bitrateSamplesSumKbps += kbps.toLong()
+            bitrateSamplesCount++
+        }
+    }
+
+    @Synchronized
+    fun getSessionAverageBitrateKbps(): Int {
+        return if (bitrateSamplesCount > 0L) {
+            (bitrateSamplesSumKbps / bitrateSamplesCount).toInt()
+        } else {
+            lastBitrateKbps
+        }
     }
 
     @Synchronized
@@ -199,6 +220,8 @@ object DiagnosticsLogger {
         droppedVideoFrames = 0
         reconnectAttempts = 0
         lastBitrateKbps = 0
+        bitrateSamplesSumKbps = 0L
+        bitrateSamplesCount = 0L
         lastEncodedFps = 0
         freshCaptureFps = 0
         repeatedFramesCount = 0L
@@ -208,6 +231,8 @@ object DiagnosticsLogger {
         lastQueueCapacity = -1
         lastRttMs = -1L
         avDriftMs = 0L
+        lastActiveAudioPolicySnapshot = ""
+        captureLiveAudioPolicySnapshot(context)
         log(
             "SESSION",
             "$modeTitle started ($pipelineDesc).",
@@ -230,6 +255,27 @@ object DiagnosticsLogger {
         )
     }
 
+    fun captureLiveAudioPolicySnapshot(context: Context) {
+        try {
+            val am = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+            val configs: List<AudioRecordingConfiguration> = am.activeRecordingConfigurations
+            if (configs.isNotEmpty()) {
+                lastActiveAudioPolicySnapshot = configs.joinToString(" | ") { cfg ->
+                    val dev = cfg.audioDevice
+                    val devLabel = if (dev != null) {
+                        "${dev.productName} (${audioDeviceTypeName(dev.type)})"
+                    } else {
+                        "Default Routing"
+                    }
+                    val silenced = if (cfg.isClientSilenced) "SILENCED" else "ACTIVE"
+                    val fmt = cfg.format
+                    "Session#${cfg.clientAudioSessionId}: $silenced via $devLabel (${fmt.sampleRate}Hz/${fmt.channelCount}ch)"
+                }
+            }
+        } catch (_: Exception) {
+        }
+    }
+
     fun sampleDeviceHealth(context: Context): Pair<Float, Int> {
         val t = readBatteryTempC(context)
         val s = readThermalStatus(context)
@@ -242,6 +288,9 @@ object DiagnosticsLogger {
         if (headroom > 0f) lastThermalHeadroom = headroom
         val battPct = readBatteryPercentage(context)
         if (battPct in 1..100) lastBatteryPercent = battPct
+        if (SolStreamService.isBroadcastLive) {
+            captureLiveAudioPolicySnapshot(context)
+        }
         sampleMemoryFootprint()
         return t to s
     }
@@ -379,23 +428,15 @@ object DiagnosticsLogger {
     }
 
     private fun buildActiveAudioPolicySummary(context: Context): String {
-        return try {
-            val am = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
-            val configs: List<AudioRecordingConfiguration> = am.activeRecordingConfigurations
-            if (configs.isEmpty()) return "No active AudioRecord sessions"
-            configs.joinToString(" | ") { cfg ->
-                val dev = cfg.audioDevice
-                val devLabel = if (dev != null) {
-                    "${dev.productName} (${audioDeviceTypeName(dev.type)})"
-                } else {
-                    "Default Routing"
-                }
-                val silenced = if (cfg.isClientSilenced) "SILENCED" else "ACTIVE"
-                "Session#${cfg.clientAudioSessionId}: $silenced via $devLabel"
+        captureLiveAudioPolicySnapshot(context)
+        if (lastActiveAudioPolicySnapshot.isNotBlank()) {
+            return if (SolStreamService.isBroadcastLive) {
+                lastActiveAudioPolicySnapshot
+            } else {
+                "$lastActiveAudioPolicySnapshot (Captured Live)"
             }
-        } catch (_: Exception) {
-            "Audio policy query unavailable"
         }
+        return "No active AudioRecord sessions"
     }
 
     @Synchronized
@@ -408,7 +449,8 @@ object DiagnosticsLogger {
         val lastCrash = prefs.getString(KEY_LAST_CRASH, null)
 
         val sb = StringBuilder()
-        sb.appendLine("=== SOLSTREAM STUDIO ULTRA — AUTOMATIC SESSION REPORT ===")
+        sb.appendLine("=== SOLSTREAM STUDIO ULTRA (SolApex™ HyperStream Engine) — AUTOMATIC SESSION REPORT ===")
+        sb.appendLine("Engine Architecture: SolApex™ HyperStream (Video: SolCore Ultra | Audio: SolLuxe | Broadcast: SolRelay Omega | Silicon: SolCodec)")
         sb.appendLine("Privacy Guarantee: Stream keys, notifications, and voice audio are NEVER included.")
         sb.appendLine(
             "Device: ${scan.deviceModel} (${scan.socModel}) | Android ${scan.androidRelease} (API ${scan.sdkInt}) | RAM: ${scan.totalRamGb}GB | Display: ${scan.maxDisplayHz}Hz | GL: ${scan.maxGlEsVersion}"
@@ -418,7 +460,8 @@ object DiagnosticsLogger {
         )
         sb.appendLine("Active Pipeline: $activePipelineDesc | Audio DSP: $activeAudioDspDesc")
 
-        val mbps = String.format(Locale.US, "%.2f Mbps", lastBitrateKbps / 1000.0)
+        val latestMbps = String.format(Locale.US, "%.2f Mbps", lastBitrateKbps / 1000.0)
+        val avgMbps = String.format(Locale.US, "%.2f Mbps", getSessionAverageBitrateKbps() / 1000.0)
         val queueStr = when {
             lastQueueFrames >= 0 && lastQueueCapacity > 0 && lastQueueBytes >= 0L ->
                 "$lastQueueFrames/$lastQueueCapacity frames (${lastQueueBytes / 1024} KB)"
@@ -431,11 +474,11 @@ object DiagnosticsLogger {
         val qpStr = if (lastAverageQp >= 0) "$lastAverageQp" else "N/A"
 
         sb.appendLine(
-            "Latest Live Metrics: $mbps | Out FPS: $lastEncodedFps (Fresh Game FPS: $freshCaptureFps, Repeat Paced: $repeatedFramesCount, Avg QP: $qpStr) | Send Queue: $queueStr | RTMP Ping: $rttStr | A/V Sync Offset: ${avDriftMs} ms | Mic: $micStatusLabel"
+            "Latest Live Metrics: $latestMbps (Session Avg: $avgMbps) | Out FPS: $lastEncodedFps (Fresh Game FPS: $freshCaptureFps, Repeat Paced: $repeatedFramesCount, Avg QP: $qpStr) | Send Queue: $queueStr | Ingest RTT: $rttStr | A/V Sync Offset: ${avDriftMs} ms | Mic: $micStatusLabel"
         )
 
         val headroomStr = if (lastThermalHeadroom > 0f) {
-            " | SoC Thermal Load (toward Severe): ${(lastThermalHeadroom * 100).roundToInt()}%"
+            " | Android OS Thermal Headroom (PowerManager): ${(lastThermalHeadroom * 100).roundToInt()}% of Severe"
         } else {
             ""
         }
@@ -467,11 +510,13 @@ object DiagnosticsLogger {
             lastGlip?.let { sb.appendLine("• ${it.toSummaryLine()}") }
         }
 
-        sb.appendLine()
-        sb.appendLine("--- PLAIN-ENGLISH SESSION NOTES (CHRONOLOGICAL) ---")
         if (events.isEmpty()) {
+            sb.appendLine()
+            sb.appendLine("--- PLAIN-ENGLISH SESSION NOTES (CHRONOLOGICAL) ---")
             sb.appendLine("• No active stream events recorded yet.")
         } else {
+            sb.appendLine()
+            sb.appendLine("--- PLAIN-ENGLISH SESSION NOTES (CHRONOLOGICAL) ---")
             for (ev in events) {
                 val tech = if (ev.technicalDetail.isNotBlank()) " [${ev.technicalDetail}]" else ""
                 sb.appendLine("${ev.timestamp} [${ev.tag}] ${ev.plainMessage}$tech")
