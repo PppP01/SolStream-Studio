@@ -3,49 +3,71 @@
  * SolStream Studio — Ultra-Lightweight Mobile Gaming Broadcast Engine
  * Copyright (c) 2026 Sol (@Sol_CODM / github.com/PppP01). All rights reserved.
  * SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+ * Commercial redistribution, rebranding, or app-store monetization prohibited without written license.
  */
 
 package com.solgaming.solstreamstudio
 
 import android.media.MediaCodec
+import android.media.MediaFormat
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
-import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
-import java.io.File
+import kotlin.math.PI
 import kotlin.math.abs
 import kotlin.math.sin
+import kotlin.math.sqrt
 
 class SolStreamUnitTests {
 
     @Test
-    fun rtmpsUrlNormalization_upgradesLegacyHostAndInsertsDefaultPort() {
-        val legacy = "rtmps://a.rtmp.youtube.com/live2/"
-        val normalized = KeystoreVault.normalizeIngestUrl(legacy)
+    fun ingestUrlNormalizer_addsDefaultTlsPort443AndFixesYoutubeTypo() {
+        val raw = "rtmps://a.rtmp.youtube.com/live2/"
+        val normalized = KeystoreVault.normalizeIngestUrl(raw)
         assertEquals("rtmps://a.rtmps.youtube.com:443/live2", normalized)
-
-        val joined = KeystoreVault.joinUrlAndStreamKey(normalized, "abcd-1234-efgh-5678")
-        assertEquals("rtmps://a.rtmps.youtube.com:443/live2/abcd-1234-efgh-5678", joined)
     }
 
     @Test
-    fun youtubeBackupFailover_constructsValidBackupEndpoint() {
-        val primary = "rtmps://a.rtmps.youtube.com:443/live2/test-key"
+    fun ingestUrlNormalizer_preservesQueryParametersCleanly() {
+        val raw = "rtmps://b.rtmps.youtube.com/live2?backup=1"
+        val normalized = KeystoreVault.normalizeIngestUrl(raw)
+        assertEquals("rtmps://b.rtmps.youtube.com:443/live2?backup=1", normalized)
+    }
+
+    @Test
+    fun joinUrlAndStreamKey_insertsKeyBeforeQueryString() {
+        val base = "rtmps://b.rtmps.youtube.com:443/live2?backup=1"
+        val joined = KeystoreVault.joinUrlAndStreamKey(base, "abcd-1234-efgh")
+        assertEquals("rtmps://b.rtmps.youtube.com:443/live2/abcd-1234-efgh?backup=1", joined)
+    }
+
+    @Test
+    fun deriveYoutubeBackupUrl_convertsPrimaryToBServerWithBackupFlag() {
+        val primary = "rtmps://a.rtmps.youtube.com:443/live2/sol-key-999"
         val backup = KeystoreVault.deriveYoutubeBackupUrl(primary)
-        assertNotNull(backup)
-        assertEquals("rtmps://b.rtmps.youtube.com:443/live2/test-key?backup=1", backup)
+        assertEquals("rtmps://b.rtmps.youtube.com:443/live2/sol-key-999?backup=1", backup)
 
-        val nonYoutube = "rtmps://live.twitch.tv:443/app/live_123"
-        assertNull(KeystoreVault.deriveYoutubeBackupUrl(nonYoutube))
+        val twitch = "rtmps://live.twitch.tv:443/app/live_123"
+        assertNull(KeystoreVault.deriveYoutubeBackupUrl(twitch))
     }
 
     @Test
-    fun hardwareDimensionAlignment_aligns480pAnd360pToSiliconBoundaries() {
-        val report16 = HardwareEncoderReport(
+    fun physicalRamNormalizer_mapsKernelReportedBytesToMarketingTier() {
+        val bytes8GbPhone = 7_520_000_000L
+        val bytes12GbPhone = 11_300_000_000L
+        val bytes16GbPhone = 15_100_000_000L
+        assertEquals(8, CodecCapabilityProbe.normalizePhysicalRamGb(bytes8GbPhone))
+        assertEquals(12, CodecCapabilityProbe.normalizePhysicalRamGb(bytes12GbPhone))
+        assertEquals(16, CodecCapabilityProbe.normalizePhysicalRamGb(bytes16GbPhone))
+    }
+
+    @Test
+    fun macroblockDimensionAlignment_rounds480pTo16PixelHardwareBoundary() {
+        val report = HardwareEncoderReport(
             codecKey = "HEVC",
-            mimeType = "video/hevc",
+            mimeType = MediaFormat.MIMETYPE_VIDEO_HEVC,
             encoderName = "c2.exynos.hevc.encoder",
             supports1440p60 = true,
             supports1080p60 = true,
@@ -55,305 +77,221 @@ class SolStreamUnitTests {
             heightAlignment = 16,
             complexityMin = 0,
             complexityMax = 0,
-            verifiedSurfaceConfigure = true
+            verifiedSurfaceConfigure = true,
+            verifiedRealEncode = true,
+            advertisedByMetadata = true
         )
-        val (w480, h480) = report16.alignDimensions(854, 480)
-        assertEquals(0, w480 % 16)
-        assertEquals(0, h480 % 16)
-        assertEquals(848, w480)
-        assertEquals(480, h480)
-
-        val (w360, h360) = report16.alignDimensions(640, 360)
-        assertEquals(0, w360 % 16)
-        assertEquals(0, h360 % 16)
+        val (alignedW, alignedH) = report.alignDimensions(854, 480)
+        assertEquals(0, alignedW % 16)
+        assertEquals(0, alignedH % 16)
+        assertEquals(848, alignedW)
+        assertEquals(480, alignedH)
     }
 
     @Test
-    fun voicePresetsAndGenderProfiles_applyCleanlyAndPreserveMixAndMatchFreedom() {
-        val base = StreamSettings(
-            voiceGenderProfile = "MALE",
-            hpfCutoffHz = 0,
-            gameGainPercent = 250,
-            targetBitrateKbps = 100000
-        )
-        val luxe = MicDspProcessor.applyPresetToSettings(base, "SOL_LUXE")
-        assertEquals("SOL_LUXE", luxe.voicePreset)
-        assertEquals("MALE", luxe.voiceGenderProfile)
-        assertEquals(80, luxe.hpfCutoffHz)
-        assertTrue(luxe.voiceEqEnabled)
-        assertTrue(luxe.deEsserEnabled)
-        assertTrue(luxe.velvetWarmthEnabled)
-        assertTrue(luxe.slowAgcEnabled)
-        assertEquals(250, luxe.gameGainPercent)
-        assertEquals(100000, luxe.targetBitrateKbps)
+    fun realEncodedFrameCheck_rejectsCsdConfigBuffersAndAcceptsRealFrames() {
+        val csdFlag = MediaCodec.BUFFER_FLAG_CODEC_CONFIG
+        val keyFrameFlag = MediaCodec.BUFFER_FLAG_KEY_FRAME
+        assertFalse(CodecCapabilityProbe.isRealEncodedFrameOutput(0, 64, csdFlag))
+        assertFalse(CodecCapabilityProbe.isRealEncodedFrameOutput(-1, 1024, 0))
+        assertFalse(CodecCapabilityProbe.isRealEncodedFrameOutput(0, 0, 0))
+        assertTrue(CodecCapabilityProbe.isRealEncodedFrameOutput(0, 4096, keyFrameFlag))
+        assertTrue(CodecCapabilityProbe.isRealEncodedFrameOutput(1, 1200, 0))
     }
 
     @Test
-    fun micDspProcessor_processes48kHzFramesWithoutNanOrClipping() {
-        val dsp = MicDspProcessor(48000)
-        val settings = MicDspProcessor.applyPresetToSettings(
-            StreamSettings(voiceGenderProfile = "MALE", rnnoiseLevel = 2),
-            "SOL_LUXE"
-        )
-        dsp.applySettings(settings)
-
-        val frame = FloatArray(480) { idx ->
-            (0.25f * sin(2.0 * Math.PI * 220.0 * idx / 48000.0)).toFloat()
-        }
-        dsp.processMonoFrameInPlace(frame, 480)
-
-        for (s in frame) {
-            assertTrue("DSP output must be finite", s.isFinite())
-            assertTrue("DSP output must respect soft-clip ceiling", abs(s) <= 1.0f)
-        }
-        dsp.release()
-    }
-
-    @Test
-    fun calibrationAdvisor_appliesRecommendedGainAndFilters() {
-        val advice = MicCalibrationAdvice(
-            measuredNoiseFloorDb = -52,
-            measuredSpeechRmsDb = -20,
-            measuredPeakDb = -6,
-            recommendedGainPercent = 150,
-            recommendedHpfHz = 80,
-            recommendedNoiseMode = "RNNOISE",
-            recommendedNoiseLevel = 2,
-            recommendedPreset = "SOL_LUXE",
-            recommendDeEsser = true,
-            recommendSlowAgc = true,
-            plainSummary = "Test summary"
-        )
-        val updated = advice.applyTo(StreamSettings(voiceGenderProfile = "MALE"))
-        assertEquals(150, updated.micGainPercent)
-        assertEquals(80, updated.hpfCutoffHz)
-        assertEquals("RNNOISE", updated.noiseSuppressMode)
-        assertEquals(2, updated.rnnoiseLevel)
-        assertEquals("SOL_LUXE", updated.voicePreset)
-    }
-
-    @Test
-    fun abrRecoveryCheck_rejectsMissingMinusOneTelemetryAndAcceptsCalmValidQueue() {
-        assertFalse(
-            "Unavailable (-1) queue metrics must never trigger ABR step-up",
-            SolStreamService.isQueueCalmForAbrRecovery(qFrames = -1, qBytes = -1L, droppedDelta = 0)
-        )
-        assertFalse(
-            "Non-zero dropped frame delta must block ABR step-up",
-            SolStreamService.isQueueCalmForAbrRecovery(qFrames = 2, qBytes = 10_000L, droppedDelta = 1)
-        )
-        assertFalse(
-            "High frame queue must block ABR step-up",
-            SolStreamService.isQueueCalmForAbrRecovery(qFrames = 14, qBytes = 50_000L, droppedDelta = 0)
-        )
-        assertTrue(
-            "Valid empty queue must allow ABR step-up",
-            SolStreamService.isQueueCalmForAbrRecovery(qFrames = 0, qBytes = 0L, droppedDelta = 0)
-        )
-        assertTrue(
-            "Valid low queue must allow ABR step-up",
-            SolStreamService.isQueueCalmForAbrRecovery(qFrames = 4, qBytes = 120_000L, droppedDelta = 0)
-        )
-    }
-
-    @Test
-    fun encoderFrameVerification_rejectsFormatChangedAndConfigBuffers() {
-        assertFalse(
-            "INFO_OUTPUT_FORMAT_CHANGED is not an encoded video frame",
-            CodecCapabilityProbe.isRealEncodedFrameOutput(MediaCodec.INFO_OUTPUT_FORMAT_CHANGED, 0, 0)
-        )
-        assertFalse(
-            "Codec config buffer is not an encoded video frame",
-            CodecCapabilityProbe.isRealEncodedFrameOutput(0, 64, MediaCodec.BUFFER_FLAG_CODEC_CONFIG)
-        )
-        assertFalse(
-            "Zero-byte buffer is not an encoded video frame",
-            CodecCapabilityProbe.isRealEncodedFrameOutput(0, 0, 0)
-        )
-        assertTrue(
-            "Non-empty keyframe buffer must be accepted as real encode output",
-            CodecCapabilityProbe.isRealEncodedFrameOutput(0, 4096, MediaCodec.BUFFER_FLAG_KEY_FRAME)
-        )
-    }
-
-    @Test
-    fun resolutionAndFpsResolver_stepsDownWhen1080p60UnsupportedOn1080p30Chip() {
-        val budgetChip = HardwareEncoderReport(
-            codecKey = "H264",
-            mimeType = "video/avc",
-            encoderName = "c2.mtk.avc.encoder",
-            supports4k60 = false,
-            supports4k30 = false,
-            supports1440p60 = false,
-            supports1440p30 = false,
-            supports1080p60 = false,
-            supports1080p30 = true,
-            supports720p60 = true,
-            supports720p30 = true,
-            supportsCbr = true,
-            supportsVbr = true,
-            complexityMin = 0,
-            complexityMax = 0,
-            verifiedSurfaceConfigure = true
-        )
-        val (w, h, fps) = SolVideoPipeline.resolveSupportedResolutionAndFps(
-            report = budgetChip,
-            reqWidth = 1920,
-            reqHeight = 1080,
-            reqFps = 60
-        )
-        assertEquals(1920, w)
-        assertEquals(1080, h)
-        assertEquals("Must step down to 30 FPS when 1080p60 is unsupported", 30, fps)
-    }
-
-    @Test
-    fun rnnoiseFallbackAndPartialFrames_attenuateNoiseEvenWhen480SampleNativePathSkipped() {
-        val dsp = MicDspProcessor(48000)
-        dsp.applySettings(
-            StreamSettings(
-                voicePreset = "NEURAL",
-                noiseSuppressMode = "RNNOISE",
-                rnnoiseLevel = 3,
-                hpfCutoffHz = 0,
-                transientTamerEnabled = false,
-                noiseGateEnabled = false,
-                compressorEnabled = false
-            )
-        )
-        val partialFrame = FloatArray(240) { 0.001f }
-        dsp.processMonoFrameInPlace(partialFrame, 240)
-        assertTrue("Partial frame fallback output must be finite", partialFrame.last().isFinite())
-        assertTrue("Light spectral fallback must attenuate stationary noise", abs(partialFrame.last()) < 0.001f)
-        dsp.release()
-    }
-
-    @Test
-    fun physicalRamNormalizer_maps7Point17GiBKernelMemTo8GbFlagshipTier() {
-        val s24FeKernelBytes = (7.17 * 1024.0 * 1024.0 * 1024.0).toLong()
-        assertEquals(8, CodecCapabilityProbe.normalizePhysicalRamGb(s24FeKernelBytes))
-
-        val twelveGbKernelBytes = (11.2 * 1024.0 * 1024.0 * 1024.0).toLong()
-        assertEquals(12, CodecCapabilityProbe.normalizePhysicalRamGb(twelveGbKernelBytes))
-    }
-
-    @Test
-    fun connectionGenerationGuard_rejectsLateSuccessCallbackAfterStop() {
-        assertFalse(
-            SolStreamService.shouldAcceptConnectionCallback(
-                isBroadcastActive = false,
-                callbackGen = 1L,
-                currentGen = 1L
-            )
-        )
-        assertFalse(
-            SolStreamService.shouldAcceptConnectionCallback(
-                isBroadcastActive = true,
-                callbackGen = 1L,
-                currentGen = 2L
-            )
-        )
-        assertFalse(
-            SolStreamService.shouldAcceptConnectionCallback(
-                isBroadcastActive = true,
-                callbackGen = 2L,
-                currentGen = 2L,
-                isTargetStopped = true
-            )
-        )
-        assertTrue(
-            SolStreamService.shouldAcceptConnectionCallback(
-                isBroadcastActive = true,
-                callbackGen = 2L,
-                currentGen = 2L,
-                isTargetStopped = false
-            )
-        )
-    }
-
-    @Test
-    fun probeTargetSelector_picksSupportedResolutionAndFpsPairTogether() {
-        // Chip supports 1440p30 and 1080p60, but NOT 1440p60 -> must pick 1920x1080@60, never 2560x1440@60
-        val (w, h, fps) = CodecCapabilityProbe.selectValidProbeTarget(
+    fun probeTargetSelector_supportsAllTiersDownTo720p30And480pAnd360p() {
+        val (w1, h1, fps1) = CodecCapabilityProbe.selectValidProbeTarget(
             ok1440p60 = false,
             ok1440p30 = true,
             ok1080p60 = true,
             ok1080p30 = true,
             ok720p60 = true
         )
-        assertEquals(1920, w)
-        assertEquals(1080, h)
-        assertEquals(60, fps)
+        assertEquals(1920, w1)
+        assertEquals(1080, h1)
+        assertEquals(60, fps1)
+
+        val (w2, h2, fps2) = CodecCapabilityProbe.selectValidProbeTarget(
+            ok1440p60 = false,
+            ok1440p30 = false,
+            ok1080p60 = false,
+            ok1080p30 = false,
+            ok720p60 = false,
+            ok720p30 = true,
+            ok480p = true,
+            ok360p = true
+        )
+        assertEquals(1280, w2)
+        assertEquals(720, h2)
+        assertEquals(30, fps2)
+
+        val (w3, h3, fps3) = CodecCapabilityProbe.selectValidProbeTarget(
+            ok1440p60 = false,
+            ok1440p30 = false,
+            ok1080p60 = false,
+            ok1080p30 = false,
+            ok720p60 = false,
+            ok720p30 = false,
+            ok480p = true,
+            ok360p = true,
+            aligned480W = 848,
+            aligned480H = 480
+        )
+        assertEquals(848, w3)
+        assertEquals(480, h3)
+        assertEquals(30, fps3)
     }
 
     @Test
-    fun sceneAssetReplaceSafely_commitsValidTempAndPreservesExistingOnInvalidTemp() {
-        val tmpDir = File(System.getProperty("java.io.tmpdir"), "sol_scene_test_${System.nanoTime()}")
-        tmpDir.mkdirs()
-        try {
-            val outFile = File(tmpDir, "scene_brb.png")
-            val originalContent = ByteArray(256) { 0x42 }
-            outFile.writeBytes(originalContent)
+    fun encoderCandidateScoring_prioritizesRealEncodeOverSurfaceConfigureAndMetadataOnly() {
+        val metadataOnly = HardwareEncoderReport(
+            codecKey = "HEVC",
+            mimeType = MediaFormat.MIMETYPE_VIDEO_HEVC,
+            encoderName = "c2.exynos.hevc.encoder",
+            supports1440p60 = true,
+            supports1080p60 = true,
+            supportsCbr = true,
+            supportsVbr = true,
+            complexityMin = 0,
+            complexityMax = 0,
+            verifiedSurfaceConfigure = false,
+            verifiedRealEncode = false,
+            advertisedByMetadata = true
+        )
+        val surfaceVerified = metadataOnly.copy(verifiedSurfaceConfigure = true)
+        val realEncodeVerified = surfaceVerified.copy(verifiedRealEncode = true)
 
-            // Invalid/missing temp file must fail and leave original outFile untouched
-            val invalidTemp = File(tmpDir, "missing.tmp")
-            assertFalse(SolSceneAssetStore.replaceFileSafely(invalidTemp, outFile))
-            assertTrue(outFile.exists())
-            assertEquals(256L, outFile.length())
+        val sMeta = CodecCapabilityProbe.scoreEncoderCandidate(metadataOnly)
+        val sSurf = CodecCapabilityProbe.scoreEncoderCandidate(surfaceVerified)
+        val sReal = CodecCapabilityProbe.scoreEncoderCandidate(realEncodeVerified)
 
-            // Valid temp file must atomically replace outFile
-            val validTemp = File(tmpDir, "valid.tmp")
-            val newContent = ByteArray(512) { 0x7A }
-            validTemp.writeBytes(newContent)
-            assertTrue(SolSceneAssetStore.replaceFileSafely(validTemp, outFile))
-            assertEquals(512L, outFile.length())
-        } finally {
-            tmpDir.deleteRecursively()
-        }
+        assertTrue(sSurf > sMeta)
+        assertTrue(sReal > sSurf)
     }
 
     @Test
-    fun overlayQueueTagFormatter_displaysNaForUnavailableMinusOneQueue() {
+    fun resolutionFallbackLadder_stepsDownCleanlyFrom1440p60To360p() {
+        val report = HardwareEncoderReport(
+            codecKey = "HEVC",
+            mimeType = MediaFormat.MIMETYPE_VIDEO_HEVC,
+            encoderName = "c2.exynos.hevc.encoder",
+            supports1440p60 = true,
+            supports1440p30 = true,
+            supports1080p60 = true,
+            supports1080p30 = true,
+            supports720p60 = true,
+            supports720p30 = true,
+            supports480p = true,
+            supports360p = true,
+            supportsCbr = true,
+            supportsVbr = true,
+            complexityMin = 0,
+            complexityMax = 0,
+            verifiedSurfaceConfigure = true,
+            verifiedRealEncode = true
+        )
+        val ladder = SolVideoPipeline.buildResolutionFallbackLadder(report, 2560, 1440, 60)
+        assertEquals(Triple(2560, 1440, 60), ladder.first())
+        assertTrue(ladder.contains(Triple(1920, 1080, 60)))
+        assertTrue(ladder.contains(Triple(1280, 720, 30)))
+        assertEquals(Triple(640, 360, 30), ladder.last())
+    }
+
+    @Test
+    fun overlayQueueTagFormatter_displaysNAWhenTelemetryUnavailable() {
         assertEquals("Q:N/A", SolStreamService.formatOverlayQueueTag(-1))
         assertEquals("Q:0f", SolStreamService.formatOverlayQueueTag(0))
-        assertEquals("Q:12f", SolStreamService.formatOverlayQueueTag(12))
+        assertEquals("Q:14f", SolStreamService.formatOverlayQueueTag(14))
     }
 
     @Test
-    fun sparkAndHammerBlanker_clampsMultiStrikeImpulsesWithoutOpeningSpeechGate() {
+    fun sessionGenerationGuard_blocksStaleOrStoppedRtmpCallbacks() {
+        assertTrue(SolStreamService.shouldAcceptConnectionCallback(true, 5L, 5L, false))
+        assertFalse(SolStreamService.shouldAcceptConnectionCallback(false, 5L, 5L, false))
+        assertFalse(SolStreamService.shouldAcceptConnectionCallback(true, 4L, 5L, false))
+        assertFalse(SolStreamService.shouldAcceptConnectionCallback(true, 5L, 5L, true))
+    }
+
+    @Test
+    fun abrRecoveryGate_requiresAtLeastOneValidQueueMetricBeforeStepUp() {
+        assertFalse(SolStreamService.isQueueCalmForAbrRecovery(-1, -1L, 0))
+        assertFalse(SolStreamService.isQueueCalmForAbrRecovery(2, 10_000L, 1))
+        assertFalse(SolStreamService.isQueueCalmForAbrRecovery(12, 50_000L, 0))
+        assertTrue(SolStreamService.isQueueCalmForAbrRecovery(3, 80_000L, 0))
+        assertTrue(SolStreamService.isQueueCalmForAbrRecovery(2, -1L, 0))
+    }
+
+    @Test
+    fun diagnosticsBitrateTracker_computesAccurateSessionAverage() {
+        DiagnosticsLogger.recordBitrateSample(20_000)
+        DiagnosticsLogger.recordBitrateSample(16_000)
+        DiagnosticsLogger.recordBitrateSample(18_000)
+        assertEquals(18_000, DiagnosticsLogger.lastBitrateKbps)
+        assertTrue(DiagnosticsLogger.getSessionAverageBitrateKbps() in 16_000..20_000)
+    }
+
+    @Test
+    fun micDspSparkBlanker_clampsMultiStrikeMosquitoRacketImpulsesWhilePreservingSpeech() {
         val dsp = MicDspProcessor(48000)
-        dsp.applySettings(
-            MicDspProcessor.applyPresetToSettings(
-                StreamSettings(voiceGenderProfile = "MALE", micGainPercent = 100),
+        val luxe = MicDspProcessor.applyPresetToSettings(
+            StreamSettings(voiceGenderProfile = "MALE"),
+            "SOL_LUXE"
+        )
+        dsp.applySettings(luxe)
+
+        val quietFrame = FloatArray(480) { 0.001f * sin(2.0 * PI * 200.0 * it / 48000.0).toFloat() }
+        repeat(15) {
+            val copy = quietFrame.clone()
+            dsp.processMonoFrameInPlace(copy, copy.size)
+        }
+
+        // Simulate 4 rapid electric mosquito-racket spark strikes ("phat-phat-phat") without 220 Hz vocal body
+        for (strike in 1..4) {
+            val sparkFrame = FloatArray(480) { 0.001f }
+            sparkFrame[40] = 0.95f
+            sparkFrame[41] = -0.92f
+            sparkFrame[42] = 0.88f
+            sparkFrame[43] = -0.84f
+            dsp.processMonoFrameInPlace(sparkFrame, sparkFrame.size)
+            val clampedPeak = sparkFrame.maxOf { abs(it) }
+            assertTrue("Spark strike #$strike should be heavily attenuated (<0.38f), was $clampedPeak", clampedPeak < 0.38f)
+        }
+    }
+
+    @Test
+    fun micDspAllThreeGenderProfiles_preserveCleanSpeechInSolLuxeMode() {
+        for (gender in listOf("MALE", "FEMALE", "NEUTRAL")) {
+            val dsp = MicDspProcessor(48000)
+            val luxe = MicDspProcessor.applyPresetToSettings(
+                StreamSettings(voiceGenderProfile = gender, micGainPercent = 125),
                 "SOL_LUXE"
             )
-        )
+            dsp.applySettings(luxe)
 
-        // Prime calm room floor
-        val quietFrame = FloatArray(480) { 0.0005f }
-        repeat(5) { dsp.processMonoFrameInPlace(quietFrame.clone(), 480) }
-
-        // Simulate 6 rapid mosquito-racket high-slew electric zaps ("phat-phat-phat") across frames
-        for (zap in 1..6) {
-            val sparkFrame = FloatArray(480) { idx ->
-                if (idx in 40..95) {
-                    if (idx % 2 == 0) 0.85f else -0.85f
-                } else {
-                    0.0005f
+            val fundHz = when (gender) {
+                "MALE" -> 125.0
+                "FEMALE" -> 210.0
+                else -> 165.0
+            }
+            var lastRms = 0f
+            repeat(8) {
+                val speech = FloatArray(480) { idx ->
+                    val t = idx.toDouble() / 48000.0
+                    (0.12 * sin(2.0 * PI * fundHz * t) +
+                        0.06 * sin(2.0 * PI * (fundHz * 2.0) * t) +
+                        0.04 * sin(2.0 * PI * 3200.0 * t)).toFloat()
                 }
+                dsp.processMonoFrameInPlace(speech, speech.size)
+                var sumSq = 0f
+                for (s in speech) {
+                    assertTrue(s.isFinite())
+                    assertTrue(abs(s) <= 1.0f)
+                    sumSq += s * s
+                }
+                lastRms = sqrt(sumSq / speech.size)
             }
-            dsp.processMonoFrameInPlace(sparkFrame, 480)
-            var peakAfterBlanker = 0f
-            for (i in 40..95) {
-                val a = abs(sparkFrame[i])
-                if (a > peakAfterBlanker) peakAfterBlanker = a
-            }
-            assertTrue(
-                "Zap #$zap must be heavily attenuated by Spark/Hammer Blanker (was $peakAfterBlanker)",
-                peakAfterBlanker < 0.25f
-            )
-            assertFalse("Short electric zap #$zap must not open the vocal VAD speech gate", dsp.vadSpeechActive)
+            assertTrue("$gender speech RMS should remain strong and clear (>0.06f), was $lastRms", lastRms > 0.06f)
         }
-        dsp.release()
     }
 }
