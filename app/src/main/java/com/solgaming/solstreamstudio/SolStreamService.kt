@@ -27,6 +27,7 @@ import android.media.MediaCodec
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
 import android.net.Uri
+import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
@@ -80,6 +81,7 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
     private var audioEngine: SolDualAudioEngine? = null
     private var mediaProjection: MediaProjection? = null
     private var wakeLock: PowerManager.WakeLock? = null
+    private var wifiLock: WifiManager.WifiLock? = null
 
     private lateinit var activeSettings: StreamSettings
     private var primaryStreamUrl: String = ""
@@ -209,7 +211,7 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
         }
 
         override fun onConnectionSuccess() {
-            service.onPrimaryConnectionSuccess(sessionGen, this)
+            service.onPrimaryConnectionSuccess(sessionGen)
         }
 
         override fun onNewBitrate(bitrate: Long) {
@@ -389,11 +391,13 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
         windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
         ensureNotificationChannel()
         registerThermalStatusListenerIfSupported()
+        notifyDashboardStateChanged()
     }
 
     override fun onServiceConnected() {
         super.onServiceConnected()
         instance = this
+        notifyDashboardStateChanged()
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
@@ -418,8 +422,8 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
                     DiagnosticsLogger.log("START_ABORT", "Screen capture permission was not granted.")
                 }
             }
-            ACTION_START_BENCHMARK -> startPassiveCompetitorBenchmark()
-            ACTION_STOP_STREAM -> stopLiveBroadcast("Stopped by user")
+            ACTION_START_BENCHMARK, ACTION_START_GLIP_BENCH -> startPassiveCompetitorBenchmark()
+            ACTION_STOP_STREAM, ACTION_STOP_GLIP_BENCH -> stopLiveBroadcast("Stopped by user")
             ACTION_TOGGLE_MIC_MUTE -> toggleMicMuteLive()
             ACTION_TOGGLE_BRB -> cycleSceneLive()
             ACTION_MARK_CLIP -> saveClipMarkerLive("Notification Clip")
@@ -431,7 +435,14 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
         unregisterThermalStatusListenerIfSupported()
         stopLiveBroadcast("Service destroyed")
         if (instance === this) instance = null
+        notifyDashboardStateChanged()
         super.onDestroy()
+    }
+
+    private fun notifyDashboardStateChanged() {
+        mainHandler.post {
+            try { onStateChangedListener?.invoke() } catch (_: Exception) {}
+        }
     }
 
     private fun registerThermalStatusListenerIfSupported() {
@@ -471,6 +482,8 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
         if (broadcastActive || benchmarkOnlyActive) return
         activeSettings = KeystoreVault.loadSettings(this)
         benchmarkOnlyActive = true
+        needsProjectionReapproval = false
+        currentLiveStateLabel = "BENCHMARK ACTIVE (Profiling Thermal & RAM)"
         userManuallyOverrodeSharp = false
         userManuallyOverrode30FpsSaver = false
         severeThermalLastSeenElapsedMs = 0L
@@ -491,6 +504,7 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
         attachFloatingOverlayPill()
         mainHandler.removeCallbacks(healthTickRunnable)
         mainHandler.post(healthTickRunnable)
+        notifyDashboardStateChanged()
         Toast.makeText(
             this,
             "Benchmark active! Open your other stream app & play for 15m, then tap Stop.",
@@ -515,29 +529,20 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
         if (benchmarkOnlyActive) stopLiveBroadcast("Switching to Live Broadcast")
 
         activeSettings = KeystoreVault.loadSettings(this)
+        needsProjectionReapproval = false
         userManuallyOverrodeSharp = false
         userManuallyOverrode30FpsSaver = false
         severeThermalLastSeenElapsedMs = 0L
         lastThermalReducedBps = -1
         lastRttProbeElapsedMs = 0L
 
-        val shortsKey = KeystoreVault.loadSecondaryKey(this, KeystoreVault.Slot.YOUTUBE_SHORTS_9_16)
-        val useShortsKeyAsPrimary = activeSettings.isVertical &&
-            activeSettings.platformPreset == "YOUTUBE" &&
-            !shortsKey.isNullOrBlank()
-
-        val rawKey = if (useShortsKeyAsPrimary) {
-            shortsKey!!
-        } else {
-            KeystoreVault.loadStreamKey(this)
-        }
-        val cleanUrl = KeystoreVault.normalizeIngestUrl(activeSettings.rtmpUrl)
-        if (rawKey.isNullOrBlank() || cleanUrl.isBlank()) {
+        val builtPrimaryUrl = KeystoreVault.buildActivePrimaryEndpoint(this, activeSettings)
+        if (builtPrimaryUrl.isNullOrBlank()) {
             Toast.makeText(this, "Save your YouTube/RTMPS Stream Key in the Vault first.", Toast.LENGTH_LONG).show()
             return
         }
 
-        primaryStreamUrl = KeystoreVault.joinUrlAndStreamKey(cleanUrl, rawKey)
+        primaryStreamUrl = builtPrimaryUrl
         backupStreamUrl = KeystoreVault.deriveYoutubeBackupUrl(primaryStreamUrl)
         parseIngestHostAndPort(primaryStreamUrl)
         usingBackupUrl = false
@@ -574,6 +579,9 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
         }
         mediaProjection = projection
         acquirePartialWakeLock()
+        if (activeSettings.wifiLowLatencyLock) {
+            acquireWifiLowLatencyLock()
+        }
 
         val originNs = System.nanoTime()
         val originUs = originNs / 1000L
@@ -589,35 +597,28 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
 
         auxTargets.clear()
         companionTarget = null
+        val useShortsSlot = activeSettings.isVertical &&
+            activeSettings.useShortsKeySlot &&
+            KeystoreVault.getShortsStreamKey(this).isNotBlank()
         val targetNames = mutableListOf(
-            if (useShortsKeyAsPrimary) "YouTube 9:16 Shorts" else "Primary (${if (activeSettings.isVertical) "9:16" else "16:9"})"
+            if (useShortsSlot) "YouTube 9:16 Shorts" else "Primary (${if (activeSettings.isVertical) "9:16" else "16:9"})"
         )
 
-        if (activeSettings.simulcastTwitchEnabled) {
-            val tk = KeystoreVault.loadSecondaryKey(this, KeystoreVault.Slot.TWITCH)
-            if (!tk.isNullOrBlank()) {
-                val tUrl = KeystoreVault.joinUrlAndStreamKey(KeystoreVault.URL_TWITCH_RTMPS, tk)
-                auxTargets.add(AuxRtmpTarget("Twitch", tUrl, "H264", mySessionGen))
-                targetNames.add("Twitch")
-            }
-        }
-        if (activeSettings.simulcastKickEnabled) {
-            val kk = KeystoreVault.loadSecondaryKey(this, KeystoreVault.Slot.KICK)
-            if (!kk.isNullOrBlank()) {
-                val kUrl = KeystoreVault.joinUrlAndStreamKey(KeystoreVault.URL_KICK_RTMPS, kk)
-                auxTargets.add(AuxRtmpTarget("Kick", kUrl, "H264", mySessionGen))
-                targetNames.add("Kick")
-            }
+        val simTargets = KeystoreVault.buildSimulcastTargets(this, activeSettings)
+        for ((simName, simUrl) in simTargets) {
+            auxTargets.add(AuxRtmpTarget(simName, simUrl, "H264", mySessionGen))
+            targetNames.add(simName)
         }
 
-        val wantDualCompanion = activeSettings.dualFormat916Enabled &&
-            !activeSettings.isVertical &&
-            !shortsKey.isNullOrBlank()
-        if (wantDualCompanion) {
-            val compUrl = KeystoreVault.joinUrlAndStreamKey(KeystoreVault.URL_YOUTUBE_RTMPS_PRIMARY, shortsKey!!)
+        val compEndpoint = if (activeSettings.dualFormatCompanionEnabled && !activeSettings.isVertical) {
+            KeystoreVault.buildCompanionVerticalEndpoint(this)
+        } else {
+            null
+        }
+        if (!compEndpoint.isNullOrBlank()) {
             val scan = CodecCapabilityProbe.getBestAvailableScanNonBlocking(this)
             val compCodec = if (scan.hevcHardware != null) "HEVC" else "H264"
-            companionTarget = AuxRtmpTarget("YT 9:16 Companion", compUrl, compCodec, mySessionGen)
+            companionTarget = AuxRtmpTarget("YT 9:16 Companion", compEndpoint, compCodec, mySessionGen)
             targetNames.add("YT 9:16 Companion")
         }
         DiagnosticsLogger.activeSimulcastDesc = targetNames.joinToString(" + ")
@@ -659,6 +660,7 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
             onProjectionStoppedBySystem = {
                 mainHandler.post {
                     if (broadcastActive) {
+                        needsProjectionReapproval = true
                         Toast.makeText(
                             this,
                             "Screen capture ended by Android (screen locked or permission revoked).",
@@ -785,6 +787,7 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
         videoPipeline = vPipeline
         audioEngine = aEngine
         broadcastActive = true
+        currentLiveStateLabel = "CONNECTING TO INGEST..."
 
         maxConfiguredBitrateBps = (activeSettings.targetBitrateKbps.coerceIn(500, 100_000) * 1000)
         activeBitrateBps = vPipeline.currentBitrateBps
@@ -803,6 +806,7 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
 
         attachFloatingOverlayPill()
         updateStreamNotification("LIVE: ${videoInfo.outWidth}x${videoInfo.outHeight}@${videoInfo.fps} (${videoInfo.codecKey})")
+        notifyDashboardStateChanged()
 
         connectRtmpAsync(primaryStreamUrl, mySessionGen, client)
         for (aux in auxTargets) {
@@ -846,6 +850,7 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
         rtmpConnected = false
         reconnectCount++
         DiagnosticsLogger.reconnectAttempts = reconnectCount
+        currentLiveStateLabel = "RECONNECTING (#$reconnectCount)..."
 
         val useBackupNow = (reconnectCount >= 2 && !backupStreamUrl.isNullOrBlank() && !usingBackupUrl)
         if (useBackupNow) {
@@ -869,7 +874,10 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
             "RECONNECT",
             "Network hiccup ($reason). Auto-reconnecting (#$reconnectCount) via $targetDesc in ${delayMs / 1000.0}s while keeping game capture alive."
         )
-        mainHandler.post { updatePillTelemetryUI() }
+        mainHandler.post {
+            updatePillTelemetryUI()
+            notifyDashboardStateChanged()
+        }
 
         mainHandler.postDelayed({
             reconnectScheduled.set(false)
@@ -895,7 +903,7 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
         }, delayMs)
     }
 
-    private fun stopLiveBroadcast(reason: String) {
+    fun stopLiveBroadcast(reason: String = "Stopped by user") {
         val wasLive = broadcastActive
         val wasBench = benchmarkOnlyActive
         if (!wasLive && !wasBench) return
@@ -905,20 +913,22 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
         benchmarkOnlyActive = false
         rtmpConnected = false
         reconnectScheduled.set(false)
+        currentLiveStateLabel = "IDLE (Ready)"
         mainHandler.removeCallbacks(healthTickRunnable)
 
         DiagnosticsLogger.log("SESSION_END", "Stream ended ($reason).")
         val snap = DiagnosticsLogger.finishAndSaveBenchmark(this, isGlipBaseline = wasBench)
         val fullReport = DiagnosticsLogger.buildShareableReport(this)
-        KeystoreVault.appendSessionReportToHistory(
-            this,
-            title = "${snap.label} (${snap.durationMinutes}m • Peak ${String.format(Locale.US, "%.1f°C", snap.peakBatteryTempC)})",
-            reportBody = fullReport
+        saveReportToLocalArchive(
+            context = this,
+            header = "${snap.label} (${snap.durationMinutes}m • Peak ${String.format(Locale.US, "%.1f°C", snap.peakBatteryTempC)})",
+            body = fullReport
         )
 
         cleanupResources()
         detachFloatingOverlayPill()
         stopForeground(STOP_FOREGROUND_REMOVE)
+        notifyDashboardStateChanged()
     }
 
     /**
@@ -948,6 +958,9 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
         val wlToRelease = wakeLock
         wakeLock = null
 
+        val wifiToRelease = wifiLock
+        wifiLock = null
+
         // Unregister MediaProjection.Callback immediately before async disconnect/audio teardown!
         videoToClose?.prepareForImmediateStop()
 
@@ -963,6 +976,10 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
             try { audioToClose?.stopStreamingAudio() } catch (_: Exception) {}
             try { videoToClose?.stopPipeline() } catch (_: Exception) {}
             try { projToClose?.stop() } catch (_: Exception) {}
+            try {
+                if (wifiToRelease?.isHeld == true) wifiToRelease.release()
+            } catch (_: Exception) {
+            }
             try {
                 if (wlToRelease?.isHeld == true) wlToRelease.release()
             } catch (_: Exception) {
@@ -1133,7 +1150,7 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
                 }
 
                 // Queue-Aware Ping Guard ABR 2.0
-                if (activeSettings.adaptiveBitrateEnabled && rtmpConnected) {
+                if (activeSettings.adaptiveBitrate && rtmpConnected) {
                     val queueCongested = (qCap > 0 && qFrames > (qCap * 35) / 100) ||
                         (qFrames > 35) ||
                         (qBytes > 1_600_000L) ||
@@ -1178,6 +1195,7 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
         }
 
         updatePillTelemetryUI()
+        notifyDashboardStateChanged()
     }
 
     // === 3-TAB FLOATING IN-GAME PILL (0 Hz Idle Redraws + Multi-Touch Split Flags) ===
@@ -1401,7 +1419,7 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
 
         root.addView(drawer)
 
-        val savedPos = KeystoreVault.loadOverlayPosition(this)
+        val savedPos = loadOverlayPositionPrefs(this)
         // FLAG_NOT_TOUCH_MODAL + FLAG_SPLIT_TOUCH guarantees 0-ms multi-touch independence for CODM!
         val lp = WindowManager.LayoutParams(
             WindowManager.LayoutParams.WRAP_CONTENT,
@@ -1451,7 +1469,7 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
                 }
                 MotionEvent.ACTION_UP -> {
                     if (dragging) {
-                        KeystoreVault.saveOverlayPosition(this, lp.x, lp.y)
+                        saveOverlayPositionPrefs(this, lp.x, lp.y)
                         scheduleGhostFade()
                     } else {
                         val now = SystemClock.uptimeMillis()
@@ -1633,7 +1651,9 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
         } else {
             "RECONN"
         }
-        statusTv.text = "$timeStr | $netState | ${freshFps}/${outFps}fps | $qStr | $tempStr$socPct$sceneTag"
+        val summaryLine = "$timeStr | $netState | ${freshFps}/${outFps}fps | $qStr | $tempStr$socPct$sceneTag"
+        statusTv.text = summaryLine
+        currentLiveStateLabel = "LIVE ($summaryLine)"
 
         if (pillExpanded) {
             refreshExpandedControlsState()
@@ -1701,7 +1721,7 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
 
         // Tab 2 (Net / Bitrate)
         tvOvBitrateReadout?.text = String.format(Locale.US, "%.1f Mbps", activeBitrateBps / 1_000_000.0)
-        btnOvAbrToggle?.text = if (activeSettings.adaptiveBitrateEnabled) "ABR:ON" else "ABR:OFF"
+        btnOvAbrToggle?.text = if (activeSettings.adaptiveBitrate) "ABR:ON" else "ABR:OFF"
         val saver30 = vPipe?.thermalThrottle30Fps == true
         btnOvThermal30Saver?.text = if (saver30) "30FPS Cool:ACTIVE" else "30FPS Cool:AUTO"
         btnOvThermal30Saver?.setTextColor(Color.parseColor(if (saver30) "#F59E0B" else "#10B981"))
@@ -1714,7 +1734,11 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
         }
     }
 
-    // === LIVE IN-GAME ACTION HANDLERS ===
+    // === LIVE IN-GAME & DASHBOARD ACTION HANDLERS ===
+    fun applyDashboardSettingsLive(updated: StreamSettings) {
+        saveAndPushSettings(updated)
+    }
+
     private fun saveAndPushSettings(updated: StreamSettings) {
         activeSettings = updated
         KeystoreVault.saveSettings(this, updated)
@@ -1725,6 +1749,7 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
                 "${it.micDsp.voiceGenderProfile}/${it.micDsp.voicePreset} • ${it.micDsp.activeDenoiserSummary} • ${updated.audioBitrateKbps}k AAC"
         }
         refreshExpandedControlsState()
+        notifyDashboardStateChanged()
     }
 
     private fun toggleMicMuteLive() {
@@ -1732,12 +1757,14 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
         dsp.streamMicMuted = !dsp.streamMicMuted
         refreshExpandedControlsState()
         updateStreamNotification(if (dsp.streamMicMuted) "LIVE (Stream Mic Muted)" else "LIVE Broadcast Active")
+        notifyDashboardStateChanged()
     }
 
     private fun toggleGameAudioMuteLive() {
         val aEng = audioEngine ?: return
         aEng.gameStreamMuted = !aEng.gameStreamMuted
         refreshExpandedControlsState()
+        notifyDashboardStateChanged()
     }
 
     private fun cycleSceneLive() {
@@ -1748,6 +1775,9 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
             else -> "LIVE"
         }
         vPipe.setSceneMode(next)
+        if (activeSettings.brbMuteMicToo) {
+            audioEngine?.micDsp?.streamMicMuted = (next != "LIVE")
+        }
         if (next != "LIVE") {
             vPipe.setBitrateOnFly(min(activeBitrateBps, 1_500_000))
         } else {
@@ -1755,6 +1785,7 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
         }
         refreshExpandedControlsState()
         updatePillTelemetryUI()
+        notifyDashboardStateChanged()
     }
 
     private fun saveClipMarkerLive(label: String) {
@@ -1808,7 +1839,7 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
     private fun toggleSlowAgcLive() = saveAndPushSettings(activeSettings.copy(slowAgcEnabled = !activeSettings.slowAgcEnabled))
 
     private fun stepMicBoostLive(deltaPct: Int) {
-        val next = (activeSettings.micGainPercent + deltaPct).coerceIn(75, 250)
+        val next = (activeSettings.micGainPercent + deltaPct).coerceIn(50, 250)
         saveAndPushSettings(activeSettings.copy(micGainPercent = next))
     }
 
@@ -1911,10 +1942,7 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
     }
 
     private fun stepLiveBitrate(dir: Int) {
-        val stepsKbps = listOf(
-            500, 800, 1000, 1500, 2000, 3000, 4500, 6000, 8000, 10000, 12000, 14000,
-            16000, 18000, 20000, 24000, 30000, 35000, 40000, 50000, 65000, 80000, 100000
-        )
+        val stepsKbps = MASTER_BITRATE_LADDER_KBPS
         val curKbps = activeBitrateBps / 1000
         val closestIdx = stepsKbps.indices.minByOrNull { abs(stepsKbps[it] - curKbps) } ?: 14
         val nextIdx = (closestIdx + dir).coerceIn(0, stepsKbps.size - 1)
@@ -1928,7 +1956,7 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
     }
 
     private fun toggleAbrLive() =
-        saveAndPushSettings(activeSettings.copy(adaptiveBitrateEnabled = !activeSettings.adaptiveBitrateEnabled))
+        saveAndPushSettings(activeSettings.copy(adaptiveBitrate = !activeSettings.adaptiveBitrate))
 
     private fun toggleThermal30FpsSaverLive() {
         val vPipe = videoPipeline ?: return
@@ -1966,7 +1994,7 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
         if (!shouldAcceptConnectionCallback(broadcastActive, sessionGen, connectionSessionGen.get())) return
     }
 
-    private fun onPrimaryConnectionSuccess(sessionGen: Long, callbackOwner: PrimaryRtmpCallback) {
+    private fun onPrimaryConnectionSuccess(sessionGen: Long) {
         if (!shouldAcceptConnectionCallback(broadcastActive, sessionGen, connectionSessionGen.get())) {
             val staleClient = rtmpClient
             netExecutor.execute { try { staleClient?.disconnect() } catch (_: Exception) {} }
@@ -1987,7 +2015,10 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
             )
         }
         probeIngestTcpRttIfNeeded()
-        mainHandler.post { updatePillTelemetryUI() }
+        mainHandler.post {
+            updatePillTelemetryUI()
+            notifyDashboardStateChanged()
+        }
     }
 
     private fun onPrimaryNewBitrate(sessionGen: Long, bitrate: Long) {
@@ -2002,7 +2033,10 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
     private fun onPrimaryDisconnect(sessionGen: Long) {
         if (!shouldAcceptConnectionCallback(broadcastActive, sessionGen, connectionSessionGen.get())) return
         rtmpConnected = false
-        mainHandler.post { updatePillTelemetryUI() }
+        mainHandler.post {
+            updatePillTelemetryUI()
+            notifyDashboardStateChanged()
+        }
     }
 
     private fun onPrimaryAuthError(sessionGen: Long) {
@@ -2026,7 +2060,7 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
     override fun onAuthError() {}
     override fun onAuthSuccess() {}
 
-    // === NOTIFICATION & WAKELOCK HELPERS ===
+    // === NOTIFICATION, WAKELOCK & WIFI LOW-LATENCY LOCK HELPERS ===
     private fun acquirePartialWakeLock() {
         try {
             if (wakeLock?.isHeld == true) return
@@ -2034,6 +2068,24 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
             wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "SolStreamStudio::BroadcastLock").apply {
                 setReferenceCounted(false)
                 acquire(6 * 60 * 60 * 1000L)
+            }
+        } catch (_: Exception) {
+        }
+    }
+
+    private fun acquireWifiLowLatencyLock() {
+        try {
+            if (wifiLock?.isHeld == true) return
+            val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager ?: return
+            val lockMode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                WifiManager.WIFI_MODE_FULL_LOW_LATENCY
+            } else {
+                @Suppress("DEPRECATION")
+                WifiManager.WIFI_MODE_FULL_HIGH_PERF
+            }
+            wifiLock = wm.createWifiLock(lockMode, "SolStreamStudio::LowLatencyWifi").apply {
+                setReferenceCounted(false)
+                acquire()
             }
         } catch (_: Exception) {
         }
@@ -2182,6 +2234,8 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
         const val ACTION_START_STREAM = "com.solgaming.solstreamstudio.ACTION_START_STREAM"
         const val ACTION_STOP_STREAM = "com.solgaming.solstreamstudio.ACTION_STOP_STREAM"
         const val ACTION_START_BENCHMARK = "com.solgaming.solstreamstudio.ACTION_START_BENCHMARK"
+        const val ACTION_START_GLIP_BENCH = "com.solgaming.solstreamstudio.ACTION_START_BENCHMARK"
+        const val ACTION_STOP_GLIP_BENCH = "com.solgaming.solstreamstudio.ACTION_STOP_STREAM"
         const val ACTION_TOGGLE_MIC_MUTE = "com.solgaming.solstreamstudio.ACTION_TOGGLE_MIC_MUTE"
         const val ACTION_TOGGLE_BRB = "com.solgaming.solstreamstudio.ACTION_TOGGLE_BRB"
         const val ACTION_MARK_CLIP = "com.solgaming.solstreamstudio.ACTION_MARK_CLIP"
@@ -2191,8 +2245,22 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
 
         private const val CHANNEL_ID = "solstream_live_channel"
         private const val NOTIF_ID = 1001
+        private const val OVERLAY_PREFS = "solstream_overlay_ui_prefs"
+        private const val KEY_OV_X = "ov_pos_x"
+        private const val KEY_OV_Y = "ov_pos_y"
+        private const val KEY_ARCHIVE_JSON = "archived_session_reports_json"
 
-        @Volatile private var instance: SolStreamService? = null
+        val MASTER_BITRATE_LADDER_KBPS = intArrayOf(
+            500, 800, 1000, 1500, 2000, 3000, 4500, 6000, 8000, 10000, 12000, 14000,
+            16000, 18000, 20000, 24000, 30000, 35000, 40000, 50000, 65000, 80000, 100000
+        )
+        val MIC_GAIN_STEPS = intArrayOf(50, 75, 100, 125, 150, 175, 200, 225, 250)
+        val GAME_GAIN_STEPS = intArrayOf(0, 25, 50, 75, 100, 125, 150, 175, 200, 225, 250)
+
+        @Volatile var instance: SolStreamService? = null
+        @Volatile var onStateChangedListener: (() -> Unit)? = null
+        @Volatile var needsProjectionReapproval: Boolean = false
+        @Volatile var currentLiveStateLabel: String = "IDLE (Ready)"
 
         val isBroadcastLive: Boolean
             get() = instance?.broadcastActive == true
@@ -2200,11 +2268,67 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
         val isBenchmarkRunning: Boolean
             get() = instance?.benchmarkOnlyActive == true
 
+        val isGlipBenchmarkRunning: Boolean
+            get() = instance?.benchmarkOnlyActive == true
+
         fun pushLiveSettingsIfRunning(settings: StreamSettings) {
             val svc = instance ?: return
             if (svc.broadcastActive) {
                 svc.mainHandler.post { svc.saveAndPushSettings(settings) }
             }
+        }
+
+        private fun loadOverlayPositionPrefs(context: Context): Pair<Int, Int> {
+            val prefs = context.getSharedPreferences(OVERLAY_PREFS, Context.MODE_PRIVATE)
+            return prefs.getInt(KEY_OV_X, 24) to prefs.getInt(KEY_OV_Y, 120)
+        }
+
+        private fun saveOverlayPositionPrefs(context: Context, x: Int, y: Int) {
+            context.getSharedPreferences(OVERLAY_PREFS, Context.MODE_PRIVATE)
+                .edit()
+                .putInt(KEY_OV_X, x)
+                .putInt(KEY_OV_Y, y)
+                .apply()
+        }
+
+        internal fun saveReportToLocalArchive(context: Context, header: String, body: String) {
+            try {
+                val prefs = context.getSharedPreferences(OVERLAY_PREFS, Context.MODE_PRIVATE)
+                val arr = org.json.JSONArray(prefs.getString(KEY_ARCHIVE_JSON, "[]") ?: "[]")
+                val entry = org.json.JSONObject().apply {
+                    put("header", header)
+                    put("body", body)
+                }
+                val updated = org.json.JSONArray()
+                updated.put(entry)
+                for (i in 0 until min(9, arr.length())) {
+                    updated.put(arr.getJSONObject(i))
+                }
+                prefs.edit().putString(KEY_ARCHIVE_JSON, updated.toString()).apply()
+            } catch (_: Exception) {
+            }
+        }
+
+        internal fun loadLocalReportArchive(context: Context): List<Pair<String, String>> {
+            return try {
+                val prefs = context.getSharedPreferences(OVERLAY_PREFS, Context.MODE_PRIVATE)
+                val arr = org.json.JSONArray(prefs.getString(KEY_ARCHIVE_JSON, "[]") ?: "[]")
+                val out = mutableListOf<Pair<String, String>>()
+                for (i in 0 until arr.length()) {
+                    val obj = arr.optJSONObject(i) ?: continue
+                    out.add(obj.optString("header", "Session") to obj.optString("body", ""))
+                }
+                out
+            } catch (_: Exception) {
+                emptyList()
+            }
+        }
+
+        internal fun clearLocalReportArchive(context: Context) {
+            context.getSharedPreferences(OVERLAY_PREFS, Context.MODE_PRIVATE)
+                .edit()
+                .remove(KEY_ARCHIVE_JSON)
+                .apply()
         }
 
         internal fun formatOverlayQueueTag(qFrames: Int): String =
@@ -2236,6 +2360,8 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
             val bytesOk = (qBytes < 0L) || (qBytes in 0L..180_000L)
             return framesOk && bytesOk
         }
+
+        fun isAccessibilityConnected(context: Context): Boolean = isAccessibilityEnabled(context)
 
         fun isAccessibilityEnabled(context: Context): Boolean {
             return try {
