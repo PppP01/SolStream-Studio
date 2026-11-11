@@ -521,7 +521,7 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
         lastThermalReducedBps = -1
         lastRttProbeElapsedMs = 0L
 
-        valshortsKey = KeystoreVault.loadSecondaryKey(this, KeystoreVault.Slot.YOUTUBE_SHORTS_9_16)
+        val shortsKey = KeystoreVault.loadSecondaryKey(this, KeystoreVault.Slot.YOUTUBE_SHORTS_9_16)
         val useShortsKeyAsPrimary = activeSettings.isVertical &&
             activeSettings.platformPreset == "YOUTUBE" &&
             !shortsKey.isNullOrBlank()
