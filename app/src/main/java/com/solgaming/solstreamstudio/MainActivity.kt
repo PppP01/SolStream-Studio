@@ -135,7 +135,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var btnKeyframeAndBFrames: Button
     private lateinit var btnQpAndLatency: Button
 
-    // Card 4: 15-Stage SOL LUXE Audio, 250% Game Soundstage & 10s Calibrator
+    // Card 4: 15-Stage SolLuxe Audio, 250% Game Soundstage & 10s Calibrator
     private lateinit var btnMicDevice: Button
     private lateinit var btnMicSource: Button
     private lateinit var btnAudioBitrate: Button
@@ -256,7 +256,7 @@ class MainActivity : AppCompatActivity() {
                     KeystoreVault.markInitialAutoScanDone(this)
                 }
                 tvHeaderSubtitle.text =
-                    "${scanSummary.deviceModel} (${scanSummary.socModel}) • Android ${scanSummary.androidRelease}\n${scanSummary.toBadgeText()}"
+                    "SolApex™ HyperStream Engine • ${scanSummary.deviceModel} (${scanSummary.socModel}) • Android ${scanSummary.androidRelease}\n${scanSummary.toBadgeText()}"
                 refreshAllUi()
             }
         }
@@ -328,7 +328,7 @@ class MainActivity : AppCompatActivity() {
             layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
         }
         val verBadge = TextView(this).apply {
-            text = "v$appVersionName • NO ROOT"
+            text = "v$appVersionName • SolApex™"
             setTextColor(Color.parseColor("#FFC400"))
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
             typeface = Typeface.DEFAULT_BOLD
@@ -339,7 +339,7 @@ class MainActivity : AppCompatActivity() {
         titleRow.addView(verBadge)
 
         tvHeaderSubtitle = TextView(this).apply {
-            text = "${scanSummary.deviceModel} (${scanSummary.socModel}) • Android ${scanSummary.androidRelease}\n${scanSummary.toBadgeText()}"
+            text = "SolApex™ HyperStream Engine • ${scanSummary.deviceModel} (${scanSummary.socModel}) • Android ${scanSummary.androidRelease}\n${scanSummary.toBadgeText()}"
             setTextColor(Color.parseColor("#90A4AE"))
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
             setPadding(0, dp(4), 0, dp(8))
@@ -448,8 +448,8 @@ class MainActivity : AppCompatActivity() {
         )
         container.addView(cardPreflight)
 
-        // === CARD 2: ENCRYPTED STREAM VAULT, SHORTS KEY & SIMULCAST ===
-        val cardStream = sectionCard("2. Encrypted RTMPS Vault, 9:16 Shorts Key & Simulcast")
+        // === CARD 2: SOLRELAY OMEGA ENCRYPTED STREAM VAULT, SHORTS KEY & SIMULCAST ===
+        val cardStream = sectionCard("2. SolRelay Omega™ Vault, 9:16 Shorts Key & Simulcast")
         btnPlatformPreset = actionButton("", "#1E3A5F") { cyclePlatformPreset() }
         cardStream.addView(btnPlatformPreset)
 
@@ -581,10 +581,10 @@ class MainActivity : AppCompatActivity() {
         cardStream.addView(tvNetTestResult)
         container.addView(cardStream)
 
-        // === CARD 3: VIDEO ENGINE, 360p-4K60, 0.5-100 Mbps, STACKABLE VISUALS & SCENES ===
-        val cardVideo = sectionCard("3. Video Engine (360p–4K60 • 0.5–100 Mbps • Stackable Visuals)")
+        // === CARD 3: SOLCORE ULTRA VIDEO ENGINE & SOLCODEC (360p-4K60, STRETCH, STACKABLE VISUALS) ===
+        val cardVideo = sectionCard("3. SolCore Ultra™ Video Engine & SolCodec (360p–4K60 • 0.5–100 Mbps)")
         cardVideo.addView(
-            bodyText("Plays at 120–185 Hz on screen while hardware silicon encodes 60/30 FPS. Combine any SDR visual filters below live with zero stream interruption!")
+            bodyText("Plays at 120–185 Hz on screen while hardware silicon encodes 60/30 FPS. Use 'STRETCH' Framing for full 16:9 zero-bars with 100% HUD visible!")
         )
 
         btnCodec = actionButton("", "#1C2836") { cycleCodec() }
@@ -652,15 +652,15 @@ class MainActivity : AppCompatActivity() {
             layoutParams = lp
         }
         btnToggleSceneProDrawer = actionButton(
-            "▼ Expand: Custom Scenes, .PNG Overlay, Text Banner & Pro Silicon",
+            "▼ Expand: Custom Scenes, .PNG Overlay, Text Banner & SolCodec Silicon",
             "#162234"
         ) {
             val show = boxSceneProDrawer.visibility != View.VISIBLE
             boxSceneProDrawer.visibility = if (show) View.VISIBLE else View.GONE
             btnToggleSceneProDrawer.text = if (show) {
-                "▲ Hide: Custom Scenes, .PNG Overlay, Text Banner & Pro Silicon"
+                "▲ Hide: Custom Scenes, .PNG Overlay, Text Banner & SolCodec Silicon"
             } else {
-                "▼ Expand: Custom Scenes, .PNG Overlay, Text Banner & Pro Silicon"
+                "▼ Expand: Custom Scenes, .PNG Overlay, Text Banner & SolCodec Silicon"
             }
         }
 
@@ -717,7 +717,7 @@ class MainActivity : AppCompatActivity() {
         boxSceneProDrawer.addView(btnShortsBackdrop)
         boxSceneProDrawer.addView(btnMinimapShield)
 
-        boxSceneProDrawer.addView(labelText("Pro Silicon & OpenGL Engine Controls:"))
+        boxSceneProDrawer.addView(labelText("SolCodec™ Silicon & OpenGL Engine Controls:"))
         btnGlEngine = actionButton("", "#1C2836") { cycleGlEngine() }
         btnHdr10 = actionButton("", "#1C2836") {
             updateSetting(settings.copy(hdr10Enabled = !settings.hdr10Enabled), requiresRestartIfLive = true)
@@ -734,10 +734,10 @@ class MainActivity : AppCompatActivity() {
         cardVideo.addView(boxSceneProDrawer)
         container.addView(cardVideo)
 
-        // === CARD 4: 15-STAGE SOL LUXE AUDIO, 250% GAME SOUNDSTAGE & 10s CALIBRATOR ===
-        val cardAudio = sectionCard("4. 15-Stage SOL LUXE Voice Studio & 250% Game Soundstage")
+        // === CARD 4: 15-STAGE SOLLUXE AUDIO, 250% GAME SOUNDSTAGE & 10s CALIBRATOR ===
+        val cardAudio = sectionCard("4. 15-Stage SolLuxe™ Voice Studio & 250% Game Soundstage")
         cardAudio.addView(
-            bodyText("Processes ONLY your voice in 32-bit float (64-bit Double EQ) + C 48kHz RNNoise + Spark/Hammer Blanker before mixing onto stereo game audio. Never alters your earphones!")
+            bodyText("Locks 48 kHz studio mic in AUTO mode (keeps Bluetooth earphones in stereo Game Mode!) + 64-bit Double MEMS EQ + 5.2 kHz Velvet Air + Unified 3-Zone Dynamics.")
         )
 
         btnMicDevice = actionButton("", "#1C2836") { cycleMicInputDevice() }
@@ -747,7 +747,7 @@ class MainActivity : AppCompatActivity() {
         cardAudio.addView(btnMicDevice)
         cardAudio.addView(buttonRow(btnMicSource, btnAudioBitrate))
 
-        cardAudio.addView(labelText("Voice Profile (Pick 1 — Tunes Chest Warmth, Mud Cut & De-Esser):"))
+        cardAudio.addView(labelText("Voice Profile (Pick 1 — Tunes Chest Warmth, 300Hz Mud Cut, 5.2kHz Air & De-Esser):"))
         btnGenderNeutral = actionButton("Neutral", "#1C2836") {
             updateSetting(settings.copy(voiceGenderProfile = "NEUTRAL"))
         }
@@ -920,7 +920,7 @@ class MainActivity : AppCompatActivity() {
 
         // === FOOTER ===
         val footer = TextView(this).apply {
-            text = "ॐ नमः शिवाय\nMade by Sol (@Sol_CODM) • SolStream Studio Ultra • Zero-Ad No-Root Broadcast Engine"
+            text = "ॐ नमः शिवाय\nMade by Sol (@Sol_CODM) • Powered by SolApex™ HyperStream Engine (SolCore Ultra • SolLuxe • SolRelay Omega • SolCodec)"
             setTextColor(Color.parseColor("#78909C"))
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
             gravity = Gravity.CENTER
@@ -937,7 +937,9 @@ class MainActivity : AppCompatActivity() {
         tier: DeviceTier,
         scan: DeviceScanSummary
     ): StreamSettings {
-        val hevcOk = scan.hevcHardware?.verifiedSurfaceConfigure == true
+        val hevcOk = scan.hevcHardware?.let {
+            it.verifiedRealEncode || it.verifiedSurfaceConfigure || it.advertisedByMetadata
+        } == true
         val codec = if (hevcOk) "HEVC" else "H264"
         return when (tier) {
             DeviceTier.LITE -> MicDspProcessor.applyPresetToSettings(base, "CLEAN").copy(
@@ -1004,6 +1006,17 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun refreshHardwareAndMicsAsync() {
+        // Never run hardware MediaCodec probing while a live broadcast is active!
+        if (SolStreamService.isBroadcastLive) {
+            micOptions = CodecCapabilityProbe.listAvailableMicInputs(this)
+            refreshAllUi()
+            Toast.makeText(
+                this,
+                "Microphone list refreshed live! (Hardware encoder scan skipped while stream is active.)",
+                Toast.LENGTH_SHORT
+            ).show()
+            return
+        }
         if (!hwScanBusy.compareAndSet(false, true)) return
         Toast.makeText(this, "Scanning hardware encoders & microphones...", Toast.LENGTH_SHORT).show()
         CodecCapabilityProbe.scanDeviceAsync(this, forceRefresh = true) { freshScan ->
@@ -1012,7 +1025,7 @@ class MainActivity : AppCompatActivity() {
                 scanSummary = freshScan
                 micOptions = CodecCapabilityProbe.listAvailableMicInputs(this)
                 tvHeaderSubtitle.text =
-                    "${scanSummary.deviceModel} (${scanSummary.socModel}) • Android ${scanSummary.androidRelease}\n${scanSummary.toBadgeText()}"
+                    "SolApex™ HyperStream Engine • ${scanSummary.deviceModel} (${scanSummary.socModel}) • Android ${scanSummary.androidRelease}\n${scanSummary.toBadgeText()}"
                 refreshAllUi()
                 Toast.makeText(this, "Hardware & mic list refreshed!", Toast.LENGTH_SHORT).show()
             }
@@ -1039,11 +1052,11 @@ class MainActivity : AppCompatActivity() {
             SolStreamService.needsProjectionReapproval ->
                 "STATUS: Screen capture paused by Android (lock/system). Tap orange button below to re-approve!"
             isLive ->
-                "STATUS: ${SolStreamService.connectionStateLabel} • All live controls below & 3-Tab Floating Pill sync instantly!"
+                "STATUS: ${SolStreamService.currentLiveStateLabel} • All live controls below & 3-Tab Floating Pill sync instantly!"
             SolStreamService.isGlipBenchmarkRunning ->
                 "STATUS: Passive Benchmark Recording Thermal & RAM for $benchmarkTargetAppName..."
             else ->
-                "STATUS: Ready in Pre-Stream Studio Ultra (0% background load when idle)"
+                "STATUS: Ready in SolApex™ Pre-Stream Studio (0% background load when idle)"
         }
         btnReapproveCapture.visibility = if (SolStreamService.needsProjectionReapproval) View.VISIBLE else View.GONE
 
@@ -1119,7 +1132,8 @@ class MainActivity : AppCompatActivity() {
         btnRateControl.text = "Rate: ${if (settings.useVbr) "VBR (Test)" else "CBR (Rec)"}$restartSuffix"
         btnAbr.text = "Ping Guard ABR 2.0: ${onOff(settings.adaptiveBitrate)}"
         btnUpscaler.text = "Upscaler: ${settings.upscalerMode}"
-        btnFraming.text = "Framing: ${settings.framingMode}"
+        val frameDisp = if (settings.framingMode == "STRETCH") "STRETCH (16:9 Full)" else settings.framingMode
+        btnFraming.text = "Framing: $frameDisp"
         btnSmartZoom.text = "Zoom: ${settings.smartZoomPercent}%"
 
         btnFilmic.text = "Cinematic Filmic: ${onOff(settings.cinematicFilmic)}"
@@ -1156,18 +1170,18 @@ class MainActivity : AppCompatActivity() {
             (if (!hdrSupported) " (HW 8-Bit Only)" else "") + restartSuffix
         btnRoiMode.text = "Hardware ROI Focus: ${settings.roiMode} (Crosshair/Minimap QP Boost)"
         btnKeyframeAndBFrames.text = "IDR Keyframe: ${settings.keyframeIntervalSec}s | B-Frames: ${settings.maxBFrames}$restartSuffix"
-        val qpLabel = if (settings.qpMaxCap == 0) "Auto" else "${settings.qpMaxCap}"
-        btnQpAndLatency.text = "QP Max Cap: $qpLabel | Low-Lat Codec Hint: ${onOff(settings.lowLatencyCodecHint)}$restartSuffix"
+        val qpLabel = if (settings.qpMaxCap == 0) "Auto (Min QP 14)" else "14..${settings.qpMaxCap}"
+        btnQpAndLatency.text = "QP Range: $qpLabel | Low-Lat Hint: ${onOff(settings.lowLatencyCodecHint)}$restartSuffix"
 
         // Audio Studio
         val selectedMicLabel = micOptions.firstOrNull { it.deviceId == settings.micDeviceId }?.label
-            ?: micOptions.firstOrNull()?.label ?: "Auto Phone Mic"
+            ?: micOptions.firstOrNull()?.label ?: "Auto (Phone Studio Mic Locked)"
         btnMicDevice.text = "Mic Input: $selectedMicLabel"
         val srcName = when (settings.micAudioSource) {
             1 -> "MIC (Raw)"
-            6 -> "VOICE_REC (BT/Headset)"
+            6 -> "VOICE_REC (Wideband 48kHz)"
             7 -> "VOICE_COMM (Speaker AEC)"
-            else -> "AUTO (Smart)"
+            else -> "AUTO (48kHz Studio Wideband)"
         }
         btnMicSource.text = "Source: $srcName"
         btnAudioBitrate.text = "Master AAC: ${settings.audioBitrateKbps} kbps$restartSuffix"
@@ -1210,11 +1224,11 @@ class MainActivity : AppCompatActivity() {
         // Individual Voice Stage Switches
         btnStageHpf.text = if (settings.hpfCutoffHz == 0) "1. HPF Rumble: OFF" else "1. HPF Rumble: ${settings.hpfCutoffHz} Hz"
         btnStageTransient.text = "2. Spark/Hammer & Grip Blanker: ${onOff(settings.transientTamerEnabled)}"
-        btnStageGate.text = "3. Idle Breath Expander: ${onOff(settings.noiseGateEnabled)}"
-        btnStageEq.text = "4. ${settings.voiceGenderProfile} 3-Band EQ: ${onOff(settings.voiceEqEnabled)}"
+        btnStageGate.text = "3. 0-ms Instant Breath Gate: ${onOff(settings.noiseGateEnabled)}"
+        btnStageEq.text = "4. ${settings.voiceGenderProfile} MEMS 3-Band EQ: ${onOff(settings.voiceEqEnabled)}"
         btnStageDeEss.text = "5. Split-Band De-Esser: ${onOff(settings.deEsserEnabled)}"
-        btnStageVelvet.text = "6. Velvet Warmth & Air: ${onOff(settings.velvetWarmthEnabled)}"
-        btnStageComp.text = "7. 3:1 Vocal Compressor: ${onOff(settings.compressorEnabled)}"
+        btnStageVelvet.text = "6. 5.2kHz Velvet Air & Exciter: ${onOff(settings.velvetWarmthEnabled)}"
+        btnStageComp.text = "7. 12ms-Punch 3:1 Compressor: ${onOff(settings.compressorEnabled)}"
         btnStageWhisper.text = "8. Whisper Callout Lift: ${onOff(settings.whisperLiftEnabled)}"
         btnStageSlowAgc.text = "9. Speech-Gated Slow AGC: ${onOff(settings.slowAgcEnabled)}"
         btnStageSpeakerAec.text = "10. Speaker Echo Canceler: ${onOff(settings.speakerAecEnabled)}"
@@ -1254,10 +1268,7 @@ class MainActivity : AppCompatActivity() {
         settings = newSettings
         KeystoreVault.saveSettings(this, settings)
         if (SolStreamService.isBroadcastLive) {
-            SolStreamService.instance?.applyDashboardSettingsLive(
-                newSettings = settings,
-                userToggledSharp = userToggledSharp
-            )
+            SolStreamService.instance?.applyDashboardSettingsLive(settings)
             if (requiresRestartIfLive) {
                 Toast.makeText(
                     this,
@@ -1351,11 +1362,8 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun cycleFraming() {
-        val next = when (settings.framingMode) {
-            "FIT" -> "SMART"
-            "SMART" -> "FILL"
-            else -> "FIT"
-        }
+        val order = listOf("FIT", "STRETCH", "SMART", "FILL")
+        val next = order[(order.indexOf(settings.framingMode) + 1) % order.size]
         updateSetting(settings.copy(framingMode = next))
     }
 
@@ -1459,7 +1467,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun cycleHpf() {
         val next = when (settings.hpfCutoffHz) {
-            0 -> 75; 75 -> 85; 85 -> 100; 100 -> 120; else -> 0
+            0 -> 75; 75 -> 80; 80 -> 85; 85 -> 100; 100 -> 120; else -> 0
         }
         updateSetting(settings.copy(hpfCutoffHz = next))
     }
@@ -1528,33 +1536,29 @@ class MainActivity : AppCompatActivity() {
 
     private fun showPlainEnglishGlossaryDialog() {
         val guide = """
-            === SOLSTREAM STUDIO ULTRA — PLAIN-ENGLISH WORD GLOSSARY ===
+            === SOLSTREAM STUDIO ULTRA (SolApex™ HyperStream Engine) — GUIDE & GLOSSARY ===
 
-            [VIDEO & GRAPHICS TERMS]
-            • HEVC (H.265) vs. H.264 vs. AV1: Video compression chips inside your phone. Keep HEVC for YouTube (gives ~40% sharper 1440p60/1080p60 video than H.264 at the same internet speed). Use H.264 for Twitch/Kick or Simulcast.
-            • CBR vs. VBR: CBR (Constant Bitrate) sends steady internet data preferred by YouTube/Twitch. VBR varies speed. Keep CBR ON.
-            • Ping Guard ABR 2.0: Watches your phone's outgoing Wi-Fi packet queue. If your internet slows down, it lowers stream Mbps smoothly BEFORE lag hits your CODM ping.
-            • Upscaler (Bilinear / Bicubic / Lanczos): How gameplay is scaled to 1080p/1440p/4K. Bilinear is coolest; Bicubic is crisp & balanced; Lanczos is ultra-sharp for flagship GPUs.
-            • Cinematic Filmic: Movie-style S-curve contrast that prevents bright flashbangs/skies from washing out while deepening shadows.
-            • AMOLED Vivid Pop: Boosts muted mid-tone colors without over-saturating red HUD icons.
-            • Shadow Boost: Gently brightens only dark indoor corners (like gaming monitor Black eQualizer) so viewers spot enemies in dark rooms.
-            • GPU Crisp Sharpen: Sharpens crosshair and HUD edges. Keep OFF on 4-hour Battle Royale streams for the coolest phone temperature.
-            • True 10-Bit HDR10 (HLG): Streams 1.07 billion colors on supported flagship chips so YouTube displays the official HDR badge.
-            • Hardware ROI (Region of Interest): Tells your video chip to spend extra clarity bits on the center crosshair and minimap.
-            • QP (Quantization Parameter): Video compression amount (lower QP = sharper image; QP 8–26 is crystal clear).
+            [SOLAPEX™ HYPERSTREAM ENGINE ARCHITECTURE]
+            • SolCore Ultra (Video Engine): Direct-TBDR OpenGL ES 3.0/2.0 renderer with precomputed vertex UV offsets, zero-ALU passthrough, and 10-bit HDR10 verification.
+            • SolLuxe (Audio Engine): 15-stage 32-bit float / 64-bit double voice & stereo game studio with Native C 48 kHz RNNoise and Unified 3-Zone Dynamics.
+            • SolRelay Omega (Broadcast Engine): RTMPS engine with Queue-Aware Ping Guard ABR 2.0, zombie-socket recovery, and single-encode simulcast.
+            • SolCodec (Hardware Silicon Layer): Verified hardware MediaCodec selector with QP 14 lossless floor, ROI focus, and automatic live resolution fallback ladder.
 
-            [VOICE & GAME SOUNDSTAGE TERMS]
-            • Voice Profile (Neutral / Male / Female): Tunes chest warmth (115/135/165 Hz), mud cut, and De-Esser frequencies to match your vocal cords.
-            • SOL LUXE (Studio + Velvet): Our flagship 10-stage broadcast voice chain combining Native C RNNoise, Spark/Hammer Blanker, 3-band EQ, Split-Band De-Esser, Velvet tube warmth, Whisper Lift, 3:1 Compressor, and Slow AGC.
-            • Native C RNNoise: Real 48 kHz neural network compiled in C that erases ceiling-fan wind, AC hum, and drill whine while keeping your natural voice intact.
-            • Spark/Hammer & Grip Blanker: Sub-millisecond slew detector that clamps multi-strike mosquito-racket zaps ("phat-phat-phat"), construction hammering, and finger taps by up to 92% before they reach the stream.
-            • HPF (High-Pass Filter): Cuts deep rumble below 75–120 Hz (wall vibration, finger taps on glass, and fan wind).
-            • Split-Band De-Esser: Softens harsh "S" and "SH" sounds without making your voice sound muffled.
-            • Speech-Gated Slow AGC: Gently evens out quiet vs. loud speech and freezes when you stop talking so background noise is never boosted.
-            • VAD Auto-Ducking: Automatically dips ONLY the stream's game volume by 20–50% during the exact moments you speak, then glides back to 100%.
-            • Cinema 3D Wide: Widens stereo game footsteps/ambience around your dead-center voice on stream (never alters your own earphones!).
-            • Theater Sub-Punch & Footstep Focus: Adds +1.8 dB @ 65 Hz theater bass punch or +2.0 dB @ 2.85 kHz footstep clarity for viewers.
-            • Blast Tamer: Softens sudden jarring predator-missile/grenade volume spikes for late-night headphone viewers.
+            [VIDEO & FRAMING TERMS]
+            • Framing (FIT / STRETCH / SMART / FILL):
+              - FIT: Shows 100% of your phone screen with thin black bars at top/bottom.
+              - STRETCH (Full 16:9 Zero-Bars): Maps all 4 corners of your phone screen directly to all 4 corners of 360p, 480p, 720p, 1080p, 1440p, or 4K! Gives ZERO black bars on laptops/TVs while keeping 100% of your CODM HUD buttons visible!
+              - SMART (104%–120%): Zooms partway to reduce top/bottom bars.
+              - FILL: Zooms until bars disappear (crops ~9% of left/right edges).
+            • HEVC (H.265) vs. H.264 vs. AV1: Keep HEVC for YouTube (~40% sharper 1440p60/1080p60 video than H.264 at the same Mbps). Use H.264 for Twitch/Kick or Simulcast.
+            • Upscaler (Bilinear / Bicubic / Lanczos): Bilinear is coolest; Bicubic is crisp & balanced; Lanczos is ultra-sharp for flagship GPUs.
+            • 2-Stage Ground-Reality Thermal Armor: Above 44.0°C & 90% SoC load, gently trims repeat-frame GPU work & 15% Mbps while keeping full 60 FPS. If Severe warmth occurs, steps to 30 FPS AND lowers Mbps by 40% (with a QP 14 floor) so CODM gunfire never stutters!
+
+            [SOLLUXE™ VOICE & GAME SOUNDSTAGE TERMS]
+            • Mic Input AUTO (Phone Studio Mic Locked): Automatically locks onto your phone's 48 kHz studio microphone using VOICE_RECOGNITION wideband mode—even if you leave Bluetooth 'Calls ON' in Android settings!
+            • Voice Profile (Neutral / Male / Female): Tunes chest body (125/150/185 Hz), two-hand grip mud cut (-3.2 to -3.4 dB @ 300/335/375 Hz), callout clarity (+2.8 dB @ 3.15–3.65 kHz), 5.1–5.6 kHz Velvet Air Shelf, and De-Esser.
+            • SOL LUXE (Studio + Velvet): Combines Native C 48kHz RNNoise, Consonant-Safe Spark/Hammer Blanker, 0-ms Instant Gate, MEMS 3-Band EQ, Split-Band De-Esser, 5.2 kHz Velvet Air + Adaptive Clarity Exciter, and Unified 3-Zone Gain Controller (Whisper Lift + Slow AGC + 12ms-Punch 3:1 Compressor).
+            • Cinema 3D Wide, Sub-Punch, Footsteps & Blast Tamer: Enhances stereo game audio for your stream viewers without altering your own earphones!
         """.trimIndent()
 
         val tv = TextView(this).apply {
@@ -1569,7 +1573,7 @@ class MainActivity : AppCompatActivity() {
             addView(tv)
         }
         AlertDialog.Builder(this)
-            .setTitle("Plain-English Guide & Word Glossary")
+            .setTitle("SolApex™ Plain-English Guide & Glossary")
             .setView(scroll)
             .setPositiveButton("Got It", null)
             .show()
@@ -1793,6 +1797,28 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun requestScreenCaptureAndGoLive() {
+        // Gate Go Live if initial 1-second startup hardware scan is still running so probe & live codecs never contend
+        if (CodecCapabilityProbe.isHardwareProbeCurrentlyRunning()) {
+            Toast.makeText(
+                this,
+                "Finishing 1-second hardware encoder check—launching stream...",
+                Toast.LENGTH_SHORT
+            ).show()
+            Thread({
+                var waitedMs = 0
+                while (CodecCapabilityProbe.isHardwareProbeCurrentlyRunning() && waitedMs < 1500) {
+                    try { Thread.sleep(60) } catch (_: InterruptedException) { break }
+                    waitedMs += 60
+                }
+                runOnUiThread {
+                    if (!isFinishing && !isDestroyed && !SolStreamService.isBroadcastLive) {
+                        val mpm = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+                        projectionLauncher.launch(mpm.createScreenCaptureIntent())
+                    }
+                }
+            }, "SolWaitProbeBeforeLive").start()
+            return
+        }
         val mpm = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
         projectionLauncher.launch(mpm.createScreenCaptureIntent())
     }
@@ -2047,9 +2073,16 @@ class MainActivity : AppCompatActivity() {
 
     // === MULTI-DAY SESSION REPORT VIEWER & ARCHIVE MANAGER ===
     private fun showDiagnosticsDialog(showingArchived: Boolean = false) {
-        val archivedCount = SolStreamService.getArchivedReportCount(this)
+        val archiveList = SolStreamService.loadLocalReportArchive(this)
+        val archivedCount = archiveList.size
         val reportText = if (showingArchived) {
-            SolStreamService.loadArchivedReports(this)
+            if (archiveList.isEmpty()) {
+                "No past session reports archived yet. Complete a live stream or benchmark session first."
+            } else {
+                archiveList.mapIndexed { idx, (hdr, body) ->
+                    "=== SAVED SESSION #${idx + 1}: $hdr ===\n$body"
+                }.joinToString("\n\n--------------------------------------------\n\n")
+            }
         } else {
             DiagnosticsLogger.buildShareableReport(this)
         }
@@ -2086,7 +2119,7 @@ class MainActivity : AppCompatActivity() {
             }
             .setNegativeButton(if (showingArchived && archivedCount > 0) "Delete History" else "Close") { _, _ ->
                 if (showingArchived && archivedCount > 0) {
-                    SolStreamService.clearArchivedReports(this)
+                    SolStreamService.clearLocalReportArchive(this)
                     Toast.makeText(this, "Archived session history deleted.", Toast.LENGTH_SHORT).show()
                 }
             }
@@ -2180,13 +2213,14 @@ class MainActivity : AppCompatActivity() {
             • Return here and tap '4. Unlock Restricted (⋮)' -> tap ⋮ at top-right -> 'Allow restricted settings'.
             • Tap '3. Tap Accessibility 1st' again and switch SolStream Studio ON!
 
-            2. AIRPODS / BLUETOOTH NECKBAND / WIRED EARPHONES:
-            • For Bluetooth Earphones (realme Buds / AirPods): To keep full stereo footsteps + low-latency Game Mode while using your phone's 48 kHz studio mic, open Bluetooth Settings -> Earphones Gear -> toggle Calls OFF (keep Audio ON).
-            • On Samsung: Settings -> Sounds and vibration -> Separate app sound -> lock Call of Duty to Bluetooth.
+            2. AIRPODS / BLUETOOTH NECKBAND / WIRED EARPHONES (AUTO STUDIO MIC LOCK):
+            • In 'Auto (Phone Studio Mic Locked)' mode, SolStream automatically locks onto your phone's 48 kHz studio microphone using VOICE_RECOGNITION wideband mode—even if you leave Bluetooth 'Calls ON'!
+            • Optional on Samsung: Settings -> Sounds and vibration -> Separate app sound -> lock Call of Duty to Bluetooth for extra routing isolation.
             • Wired 3.5mm & USB-C Headsets work automatically in full stereo!
 
-            3. KEEPING BATTLE ROYALE (BR) COOL ON 4+ HOUR STREAMS:
-            • Open-world BR pushes 2x more GPU load than 5v5 MP. Keep in-game CODM graphics on Low + Ultra FPS and 'GPU Crisp Sharpen' OFF for BR, or use 1080p60 (44% less heat than 1440p60) when room fan speed is low!
+            3. ZERO-BARS 16:9 FRAMING & KEEPING BATTLE ROYALE COOL:
+            • Set Framing to 'STRETCH (16:9 Full)' to fill 100% of 1080p/1440p/4K screens with zero black bars and 100% of your CODM HUD visible!
+            • Our 2-Stage Thermal Armor automatically cools repeat frames at 44.0°C (90% SoC load) and scales bitrate proportionally (-40%) if 30 FPS Cooldown activates so CODM gunfire never stutters.
         """.trimIndent()
 
         AlertDialog.Builder(this)
@@ -2224,7 +2258,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun isAccessibilityServiceEnabled(): Boolean {
-        if (SolStreamService.isAccessibilityConnected) return true
+        if (SolStreamService.isAccessibilityConnected(this)) return true
         val enabled = Settings.Secure.getString(contentResolver, Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES) ?: return false
         return enabled.contains("$packageName/${SolStreamService::class.java.name}") ||
             enabled.contains("$packageName/.SolStreamService")
