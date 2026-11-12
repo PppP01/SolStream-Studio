@@ -52,8 +52,8 @@ android {
         applicationId = "com.solgaming.solstreamstudio"
         minSdk = 29
         targetSdk = 36
-        versionCode = 6
-        versionName = "1.1.2"
+        versionCode = 7
+        versionName = "1.1.3"
 
         ndk {
             abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64")
