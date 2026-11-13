@@ -18,6 +18,8 @@ import android.os.BatteryManager
 import android.os.Build
 import android.os.Debug
 import android.os.PowerManager
+import android.os.SystemClock
+import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.text.SimpleDateFormat
@@ -86,24 +88,29 @@ data class BenchmarkSnapshot(
 object DiagnosticsLogger {
 
     private const val MAX_EVENTS = 160
-    private const val MAX_CLIPS = 50
+    private const val MAX_CLIPS = 60
     private const val PREFS_BENCH = "solstream_benchmarks"
     private const val KEY_LAST_SOL_BENCH = "last_solstream_bench_json"
     private const val KEY_LAST_GLIP_BENCH = "last_glip_bench_json"
     private const val KEY_LAST_CRASH = "last_uncaught_exception"
+    private const val KEY_SAVED_CLIPS_JSON = "saved_stream_clips_json"
 
     private val events = ArrayDeque<SessionEvent>(MAX_EVENTS)
     private val clipHighlights = ArrayList<String>(MAX_CLIPS)
+    private val timeFmtLock = Any()
     private val timeFmt = SimpleDateFormat("HH:mm:ss", Locale.US)
 
     private val secretUrlRegex = Regex("(rtmps?://[^/\\s]+/[^/\\s]+/)([^\\s?\"']+)", RegexOption.IGNORE_CASE)
     private val queryKeyRegex = Regex("(stream_?key=|key=|token=|auth=)([^&\\s\"']+)", RegexOption.IGNORE_CASE)
 
     @Volatile private var crashHandlerInstalled = false
+    @Volatile private var lastPssSampleRealtimeMs: Long = 0L
+    @Volatile private var lastAiClutchRealtimeMs: Long = 0L
+    @Volatile private var finalMicStatusSnapshot: String = ""
 
     @Volatile var sessionStartMs: Long = 0L
     @Volatile var activePipelineDesc: String = "Idle (Not Streaming)"
-    @Volatile var activeAudioDspDesc: String = "SolLuxe 32-Bit Float + C RNNoise"
+    @Volatile var activeAudioDspDesc: String = "SolLuxe™ 2.0 32-Bit Float + Native C RNNoise"
     @Volatile var activeSimulcastDesc: String = "Primary Only"
     @Volatile var startTempC: Float = 0f
     @Volatile var peakTempC: Float = 0f
@@ -112,6 +119,8 @@ object DiagnosticsLogger {
     @Volatile var lastThermalHeadroom: Float = -1f
 
     @Volatile var lastBatteryPercent: Int = 100
+    @Volatile var startPowerSourceLabel: String = "Battery"
+    @Volatile var lastPowerSourceLabel: String = "Battery"
     @Volatile var peakTotalPssMb: Int = 0
     @Volatile var lastJavaHeapMb: Int = 0
     @Volatile var lastNativeHeapMb: Int = 0
@@ -125,19 +134,28 @@ object DiagnosticsLogger {
     @Volatile var freshCaptureFps: Int = 0
     @Volatile var repeatedFramesCount: Long = 0L
     @Volatile var lastAverageQp: Int = -1
-    @Volatile var lastQueueBytes: Long = -1L
-    @Volatile var lastQueueFrames: Int = -1
-    @Volatile var lastQueueCapacity: Int = -1
+    @Volatile var lastQueueBytes: Long = 0L
+    @Volatile var lastQueueFrames: Int = 0
+    @Volatile var lastQueueCapacity: Int = 60
+    @Volatile var lastSendLatencyMs: Long = 1L
     @Volatile var lastRttMs: Long = -1L
     @Volatile var avDriftMs: Long = 0L
     @Volatile var micStatusLabel: String = "Ready"
     @Volatile var lastActiveAudioPolicySnapshot: String = ""
+
+    private fun formatWallClockNow(): String {
+        synchronized(timeFmtLock) {
+            return timeFmt.format(Date())
+        }
+    }
 
     fun installPrivacySafeCrashHandler(context: Context) {
         if (crashHandlerInstalled) return
         synchronized(this) {
             if (crashHandlerInstalled) return
             val appCtx = context.applicationContext
+            // Preload persisted clips if present from the previous stream session
+            loadPersistedClipsIfEmpty(appCtx)
             val previousHandler = Thread.getDefaultUncaughtExceptionHandler()
             Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
                 try {
@@ -145,7 +163,7 @@ object DiagnosticsLogger {
                     val topFrame = throwable.stackTrace.firstOrNull()?.let {
                         "${it.className.substringAfterLast('.')}.${it.methodName}:${it.lineNumber}"
                     } ?: "unknown"
-                    val summary = "${ timeFmt.format(Date()) } [${thread.name}] ${throwable.javaClass.simpleName}: $safeMsg (@ $topFrame)"
+                    val summary = "${formatWallClockNow()} [${thread.name}] ${throwable.javaClass.simpleName}: $safeMsg (@ $topFrame)"
                     appCtx.getSharedPreferences(PREFS_BENCH, Context.MODE_PRIVATE)
                         .edit()
                         .putString(KEY_LAST_CRASH, summary.take(280))
@@ -183,40 +201,151 @@ object DiagnosticsLogger {
         }
     }
 
+    /**
+     * Snapshots the live active microphone status right BEFORE cleanupResources() stops the audio
+     * engine so the final Session Report header always shows the true active mic status instead of "MIC STOPPED".
+     */
     @Synchronized
-    fun markClipHighlight(elapsedStreamSec: Long, label: String = "Highlight"): String {
+    fun lockFinalMicStatusBeforeStop() {
+        val current = micStatusLabel.trim()
+        if (current.isNotBlank() && !current.contains("STOPPED", ignoreCase = true)) {
+            finalMicStatusSnapshot = current
+        }
+    }
+
+    @Synchronized
+    fun markClipHighlight(
+        elapsedStreamSec: Long,
+        label: String = "Manual ★ Highlight",
+        context: Context? = null
+    ): String {
         val hh = elapsedStreamSec / 3600L
         val mm = (elapsedStreamSec % 3600L) / 60L
         val ss = elapsedStreamSec % 60L
         val streamStamp = String.format(Locale.US, "%02d:%02d:%02d", hh, mm, ss)
-        val wallStamp = timeFmt.format(Date())
+        val wallStamp = formatWallClockNow()
         val index = clipHighlights.size + 1
-        val entry = "Clip #$index @ Stream Time $streamStamp (Wall Clock $wallStamp) — $label"
+        val entry = "Clip #$index — $streamStamp into stream (Clock $wallStamp) • $label"
         if (clipHighlights.size < MAX_CLIPS) {
             clipHighlights.add(entry)
         }
+        context?.let { persistSavedClips(it) }
         log("CLIP_MARK", "Saved stream highlight marker #$index at $streamStamp.", label)
         return streamStamp
+    }
+
+    /**
+     * Zero-bloat AI Auto-Clutch Highlight Detector (#34): records intense gunfire + excited voice
+     * callout peaks automatically with a 45-second cooldown to prevent duplicate spam.
+     */
+    @Synchronized
+    fun markAiClutchHighlight(
+        elapsedStreamSec: Long,
+        detail: String = "🤖 AI Clutch Moment (Gunfight + Voice Callout)",
+        context: Context? = null
+    ): String? {
+        val nowMs = SystemClock.elapsedRealtime()
+        if (nowMs - lastAiClutchRealtimeMs < 45_000L) return null
+        lastAiClutchRealtimeMs = nowMs
+        return markClipHighlight(elapsedStreamSec, detail, context)
     }
 
     @Synchronized
     fun getClipHighlightCount(): Int = clipHighlights.size
 
     @Synchronized
+    fun getSavedClipsList(context: Context? = null): List<String> {
+        if (clipHighlights.isEmpty() && context != null) {
+            loadPersistedClipsIfEmpty(context)
+        }
+        return clipHighlights.toList()
+    }
+
+    @Synchronized
+    fun clearSavedClips(context: Context) {
+        clipHighlights.clear()
+        try {
+            context.getSharedPreferences(PREFS_BENCH, Context.MODE_PRIVATE)
+                .edit()
+                .remove(KEY_SAVED_CLIPS_JSON)
+                .apply()
+        } catch (_: Exception) {
+        }
+    }
+
+    @Synchronized
+    fun buildSavedClipsPlainEnglishSummary(context: Context): String {
+        val list = getSavedClipsList(context)
+        if (list.isEmpty()) {
+            return "No saved clip timestamps yet.\n\n" +
+                "• While streaming, tap '★ Clip' inside the Floating Pill anytime you hit a great play.\n" +
+                "• Plus, SolStream's 🤖 AI Auto-Clutch Detector automatically marks intense gunfight + voice callout moments for you!"
+        }
+        val sb = StringBuilder()
+        sb.appendLine("=== ★ SAVED STREAM CLIP TIMESTAMPS (${list.size} Total) ===")
+        sb.appendLine("Open your YouTube Live VOD or video editor and jump straight to these exact stream times:")
+        sb.appendLine()
+        for (item in list) {
+            sb.appendLine("• $item")
+        }
+        return sb.toString().trimEnd()
+    }
+
+    @Synchronized
+    private fun persistSavedClips(context: Context) {
+        try {
+            val arr = JSONArray()
+            for (c in clipHighlights) arr.put(c)
+            context.applicationContext.getSharedPreferences(PREFS_BENCH, Context.MODE_PRIVATE)
+                .edit()
+                .putString(KEY_SAVED_CLIPS_JSON, arr.toString())
+                .apply()
+        } catch (_: Exception) {
+        }
+    }
+
+    @Synchronized
+    private fun loadPersistedClipsIfEmpty(context: Context) {
+        if (clipHighlights.isNotEmpty()) return
+        try {
+            val raw = context.applicationContext
+                .getSharedPreferences(PREFS_BENCH, Context.MODE_PRIVATE)
+                .getString(KEY_SAVED_CLIPS_JSON, null) ?: return
+            val arr = JSONArray(raw)
+            for (i in 0 until arr.length()) {
+                val item = arr.optString(i, "")
+                if (item.isNotBlank() && clipHighlights.size < MAX_CLIPS) {
+                    clipHighlights.add(item)
+                }
+            }
+        } catch (_: Exception) {
+        }
+    }
+
+    @Synchronized
     fun startNewSession(context: Context, modeTitle: String, pipelineDesc: String) {
         events.clear()
         clipHighlights.clear()
+        persistSavedClips(context)
+        finalMicStatusSnapshot = ""
+        lastAiClutchRealtimeMs = 0L
+        lastPssSampleRealtimeMs = 0L
         sessionStartMs = System.currentTimeMillis()
         activePipelineDesc = pipelineDesc
-        val temp = readBatteryTempC(context)
+
+        val liveHealth = CodecCapabilityProbe.readLiveHardwareHealth(context)
+        val temp = liveHealth.batteryTempC
         startTempC = temp
         peakTempC = temp
         peakSocTempC = readOptionalSocTempC()
-        worstThermalState = readThermalStatus(context)
-        lastThermalHeadroom = readThermalHeadroom(context)
+        worstThermalState = liveHealth.thermalStatus
+        lastThermalHeadroom = if (liveHealth.thermalHeadroomRatio.isNaN()) -1f else liveHealth.thermalHeadroomRatio
         lastBatteryPercent = readBatteryPercentage(context)
+        startPowerSourceLabel = liveHealth.powerSourceLabel
+        lastPowerSourceLabel = liveHealth.powerSourceLabel
+
         peakTotalPssMb = 0
-        sampleMemoryFootprint()
+        sampleMemoryFootprint(forcePssWalk = true)
         droppedVideoFrames = 0
         reconnectAttempts = 0
         lastBitrateKbps = 0
@@ -226,9 +355,10 @@ object DiagnosticsLogger {
         freshCaptureFps = 0
         repeatedFramesCount = 0L
         lastAverageQp = -1
-        lastQueueBytes = -1L
-        lastQueueFrames = -1
-        lastQueueCapacity = -1
+        lastQueueBytes = 0L
+        lastQueueFrames = 0
+        lastQueueCapacity = 60
+        lastSendLatencyMs = 1L
         lastRttMs = -1L
         avDriftMs = 0L
         lastActiveAudioPolicySnapshot = ""
@@ -236,7 +366,7 @@ object DiagnosticsLogger {
         log(
             "SESSION",
             "$modeTitle started ($pipelineDesc).",
-            "startTemp=${String.format(Locale.US, "%.1f", temp)}°C batt=${lastBatteryPercent}% thermal=${thermalStatusName(worstThermalState)}"
+            "startTemp=${String.format(Locale.US, "%.1f", temp)}°C batt=${lastBatteryPercent}% power=$startPowerSourceLabel thermal=${thermalStatusName(worstThermalState)}"
         )
     }
 
@@ -247,7 +377,7 @@ object DiagnosticsLogger {
         }
         events.addLast(
             SessionEvent(
-                timestamp = timeFmt.format(Date()),
+                timestamp = formatWallClockNow(),
                 tag = tag,
                 plainMessage = redactSecrets(plainMessage),
                 technicalDetail = redactSecrets(technicalDetail)
@@ -277,34 +407,43 @@ object DiagnosticsLogger {
     }
 
     fun sampleDeviceHealth(context: Context): Pair<Float, Int> {
-        val t = readBatteryTempC(context)
-        val s = readThermalStatus(context)
+        val health = CodecCapabilityProbe.readLiveHardwareHealth(context)
+        val t = health.batteryTempC
+        val s = health.thermalStatus
         if (t > peakTempC) peakTempC = t
         if (startTempC == 0f && t > 0f) startTempC = t
         val socT = readOptionalSocTempC()
         if (socT > peakSocTempC) peakSocTempC = socT
         if (s > worstThermalState) worstThermalState = s
-        val headroom = readThermalHeadroom(context)
-        if (headroom > 0f) lastThermalHeadroom = headroom
+        if (!health.thermalHeadroomRatio.isNaN() && health.thermalHeadroomRatio > 0f) {
+            lastThermalHeadroom = health.thermalHeadroomRatio
+        }
+        lastPowerSourceLabel = health.powerSourceLabel
         val battPct = readBatteryPercentage(context)
         if (battPct in 1..100) lastBatteryPercent = battPct
         if (SolStreamService.isBroadcastLive) {
             captureLiveAudioPolicySnapshot(context)
+            val currentMic = micStatusLabel.trim()
+            if (currentMic.isNotBlank() && !currentMic.contains("STOPPED", ignoreCase = true)) {
+                finalMicStatusSnapshot = currentMic
+            }
         }
-        sampleMemoryFootprint()
+        sampleMemoryFootprint(forcePssWalk = false)
         return t to s
     }
 
-    private fun sampleMemoryFootprint() {
+    private fun sampleMemoryFootprint(forcePssWalk: Boolean = false) {
         try {
             val rt = Runtime.getRuntime()
             lastJavaHeapMb = ((rt.totalMemory() - rt.freeMemory()) / (1024L * 1024L)).toInt()
             lastNativeHeapMb = (Debug.getNativeHeapAllocatedSize() / (1024L * 1024L)).toInt()
-            val pssKb = Debug.getPss()
-            val totalMb = if (pssKb > 0L) {
-                (pssKb / 1024L).toInt()
+            val nowMs = SystemClock.elapsedRealtime()
+            val totalMb = if (forcePssWalk || nowMs - lastPssSampleRealtimeMs >= 15_000L || peakTotalPssMb == 0) {
+                lastPssSampleRealtimeMs = nowMs
+                val pssKb = Debug.getPss()
+                if (pssKb > 0L) (pssKb / 1024L).toInt() else (lastJavaHeapMb + lastNativeHeapMb)
             } else {
-                lastJavaHeapMb + lastNativeHeapMb
+                max(peakTotalPssMb, lastJavaHeapMb + lastNativeHeapMb)
             }
             if (totalMb > peakTotalPssMb) peakTotalPssMb = totalMb
         } catch (_: Exception) {
@@ -313,6 +452,7 @@ object DiagnosticsLogger {
 
     fun finishAndSaveBenchmark(context: Context, isGlipBaseline: Boolean): BenchmarkSnapshot {
         sampleDeviceHealth(context)
+        persistSavedClips(context)
         val durMin = if (sessionStartMs > 0L) {
             max(1, ((System.currentTimeMillis() - sessionStartMs) / 60_000L).toInt())
         } else {
@@ -396,15 +536,14 @@ object DiagnosticsLogger {
         }
     }
 
+    /**
+     * Uses CodecCapabilityProbe's 10.5-second rate-limited thermal headroom poller so Android 11-17
+     * never throttles or returns NaN from frequent background calls.
+     */
     fun readThermalHeadroom(context: Context): Float {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return -1f
-        return try {
-            val pm = context.getSystemService(Context.POWER_SERVICE) as PowerManager
-            val hr = pm.getThermalHeadroom(10)
-            if (hr.isNaN() || hr <= 0f) -1f else hr
-        } catch (_: Exception) {
-            -1f
-        }
+        val hr = CodecCapabilityProbe.readLiveHardwareHealth(context).thermalHeadroomRatio
+        return if (hr.isNaN() || hr <= 0f) -1f else hr
     }
 
     fun thermalStatusName(status: Int): String = when (status) {
@@ -428,7 +567,9 @@ object DiagnosticsLogger {
     }
 
     private fun buildActiveAudioPolicySummary(context: Context): String {
-        captureLiveAudioPolicySnapshot(context)
+        if (SolStreamService.isBroadcastLive) {
+            captureLiveAudioPolicySnapshot(context)
+        }
         if (lastActiveAudioPolicySnapshot.isNotBlank()) {
             return if (SolStreamService.isBroadcastLive) {
                 lastActiveAudioPolicySnapshot
@@ -442,39 +583,49 @@ object DiagnosticsLogger {
     @Synchronized
     fun buildShareableReport(context: Context): String {
         sampleDeviceHealth(context)
+        loadPersistedClipsIfEmpty(context)
         val scan = CodecCapabilityProbe.peekCachedOrPlaceholder(context)
         val prefs = context.getSharedPreferences(PREFS_BENCH, Context.MODE_PRIVATE)
         val lastSol = BenchmarkSnapshot.fromJson(prefs.getString(KEY_LAST_SOL_BENCH, null))
         val lastGlip = BenchmarkSnapshot.fromJson(prefs.getString(KEY_LAST_GLIP_BENCH, null))
         val lastCrash = prefs.getString(KEY_LAST_CRASH, null)
 
+        val effectiveMicLabel = if (!SolStreamService.isBroadcastLive &&
+            micStatusLabel.contains("STOPPED", ignoreCase = true) &&
+            finalMicStatusSnapshot.isNotBlank()
+        ) {
+            "$finalMicStatusSnapshot (Completed Cleanly)"
+        } else {
+            micStatusLabel
+        }
+
         val sb = StringBuilder()
-        sb.appendLine("=== SOLSTREAM STUDIO ULTRA (SolApex™ HyperStream Engine) — AUTOMATIC SESSION REPORT ===")
-        sb.appendLine("Engine Architecture: SolApex™ HyperStream (Video: SolCore Ultra | Audio: SolLuxe | Broadcast: SolRelay Omega | Silicon: SolCodec)")
+        sb.appendLine("=== SOLSTREAM STUDIO ULTRA v1.2.0 (SolApex™ HyperStream Engine) — AUTOMATIC SESSION REPORT ===")
+        sb.appendLine("Engine Architecture: SolApex™ HyperStream (Video: SolCore Ultra | Audio: SolLuxe 2.0 | Broadcast: SolRelay Omega | Silicon: SolCodec)")
         sb.appendLine("Privacy Guarantee: Stream keys, notifications, and voice audio are NEVER included.")
         sb.appendLine(
-            "Device: ${scan.deviceModel} (${scan.socModel}) | Android ${scan.androidRelease} (API ${scan.sdkInt}) | RAM: ${scan.totalRamGb}GB | Display: ${scan.maxDisplayHz}Hz | GL: ${scan.maxGlEsVersion}"
+            "Device: ${scan.friendlyHardwareLine()} | RAM: ${scan.totalRamGb}GB | Display: ${scan.maxDisplayHz}Hz | GL: ${scan.maxGlEsVersion}"
         )
         sb.appendLine(
-            "Vault Security: ${KeystoreVault.getKeySecurityDescription()} | Targets: $activeSimulcastDesc"
+            "Vault Security: ${KeystoreVault.getKeySecurityDescription()} | Targets: $activeSimulcastDesc | Power: $startPowerSourceLabel -> $lastPowerSourceLabel"
         )
         sb.appendLine("Active Pipeline: $activePipelineDesc | Audio DSP: $activeAudioDspDesc")
 
         val latestMbps = String.format(Locale.US, "%.2f Mbps", lastBitrateKbps / 1000.0)
         val avgMbps = String.format(Locale.US, "%.2f Mbps", getSessionAverageBitrateKbps() / 1000.0)
-        val queueStr = when {
-            lastQueueFrames >= 0 && lastQueueCapacity > 0 && lastQueueBytes >= 0L ->
-                "$lastQueueFrames/$lastQueueCapacity frames (${lastQueueBytes / 1024} KB)"
-            lastQueueFrames >= 0 && lastQueueCapacity > 0 ->
-                "$lastQueueFrames/$lastQueueCapacity frames"
-            lastQueueBytes >= 0L -> "${lastQueueBytes / 1024} KB"
-            else -> "N/A"
+        val safeQFrames = max(0, lastQueueFrames)
+        val safeQCap = max(30, lastQueueCapacity)
+        val safeSendMs = max(0L, lastSendLatencyMs)
+        val queueStr = if (lastQueueBytes > 0L) {
+            "$safeQFrames/$safeQCap frames (${lastQueueBytes / 1024} KB, ${safeSendMs}ms send)"
+        } else {
+            "$safeQFrames/$safeQCap frames (${safeSendMs}ms send)"
         }
         val rttStr = if (lastRttMs > 0L) "${lastRttMs} ms" else "N/A"
         val qpStr = if (lastAverageQp >= 0) "$lastAverageQp" else "N/A"
 
         sb.appendLine(
-            "Latest Live Metrics: $latestMbps (Session Avg: $avgMbps) | Out FPS: $lastEncodedFps (Fresh Game FPS: $freshCaptureFps, Repeat Paced: $repeatedFramesCount, Avg QP: $qpStr) | Send Queue: $queueStr | Ingest RTT: $rttStr | A/V Sync Offset: ${avDriftMs} ms | Mic: $micStatusLabel"
+            "Latest Live Metrics: $latestMbps (Session Avg: $avgMbps) | Out FPS: $lastEncodedFps (Fresh Game FPS: $freshCaptureFps, Repeat Paced: $repeatedFramesCount, Avg QP: $qpStr) | Send Queue: $queueStr | Ingest RTT: $rttStr | A/V Sync Offset: ${avDriftMs} ms | Mic: $effectiveMicLabel"
         )
 
         val headroomStr = if (lastThermalHeadroom > 0f) {
@@ -497,7 +648,7 @@ object DiagnosticsLogger {
 
         if (clipHighlights.isNotEmpty()) {
             sb.appendLine()
-            sb.appendLine("--- ★ SAVED STREAM CLIP HIGHLIGHTS (FOR SHORTS / VODS) ---")
+            sb.appendLine("--- ★ SAVED STREAM CLIP HIGHLIGHTS & AI CLUTCH MOMENTS (FOR SHORTS / VODS) ---")
             for (clip in clipHighlights) {
                 sb.appendLine("• $clip")
             }
