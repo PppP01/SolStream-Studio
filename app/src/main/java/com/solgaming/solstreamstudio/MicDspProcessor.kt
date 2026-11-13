@@ -101,7 +101,7 @@ class MicDspProcessor(private val sampleRate: Int = 48000) {
     private val eqPresence = Biquad64()          // Stage 5 Band 3: Smooth Callout Presence
     private val subWarmthBandFilter = Biquad64() // Stage 6 Part A: Isolated Vocal Fundamental for 2f Tube Harmonics
     private val eqVelvetAir = Biquad64()         // Stage 6 Part B: Gentle Silk Air High-Shelf
-    private val aiPresenceTamer = Biquad64()     // Stage 7: AI Dynamic Shout Tamer (3.2 kHz detector)
+    private val aiPresenceTamer = Biquad64()     // Stage 7: AI Dynamic Shout Tamer (3.1-3.5 kHz detector)
     private val sibilanceBand = Biquad64()       // Stage 9: Post-Compressor Split-Band De-Esser detector
 
     private val nativeLock = Any()
@@ -156,7 +156,11 @@ class MicDspProcessor(private val sampleRate: Int = 48000) {
         refreshDenoiserSummary()
     }
 
-    fun setHardwareAcousticMode(mode: HardwareAcousticMode) {
+    /**
+     * Updates the active hardware acoustic mode and immediately re-tunes the 12-mode filter matrix.
+     * Named applyHardwareAcousticMode to avoid clashing with Kotlin's auto-generated setter for var hardwareAcousticMode.
+     */
+    fun applyHardwareAcousticMode(mode: HardwareAcousticMode) {
         if (hardwareAcousticMode != mode) {
             hardwareAcousticMode = mode
             updateGenderAndHardwareFiltersIfNeeded(voiceGenderProfile, mode)
@@ -355,7 +359,7 @@ class MicDspProcessor(private val sampleRate: Int = 48000) {
                         configurePeakingEq(eqLowWarmth, 110.0, 0.90, 1.6)
                         configurePeakingEq(eqMudCut, 335.0, 2.20, -1.0)
                         configurePeakingEq(eqPresence, 3100.0, 1.05, 1.8)
-                        configureBandPass(subWarmthBandFilter, 135.0, 0.85)
+                        configureBandPass(subWarmthBandFilter, 110.0, 1.10)
                         configureHighShelf(eqVelvetAir, 5200.0, 1.6)
                         configureBandPass(aiPresenceTamer, 3100.0, 1.20)
                         configureBandPass(sibilanceBand, 6000.0, 1.75)
@@ -364,7 +368,7 @@ class MicDspProcessor(private val sampleRate: Int = 48000) {
                         configurePeakingEq(eqLowWarmth, 190.0, 0.95, 1.0)
                         configurePeakingEq(eqMudCut, 380.0, 2.10, -1.0)
                         configurePeakingEq(eqPresence, 3500.0, 1.05, 1.8)
-                        configureBandPass(subWarmthBandFilter, 220.0, 0.90)
+                        configureBandPass(subWarmthBandFilter, 195.0, 1.10)
                         configureHighShelf(eqVelvetAir, 5600.0, 2.0)
                         configureBandPass(aiPresenceTamer, 3500.0, 1.20)
                         configureBandPass(sibilanceBand, 6800.0, 1.75)
@@ -373,7 +377,7 @@ class MicDspProcessor(private val sampleRate: Int = 48000) {
                         configurePeakingEq(eqLowWarmth, 145.0, 0.90, 1.2)
                         configurePeakingEq(eqMudCut, 355.0, 2.15, -1.0)
                         configurePeakingEq(eqPresence, 3300.0, 1.05, 1.8)
-                        configureBandPass(subWarmthBandFilter, 175.0, 0.85)
+                        configureBandPass(subWarmthBandFilter, 145.0, 1.10)
                         configureHighShelf(eqVelvetAir, 5400.0, 1.8)
                         configureBandPass(aiPresenceTamer, 3300.0, 1.20)
                         configureBandPass(sibilanceBand, 6400.0, 1.75)
@@ -383,14 +387,14 @@ class MicDspProcessor(private val sampleRate: Int = 48000) {
 
             HardwareAcousticMode.BLUETOOTH_SCO -> {
                 allowUpperAirExciter = false
-                subHarmonicDrive = 0.125f
+                subHarmonicDrive = 0.120f
                 deEssThreshold = 0.088f
                 when (gender) {
                     "MALE" -> {
                         configurePeakingEq(eqLowWarmth, 115.0, 0.90, 2.4)
                         configurePeakingEq(eqMudCut, 320.0, 2.10, -2.6)
                         configurePeakingEq(eqPresence, 2400.0, 1.00, 2.6)
-                        configureBandPass(subWarmthBandFilter, 140.0, 0.85)
+                        configureBandPass(subWarmthBandFilter, 112.0, 1.10)
                         configureHighShelf(eqVelvetAir, 5200.0, 0.0)
                         configureBandPass(aiPresenceTamer, 2500.0, 1.20)
                         configureBandPass(sibilanceBand, 4800.0, 1.65)
@@ -399,7 +403,7 @@ class MicDspProcessor(private val sampleRate: Int = 48000) {
                         configurePeakingEq(eqLowWarmth, 195.0, 0.95, 1.8)
                         configurePeakingEq(eqMudCut, 365.0, 2.10, -2.4)
                         configurePeakingEq(eqPresence, 2700.0, 1.00, 2.6)
-                        configureBandPass(subWarmthBandFilter, 225.0, 0.90)
+                        configureBandPass(subWarmthBandFilter, 195.0, 1.10)
                         configureHighShelf(eqVelvetAir, 5400.0, 0.0)
                         configureBandPass(aiPresenceTamer, 2750.0, 1.20)
                         configureBandPass(sibilanceBand, 5200.0, 1.65)
@@ -408,7 +412,7 @@ class MicDspProcessor(private val sampleRate: Int = 48000) {
                         configurePeakingEq(eqLowWarmth, 150.0, 0.90, 2.0)
                         configurePeakingEq(eqMudCut, 340.0, 2.10, -2.5)
                         configurePeakingEq(eqPresence, 2550.0, 1.00, 2.6)
-                        configureBandPass(subWarmthBandFilter, 180.0, 0.85)
+                        configureBandPass(subWarmthBandFilter, 148.0, 1.10)
                         configureHighShelf(eqVelvetAir, 5300.0, 0.0)
                         configureBandPass(aiPresenceTamer, 2600.0, 1.20)
                         configureBandPass(sibilanceBand, 5000.0, 1.65)
@@ -426,7 +430,8 @@ class MicDspProcessor(private val sampleRate: Int = 48000) {
                         configurePeakingEq(eqLowWarmth, 108.0, 0.85, 3.8)
                         configurePeakingEq(eqMudCut, 335.0, 2.20, -2.2)
                         configurePeakingEq(eqPresence, 3100.0, 1.05, 2.0)
-                        configureBandPass(subWarmthBandFilter, 135.0, 0.80)
+                        // Centered at 110 Hz (Q=1.10) so 2f harmonics enrich 170-235 Hz baritone chest without spilling into 335 Hz!
+                        configureBandPass(subWarmthBandFilter, 110.0, 1.10)
                         configureHighShelf(eqVelvetAir, 5100.0, 1.8)
                         configureBandPass(aiPresenceTamer, 3100.0, 1.20)
                         configureBandPass(sibilanceBand, 6000.0, 1.75)
@@ -435,7 +440,7 @@ class MicDspProcessor(private val sampleRate: Int = 48000) {
                         configurePeakingEq(eqLowWarmth, 190.0, 0.95, 2.5)
                         configurePeakingEq(eqMudCut, 380.0, 2.10, -2.2)
                         configurePeakingEq(eqPresence, 3500.0, 1.05, 2.0)
-                        configureBandPass(subWarmthBandFilter, 225.0, 0.85)
+                        configureBandPass(subWarmthBandFilter, 195.0, 1.10)
                         configureHighShelf(eqVelvetAir, 5600.0, 2.2)
                         configureBandPass(aiPresenceTamer, 3500.0, 1.20)
                         configureBandPass(sibilanceBand, 6800.0, 1.75)
@@ -444,7 +449,7 @@ class MicDspProcessor(private val sampleRate: Int = 48000) {
                         configurePeakingEq(eqLowWarmth, 145.0, 0.90, 2.8)
                         configurePeakingEq(eqMudCut, 355.0, 2.15, -2.2)
                         configurePeakingEq(eqPresence, 3300.0, 1.05, 2.0)
-                        configureBandPass(subWarmthBandFilter, 175.0, 0.85)
+                        configureBandPass(subWarmthBandFilter, 145.0, 1.10)
                         configureHighShelf(eqVelvetAir, 5350.0, 2.0)
                         configureBandPass(aiPresenceTamer, 3300.0, 1.20)
                         configureBandPass(sibilanceBand, 6400.0, 1.75)
@@ -684,8 +689,8 @@ class MicDspProcessor(private val sampleRate: Int = 48000) {
         val targetAirMix = if (useVelvet && activeSpeech) 1.0f else 0.0f
 
         // Stage 7: AI Dynamic Vocal Tone Balancer target calculation
-        // - Soft/calm speech (preDspRms < 0.055): gently reinforces chest warmth (+15%..+25%)
-        // - Loud shouted gunfight callout (preDspRms > 0.110): dynamically trims 3.1-3.5 kHz bite
+        // - Soft/calm speech (preDspRms < 0.065): gently reinforces chest warmth (+15%..+22%)
+        // - Loud shouted gunfight callout (preDspRms > 0.105): dynamically trims 3.1-3.5 kHz bite
         val targetAiWarmthBoost = if (useAiTone && activeSpeech && preDspRms < 0.065f) {
             ((0.065f - preDspRms) / 0.065f).coerceIn(0.0f, 0.22f)
         } else {
@@ -705,7 +710,8 @@ class MicDspProcessor(private val sampleRate: Int = 48000) {
         val enableUpperExciter = allowUpperAirExciter
         val currentSibThreshold = deEssThreshold
 
-        // === PASS 3: Stage 4 (Gate) -> Stage 5 (EQ) -> Stage 6 (2f Sub-Harmonic Tube Warmth & Silk Air)
+        // === PASS 3: Stage 4 (Gate) -> Stage 5a (Proximity Chest Warmth) -> Stage 6a (2f Sub-Harmonic Tube Warmth)
+        //          -> Stage 5b/c (Surgical Narrow Q=2.2 Mud Cut + Presence) -> Stage 6b (Silk Air Shelf)
         //          -> Stage 7 (AI Tone Balancer) -> Stage 8 (3-Zone Dynamics)
         //          -> Stage 9 (Post-Compressor Split-Band De-Esser) -> Stage 10 (True Post-DSP Mic Boost & Safety Clip) ===
         for (i in 0 until count) {
@@ -725,25 +731,32 @@ class MicDspProcessor(private val sampleRate: Int = 48000) {
                 s *= gateGain
             }
 
-            // Stage 5: Cardioid Proximity & Surgical Narrow Q=2.2 3-Band EQ
+            // Stage 5 Band 1: Studio Cardioid Proximity Chest Warmth (108 / 145 / 190 Hz)
             if (useEq) {
                 s = eqLowWarmth.process(s)
-                s = eqMudCut.process(s)
-                s = eqPresence.process(s)
             }
 
-            // Extract isolated vocal chest fundamental (85-320 Hz) for Stage 6 & Stage 7
+            // Extract isolated vocal fundamental (110 / 145 / 195 Hz) BEFORE mud cut so 2f harmonics
+            // are generated cleanly and any upper harmonic spill near 335 Hz is cleaned by eqMudCut!
             val subChestBand = if (useVelvet || useAiTone) subWarmthBandFilter.process(s) else 0.0f
 
-            // Stage 6: Velvet Baritone 2f Sub-Harmonic Tube Warmth + Gentle Silk Air Shelf
             if (useVelvet) {
-                val clamped = s.coerceIn(-1.2f, 1.2f)
-                // Generate 2nd-order (2f) even tube harmonics strictly from the isolated chest fundamental!
                 val subClamped = subChestBand.coerceIn(-0.85f, 0.85f)
                 val sq = subClamped * abs(subClamped) + (0.45f * subClamped * subClamped)
                 velvetDcState += 0.003f * (sq - velvetDcState)
                 val baritoneTubeHarmonics = warmDrive * (sq - velvetDcState)
+                s += baritoneTubeHarmonics
+            }
 
+            // Stage 5 Band 2 & Band 3: Surgical Narrow Q=2.2 Boxiness Cut (335/355/380 Hz) + Callout Presence
+            if (useEq) {
+                s = eqMudCut.process(s)
+                s = eqPresence.process(s)
+            }
+
+            // Stage 6 Part B: Gentle Silk Air High-Shelf (5.1 / 5.35 / 5.6 kHz)
+            if (useVelvet) {
+                val clamped = s.coerceIn(-1.2f, 1.2f)
                 val airExciter = if (enableUpperExciter) {
                     exciterLpState += 0.38f * (clamped - exciterLpState)
                     val highPresence = clamped - exciterLpState
@@ -751,8 +764,7 @@ class MicDspProcessor(private val sampleRate: Int = 48000) {
                 } else {
                     0.0f
                 }
-
-                val warmed = clamped + baritoneTubeHarmonics + (airExciter * velvetAirMixSmooth)
+                val warmed = clamped + (airExciter * velvetAirMixSmooth)
                 velvetAirMixSmooth += 0.015f * (targetAirMix - velvetAirMixSmooth)
                 val aired = eqVelvetAir.process(warmed)
                 s = warmed + velvetAirMixSmooth * (aired - warmed)
@@ -867,7 +879,11 @@ class MicDspProcessor(private val sampleRate: Int = 48000) {
         fun applyPresetToSettings(current: StreamSettings, newPreset: String): StreamSettings {
             val p = newPreset.uppercase(Locale.US)
             val matchedHpf = KeystoreVault.resolveDefaultHpfForProfile(current.voiceGenderProfile)
-            val activeHpf = if (current.hpfCutoffHz == 0) matchedHpf else matchedHpf
+            val activeHpf = if (current.hpfCutoffHz <= 0 || current.hpfCutoffHz in setOf(60, 75, 80, 85, 95, 100)) {
+                matchedHpf
+            } else {
+                current.hpfCutoffHz
+            }
 
             return when (p) {
                 "RAW" -> current.copy(voicePreset = "RAW")
@@ -914,7 +930,7 @@ class MicDspProcessor(private val sampleRate: Int = 48000) {
                     hpfCutoffHz = activeHpf,
                     transientTamerEnabled = true,
                     noiseGateEnabled = true,
-                    voiceEqEnabled = true,
+                    voiceEqEnabled = false,
                     deEsserEnabled = true,
                     velvetWarmthEnabled = true,
                     compressorEnabled = true,
