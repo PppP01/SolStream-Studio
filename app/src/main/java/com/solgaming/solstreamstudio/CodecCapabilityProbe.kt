@@ -10,6 +10,8 @@ package com.solgaming.solstreamstudio
 
 import android.app.ActivityManager
 import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.hardware.display.DisplayManager
 import android.media.AudioDeviceInfo
 import android.media.AudioManager
@@ -26,9 +28,12 @@ import android.opengl.EGLDisplay
 import android.opengl.EGLExt
 import android.opengl.EGLSurface
 import android.opengl.GLES20
+import android.os.BatteryManager
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.os.PowerManager
+import android.os.SystemClock
 import android.view.Display
 import android.view.Surface
 import org.json.JSONObject
@@ -54,7 +59,7 @@ enum class DeviceTier(
     LITE(
         id = "LITE",
         title = "Lite",
-        badgeSummary = "Budget / Mobile-Data Safe • 1080p30 + Full 10-Stage Voice Filters",
+        badgeSummary = "Budget / Mobile-Data Safe • 720p30/1080p30 + Full 10-Stage SolLuxe™ Voice",
         defaultWidth = 1920,
         defaultHeight = 1080,
         defaultFps = 30,
@@ -64,7 +69,7 @@ enum class DeviceTier(
     BALANCED(
         id = "BALANCED",
         title = "Balanced",
-        badgeSummary = "Mid-Range Smooth • 1080p60 + Full 10-Stage Voice Studio",
+        badgeSummary = "Mid-Range Smooth • 1080p60 + Full 10-Stage SolLuxe™ Voice Studio",
         defaultWidth = 1920,
         defaultHeight = 1080,
         defaultFps = 60,
@@ -74,7 +79,7 @@ enum class DeviceTier(
     HIGH(
         id = "HIGH",
         title = "High",
-        badgeSummary = "Upper Mid-Range • 1080p60/1440p60 + Bicubic + RNNoise Ready",
+        badgeSummary = "Upper Mid-Range • 1080p60/1440p60 + TMU Bicubic + Native C RNNoise",
         defaultWidth = 1920,
         defaultHeight = 1080,
         defaultFps = 60,
@@ -109,7 +114,7 @@ enum class DeviceTier(
 }
 
 data class HardwareEncoderReport(
-    val codecKey: String,                // "HEVC", "H264", "AV1"
+    val codecKey: String,                 // "HEVC", "H264", "AV1"
     val mimeType: String,
     val encoderName: String,
     val supports4k60: Boolean = false,
@@ -134,12 +139,21 @@ data class HardwareEncoderReport(
     val complexityMax: Int,
     val verifiedSurfaceConfigure: Boolean,
     val verifiedRealEncode: Boolean = false,
-    val advertisedByMetadata: Boolean = true
+    val advertisedByMetadata: Boolean = true,
+    val supports480p60: Boolean = supports480p,
+    val supports480p30: Boolean = supports480p,
+    val supports360p60: Boolean = supports360p,
+    val supports360p30: Boolean = supports360p
 ) {
     fun alignDimensions(rawWidth: Int, rawHeight: Int): Pair<Int, Int> {
         val wAlign = max(2, if (widthAlignment % 2 == 0) widthAlignment else widthAlignment * 2)
         val hAlign = max(2, if (heightAlignment % 2 == 0) heightAlignment else heightAlignment * 2)
-        val alignedW = max(wAlign, ((rawWidth + (wAlign / 2)) / wAlign) * wAlign)
+        // Prefer rounding down when rawWidth is a non-16-aligned SD width like 854 -> 848
+        val alignedW = if (rawWidth == 854 && wAlign < 16) {
+            848
+        } else {
+            max(wAlign, ((rawWidth + (wAlign / 2)) / wAlign) * wAlign)
+        }
         val alignedH = max(hAlign, ((rawHeight + (hAlign / 2)) / hAlign) * hAlign)
         return alignedW to alignedH
     }
@@ -158,6 +172,10 @@ data class HardwareEncoderReport(
         put("supports720p30", supports720p30)
         put("supports480p", supports480p)
         put("supports360p", supports360p)
+        put("supports480p60", supports480p60)
+        put("supports480p30", supports480p30)
+        put("supports360p60", supports360p60)
+        put("supports360p30", supports360p30)
         put("supportsCbr", supportsCbr)
         put("supportsVbr", supportsVbr)
         put("supports10BitHdr", supports10BitHdr)
@@ -178,6 +196,8 @@ data class HardwareEncoderReport(
             if (obj == null) return null
             val name = obj.optString("encoderName", "")
             if (name.isBlank()) return null
+            val ok480 = obj.optBoolean("supports480p", true)
+            val ok360 = obj.optBoolean("supports360p", true)
             return HardwareEncoderReport(
                 codecKey = obj.optString("codecKey", "H264"),
                 mimeType = obj.optString("mimeType", MediaFormat.MIMETYPE_VIDEO_AVC),
@@ -190,8 +210,8 @@ data class HardwareEncoderReport(
                 supports1080p30 = obj.optBoolean("supports1080p30", true),
                 supports720p60 = obj.optBoolean("supports720p60", true),
                 supports720p30 = obj.optBoolean("supports720p30", true),
-                supports480p = obj.optBoolean("supports480p", true),
-                supports360p = obj.optBoolean("supports360p", true),
+                supports480p = ok480,
+                supports360p = ok360,
                 supportsCbr = obj.optBoolean("supportsCbr", true),
                 supportsVbr = obj.optBoolean("supportsVbr", true),
                 supports10BitHdr = obj.optBoolean("supports10BitHdr", false),
@@ -204,7 +224,11 @@ data class HardwareEncoderReport(
                 complexityMax = obj.optInt("complexityMax", 0),
                 verifiedSurfaceConfigure = obj.optBoolean("verifiedSurfaceConfigure", true),
                 verifiedRealEncode = obj.optBoolean("verifiedRealEncode", false),
-                advertisedByMetadata = obj.optBoolean("advertisedByMetadata", true)
+                advertisedByMetadata = obj.optBoolean("advertisedByMetadata", true),
+                supports480p60 = obj.optBoolean("supports480p60", ok480),
+                supports480p30 = obj.optBoolean("supports480p30", ok480),
+                supports360p60 = obj.optBoolean("supports360p60", ok360),
+                supports360p30 = obj.optBoolean("supports360p30", ok360)
             )
         }
     }
@@ -232,7 +256,9 @@ data class DeviceScanSummary(
     val recommendedWidth: Int,
     val recommendedHeight: Int,
     val recommendedFps: Int = 60,
-    val recommendedBitrateKbps: Int = 20000
+    val recommendedBitrateKbps: Int = 20000,
+    val gpuRenderer: String = "",
+    val mediaPerformanceClass: Int = 0
 ) {
     fun findReport(codecKey: String): HardwareEncoderReport? = when (codecKey) {
         "HEVC" -> hevcHardware
@@ -240,14 +266,37 @@ data class DeviceScanSummary(
         else -> h264Hardware
     }
 
+    /**
+     * Checks all verified hardware encoders (HEVC, H.264, AV1) so a device whose H.264 or AV1
+     * hardware block supports 2+ instances is never falsely rejected if HEVC reports 1.
+     */
     fun supportsDualFormatCompanion(): Boolean {
-        val primary = hevcHardware ?: h264Hardware ?: return false
-        return totalRamGb >= 8 && primary.maxConcurrentInstances >= 2 && primary.supports1080p60
+        if (totalRamGb < 8) return false
+        return listOfNotNull(hevcHardware, h264Hardware, av1Hardware).any {
+            it.maxConcurrentInstances >= 2 && (it.supports1080p60 || it.supports1080p30)
+        }
+    }
+
+    fun friendlyHardwareLine(): String {
+        val cleanSoc = CodecCapabilityProbe.formatFriendlySocName(socModel)
+        val cleanGpu = gpuRenderer.trim().takeIf { it.isNotBlank() && !it.equals("Unknown", true) }
+        val chipPart = if (cleanGpu != null && !cleanSoc.contains(cleanGpu, ignoreCase = true)) {
+            "$cleanSoc • $cleanGpu"
+        } else {
+            cleanSoc
+        }
+        val mpcTag = if (mediaPerformanceClass > 0) " • PC$mediaPerformanceClass" else ""
+        return "$deviceModel ($chipPart) • Android $androidRelease$mpcTag"
     }
 
     fun toBadgeText(): String {
         val parts = mutableListOf<String>()
-        parts.add("Tier: ${recommendedTier.title.uppercase(Locale.US)} (${totalRamGb}GB • ${maxDisplayHz}Hz • GL ES $maxGlEsVersion)")
+        val glTag = if (gpuRenderer.isNotBlank()) {
+            "GL ES $maxGlEsVersion (${gpuRenderer.take(18)})"
+        } else {
+            "GL ES $maxGlEsVersion"
+        }
+        parts.add("Tier: ${recommendedTier.title.uppercase(Locale.US)} (${totalRamGb}GB • ${maxDisplayHz}Hz • $glTag)")
 
         hevcHardware?.let {
             val topRes = when {
@@ -269,10 +318,16 @@ data class DeviceScanSummary(
             parts.add("HW H.264 ($topH264)")
         }
 
-        if (av1Hardware != null && (av1Hardware.supports1440p60 || av1Hardware.supports1080p60)) {
-            parts.add("HW AV1 (${av1Hardware.encoderName})")
+        if (av1Hardware != null && (av1Hardware.supports1440p60 || av1Hardware.supports1080p60 || av1Hardware.supports1080p30)) {
+            val topAv1 = when {
+                av1Hardware.supports4k60 -> "4K60"
+                av1Hardware.supports1440p60 -> "1440p60"
+                av1Hardware.supports1080p60 -> "1080p60"
+                else -> "1080p30"
+            }
+            parts.add("HW AV1 ($topAv1)")
         } else {
-            parts.add("AV1: SW Blocked")
+            parts.add("AV1: No HW Enc (CPU-SW Blocked)")
         }
         return parts.joinToString("  |  ")
     }
@@ -300,6 +355,8 @@ data class DeviceScanSummary(
         put("recommendedHeight", recommendedHeight)
         put("recommendedFps", recommendedFps)
         put("recommendedBitrateKbps", recommendedBitrateKbps)
+        put("gpuRenderer", gpuRenderer)
+        put("mediaPerformanceClass", mediaPerformanceClass)
     }
 
     companion object {
@@ -326,9 +383,35 @@ data class DeviceScanSummary(
                 recommendedWidth = obj.optInt("recommendedWidth", 2560),
                 recommendedHeight = obj.optInt("recommendedHeight", 1440),
                 recommendedFps = obj.optInt("recommendedFps", 60),
-                recommendedBitrateKbps = obj.optInt("recommendedBitrateKbps", 20000)
+                recommendedBitrateKbps = obj.optInt("recommendedBitrateKbps", 20000),
+                gpuRenderer = obj.optString("gpuRenderer", ""),
+                mediaPerformanceClass = obj.optInt("mediaPerformanceClass", 0)
             )
         }
+    }
+}
+
+data class LiveHardwareHealth(
+    val batteryTempC: Float,
+    val thermalStatus: Int,
+    val thermalHeadroomRatio: Float,
+    val socThermalLoadPercent: Int,
+    val availRamGb: Float,
+    val totalRamGb: Int,
+    val isPluggedIn: Boolean,
+    val powerSourceLabel: String
+) {
+    fun tempStateLabel(): String = when {
+        batteryTempC >= 43.0f || thermalStatus >= PowerManager.THERMAL_STATUS_SEVERE -> "Hot"
+        batteryTempC >= 39.5f || thermalStatus >= PowerManager.THERMAL_STATUS_MODERATE -> "Warm"
+        else -> "Cool"
+    }
+
+    fun toIdleStatusBanner(): String {
+        val tempStr = String.format(Locale.US, "%.1f°C (%s)", batteryTempC, tempStateLabel())
+        val ramStr = String.format(Locale.US, "%.1f/%dGB", availRamGb, totalRamGb)
+        val pwrTag = if (isPluggedIn) " • ⚡ $powerSourceLabel" else ""
+        return "READY • Idle Temp: $tempStr • SoC Load: ${socThermalLoadPercent}% • Free RAM: $ramStr$pwrTag"
     }
 }
 
@@ -336,7 +419,8 @@ data class MicInputOption(
     val deviceId: Int,
     val label: String,
     val isBluetooth: Boolean,
-    val deviceInfo: AudioDeviceInfo?
+    val deviceInfo: AudioDeviceInfo?,
+    val shortPillLabel: String = "Phone Studio"
 )
 
 object CodecCapabilityProbe {
@@ -344,7 +428,7 @@ object CodecCapabilityProbe {
     private const val CACHE_PREFS = "solstream_hw_probe_cache_v3"
     private const val KEY_FINGERPRINT = "cached_fingerprint"
     private const val KEY_PAYLOAD = "cached_scan_json"
-    private const val CACHE_SCHEMA_TAG = "ultra_v112_r2"
+    private const val CACHE_SCHEMA_TAG = "ultra_v120_r1"
 
     private val scanLock = ReentrantLock()
     private val activeHardwareProbeRunning = AtomicBoolean(false)
@@ -354,6 +438,21 @@ object CodecCapabilityProbe {
     private val mainHandler = Handler(Looper.getMainLooper())
 
     @Volatile private var cachedScan: DeviceScanSummary? = null
+    @Volatile private var detectedGpuRenderer: String = ""
+
+    /**
+     * Reserved immediately when Go Live is tapped (before encoder allocation begins) so
+     * background or manual hardware scans never overlap with a starting or active broadcast.
+     */
+    @Volatile var isBroadcastStartingOrLive: Boolean = false
+
+    // 10-second rate-limit cache for PowerManager.getThermalHeadroom() (Android 11-17 requires >=10s interval)
+    private val thermalPollLock = Any()
+    @Volatile private var lastThermalHeadroomPollMs: Long = 0L
+    @Volatile private var cachedThermalHeadroomRatio: Float = Float.NaN
+
+    private fun isStreamBusy(): Boolean =
+        SolStreamService.isBroadcastLive || isBroadcastStartingOrLive
 
     fun isHardwareProbeCurrentlyRunning(): Boolean = activeHardwareProbeRunning.get()
 
@@ -372,8 +471,144 @@ object CodecCapabilityProbe {
     }
 
     /**
+     * Maps cryptic SoC model strings (e.g., s5e9945, SM8650, MT6897) to clean global processor names.
+     */
+    fun formatFriendlySocName(rawSoc: String, hardwareFallback: String = Build.HARDWARE): String {
+        val combined = "$rawSoc $hardwareFallback".trim()
+        val u = combined.uppercase(Locale.US)
+        return when {
+            u.contains("S5E9945") -> "Samsung Exynos 2400e"
+            u.contains("S5E9940") -> "Samsung Exynos 2400"
+            u.contains("S5E9955") -> "Samsung Exynos 2500"
+            u.contains("S5E9925") -> "Samsung Exynos 2200"
+            u.contains("S5E8855") -> "Samsung Exynos 1580"
+            u.contains("S5E8845") -> "Samsung Exynos 1480"
+            u.contains("S5E8835") -> "Samsung Exynos 1380"
+            u.contains("S5E8825") -> "Samsung Exynos 1280"
+            u.contains("SM8750") -> "Snapdragon 8 Elite"
+            u.contains("SM8650") -> "Snapdragon 8 Gen 3"
+            u.contains("SM8635") -> "Snapdragon 8s Gen 3"
+            u.contains("SM8550") -> "Snapdragon 8 Gen 2"
+            u.contains("SM8475") -> "Snapdragon 8+ Gen 1"
+            u.contains("SM8450") -> "Snapdragon 8 Gen 1"
+            u.contains("SM8350") -> "Snapdragon 888"
+            u.contains("SM8250") -> "Snapdragon 865/870"
+            u.contains("SM7675") -> "Snapdragon 7+ Gen 3"
+            u.contains("SM7550") -> "Snapdragon 7 Gen 3"
+            u.contains("SM7475") -> "Snapdragon 7+ Gen 2"
+            u.contains("MT6991") -> "MediaTek Dimensity 9400"
+            u.contains("MT6989") -> "MediaTek Dimensity 9300"
+            u.contains("MT6985") -> "MediaTek Dimensity 9200"
+            u.contains("MT6983") -> "MediaTek Dimensity 9000"
+            u.contains("MT6897") -> "MediaTek Dimensity 8300"
+            u.contains("MT6896") -> "MediaTek Dimensity 8200"
+            u.contains("MT6895") -> "MediaTek Dimensity 8100"
+            u.contains("MT6886") -> "MediaTek Dimensity 7200"
+            u.contains("TENSOR G5") || u.contains("LAGUNA") -> "Google Tensor G5"
+            u.contains("TENSOR G4") || u.contains("ZUMA PRO") -> "Google Tensor G4"
+            u.contains("TENSOR G3") || u.contains("ZUMA") -> "Google Tensor G3"
+            u.contains("TENSOR G2") || u.contains("CLOUDRIPPER") -> "Google Tensor G2"
+            u.contains("TENSOR") || u.contains("GS101") || u.contains("GS201") -> "Google Tensor"
+            rawSoc.isNotBlank() -> rawSoc
+            else -> hardwareFallback
+        }
+    }
+
+    /**
+     * Reads zero-permission live idle/active hardware telemetry (Battery 0.1C temp, 10s rate-limited
+     * PowerManager thermal headroom, available RAM, and AC/Bypass charging state).
+     */
+    fun readLiveHardwareHealth(context: Context): LiveHardwareHealth {
+        val appCtx = context.applicationContext
+        var tempC = 33.0f
+        var isPlugged = false
+        var powerLabel = "Battery"
+        try {
+            val intent = appCtx.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+            if (intent != null) {
+                val tenths = intent.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, 330)
+                if (tenths in 100..750) {
+                    tempC = tenths / 10.0f
+                }
+                val plugged = intent.getIntExtra(BatteryManager.EXTRA_PLUGGED, 0)
+                isPlugged = plugged != 0
+                val status = intent.getIntExtra(BatteryManager.EXTRA_STATUS, -1)
+                powerLabel = when {
+                    plugged != 0 && status == BatteryManager.BATTERY_STATUS_NOT_CHARGING -> "Bypass / Direct AC"
+                    (plugged and BatteryManager.BATTERY_PLUGGED_AC) != 0 -> "AC Fast Power"
+                    (plugged and BatteryManager.BATTERY_PLUGGED_USB) != 0 -> "USB Power"
+                    (plugged and BatteryManager.BATTERY_PLUGGED_WIRELESS) != 0 -> "Wireless Power"
+                    else -> "Battery"
+                }
+            }
+        } catch (_: Exception) {
+        }
+
+        var availGb = 4.0f
+        var totalGb = 8
+        try {
+            val am = appCtx.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+            val mem = ActivityManager.MemoryInfo()
+            am.getMemoryInfo(mem)
+            if (mem.totalMem > 0L) {
+                totalGb = normalizePhysicalRamGb(mem.totalMem)
+                availGb = (mem.availMem.toDouble() / (1024.0 * 1024.0 * 1024.0)).toFloat().coerceAtLeast(0.2f)
+            }
+        } catch (_: Exception) {
+        }
+
+        var thermalStatus = PowerManager.THERMAL_STATUS_NONE
+        var headroom = Float.NaN
+        try {
+            val pm = appCtx.getSystemService(Context.POWER_SERVICE) as PowerManager
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                thermalStatus = pm.currentThermalStatus
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                val nowMs = SystemClock.elapsedRealtime()
+                synchronized(thermalPollLock) {
+                    if (nowMs - lastThermalHeadroomPollMs >= 10_500L || cachedThermalHeadroomRatio.isNaN()) {
+                        val sampled = pm.getThermalHeadroom(0)
+                        if (!sampled.isNaN() && sampled in 0.05f..2.5f) {
+                            cachedThermalHeadroomRatio = sampled
+                        }
+                        lastThermalHeadroomPollMs = nowMs
+                    }
+                    headroom = cachedThermalHeadroomRatio
+                }
+            }
+        } catch (_: Exception) {
+        }
+
+        val socPercent = if (!headroom.isNaN() && headroom > 0.0f) {
+            (headroom * 100.0f).roundToInt().coerceIn(25, 130)
+        } else {
+            val fromTemp = (50.0f + ((tempC - 30.0f) * 3.1f)).roundToInt()
+            val statusFloor = when (thermalStatus) {
+                PowerManager.THERMAL_STATUS_NONE -> 35
+                PowerManager.THERMAL_STATUS_LIGHT -> 72
+                PowerManager.THERMAL_STATUS_MODERATE -> 85
+                PowerManager.THERMAL_STATUS_SEVERE -> 96
+                else -> 102
+            }
+            max(fromTemp, statusFloor).coerceIn(30, 125)
+        }
+
+        return LiveHardwareHealth(
+            batteryTempC = tempC,
+            thermalStatus = thermalStatus,
+            thermalHeadroomRatio = headroom,
+            socThermalLoadPercent = socPercent,
+            availRamGb = availGb,
+            totalRamGb = totalGb,
+            isPluggedIn = isPlugged,
+            powerSourceLabel = powerLabel
+        )
+    }
+
+    /**
      * Selects a valid (width, height, fps) combination that the encoder metadata actually claims
-     * to support together, including explicit 720p30, aligned 480p, and aligned 360p fallbacks.
+     * to support together, including explicit 720p30, aligned 480p60/30, and aligned 360p60/30 fallbacks.
      */
     internal fun selectValidProbeTarget(
         ok1440p60: Boolean,
@@ -387,7 +622,11 @@ object CodecCapabilityProbe {
         aligned480W: Int = 854,
         aligned480H: Int = 480,
         aligned360W: Int = 640,
-        aligned360H: Int = 360
+        aligned360H: Int = 360,
+        ok480p60: Boolean = false,
+        ok480p30: Boolean = ok480p,
+        ok360p60: Boolean = false,
+        ok360p30: Boolean = ok360p
     ): Triple<Int, Int, Int> {
         return when {
             ok1440p60 -> Triple(2560, 1440, 60)
@@ -396,8 +635,10 @@ object CodecCapabilityProbe {
             ok1080p30 -> Triple(1920, 1080, 30)
             ok720p60 -> Triple(1280, 720, 60)
             ok720p30 -> Triple(1280, 720, 30)
-            ok480p -> Triple(aligned480W, aligned480H, 30)
-            ok360p -> Triple(aligned360W, aligned360H, 30)
+            ok480p60 -> Triple(aligned480W, aligned480H, 60)
+            ok480p30 || ok480p -> Triple(aligned480W, aligned480H, 30)
+            ok360p60 -> Triple(aligned360W, aligned360H, 60)
+            ok360p30 || ok360p -> Triple(aligned360W, aligned360H, 30)
             else -> Triple(aligned360W, aligned360H, 30)
         }
     }
@@ -430,25 +671,41 @@ object CodecCapabilityProbe {
             recommendedWidth = if (ramGb >= 8) 2560 else 1920,
             recommendedHeight = if (ramGb >= 8) 1440 else 1080,
             recommendedFps = 60,
-            recommendedBitrateKbps = if (ramGb >= 8) 20000 else 12000
+            recommendedBitrateKbps = if (ramGb >= 8) 20000 else 12000,
+            gpuRenderer = detectedGpuRenderer,
+            mediaPerformanceClass = readMediaPerformanceClass()
         )
     }
 
     /**
-     * Non-blocking scan getter for SolVideoPipeline.startPipeline(): returns cached or persisted
-     * verified scan immediately; if an initial background scan is still running on first launch,
-     * waits briefly up to 350 ms on a worker thread or falls back to an honest metadata-only scan
-     * (where verifiedSurfaceConfigure = false and advertisedByMetadata = true).
+     * Waits up to maxWaitMs (default 5000 ms on worker threads, 80 ms on UI thread) for an
+     * active startup hardware scan to finish before falling back to a metadata-only scan.
      */
-    fun getBestAvailableScanNonBlocking(context: Context): DeviceScanSummary {
+    fun awaitCachedSummary(context: Context, maxWaitMs: Long = 5000L): DeviceScanSummary {
         val appCtx = context.applicationContext
         cachedScan?.let { return it }
         loadPersistedCache(appCtx)?.let {
             cachedScan = it
             return it
         }
-        val waitMs = if (Looper.myLooper() == Looper.getMainLooper()) 80L else 400L
-        return if (scanLock.tryLock(waitMs, TimeUnit.MILLISECONDS)) {
+        val isUiThread = Looper.myLooper() == Looper.getMainLooper()
+        val effectiveWaitMs = if (isUiThread) min(80L, maxWaitMs) else maxWaitMs.coerceIn(100L, 6000L)
+        val deadline = SystemClock.elapsedRealtime() + effectiveWaitMs
+        while (activeHardwareProbeRunning.get() && SystemClock.elapsedRealtime() < deadline) {
+            cachedScan?.let { return it }
+            try {
+                Thread.sleep(25L)
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+                break
+            }
+        }
+        cachedScan?.let { return it }
+        loadPersistedCache(appCtx)?.let {
+            cachedScan = it
+            return it
+        }
+        return if (scanLock.tryLock(effectiveWaitMs.coerceAtMost(1200L), TimeUnit.MILLISECONDS)) {
             try {
                 cachedScan ?: loadPersistedCache(appCtx) ?: performFastMetadataScan(appCtx)
             } finally {
@@ -459,14 +716,24 @@ object CodecCapabilityProbe {
         }
     }
 
+    /**
+     * Scan getter for SolVideoPipeline.startPipeline(): returns cached or persisted verified scan
+     * immediately; if an initial background scan is still running on first launch, waits up to
+     * 5000 ms on a worker thread so the probe finishes cleanly before encoder setup begins.
+     */
+    fun getBestAvailableScanNonBlocking(context: Context): DeviceScanSummary {
+        val waitMs = if (Looper.myLooper() == Looper.getMainLooper()) 80L else 5000L
+        return awaitCachedSummary(context, maxWaitMs = waitMs)
+    }
+
     fun scanDeviceAsync(
         context: Context,
         forceRefresh: Boolean = false,
         onComplete: (DeviceScanSummary) -> Unit
     ) {
         val appCtx = context.applicationContext
-        // Never run hardware MediaCodec probing while a live broadcast is active!
-        if (SolStreamService.isBroadcastLive) {
+        // Never run hardware MediaCodec probing while a live broadcast is starting or active!
+        if (isStreamBusy()) {
             val safeLiveSummary = cachedScan ?: loadPersistedCache(appCtx) ?: performFastMetadataScan(appCtx)
             onComplete(safeLiveSummary)
             return
@@ -490,8 +757,8 @@ object CodecCapabilityProbe {
 
     fun scanDevice(context: Context, forceRefresh: Boolean = false): DeviceScanSummary {
         val appCtx = context.applicationContext
-        // Never allocate test MediaCodec encoders while a livestream is actively encoding!
-        if (SolStreamService.isBroadcastLive) {
+        // Never allocate test MediaCodec encoders while a livestream is starting or actively encoding!
+        if (isStreamBusy()) {
             return cachedScan ?: loadPersistedCache(appCtx) ?: performFastMetadataScan(appCtx)
         }
         if (!forceRefresh) {
@@ -512,7 +779,7 @@ object CodecCapabilityProbe {
 
         activeHardwareProbeRunning.set(true)
         try {
-            if (SolStreamService.isBroadcastLive) {
+            if (isStreamBusy()) {
                 return cachedScan ?: loadPersistedCache(appCtx) ?: performFastMetadataScan(appCtx)
             }
             if (!forceRefresh) {
@@ -546,6 +813,7 @@ object CodecCapabilityProbe {
         val hwAac = checkHardwareAacPresent()
         val hwNs = try { NoiseSuppressor.isAvailable() } catch (_: Throwable) { false }
         val hwAec = try { AcousticEchoCanceler.isAvailable() } catch (_: Throwable) { false }
+        val mpc = readMediaPerformanceClass()
 
         val hevc = probeBestHardwareCodec("HEVC", MediaFormat.MIMETYPE_VIDEO_HEVC, runEglEncodeVerification)
         val h264 = probeBestHardwareCodec("H264", MediaFormat.MIMETYPE_VIDEO_AVC, runEglEncodeVerification)
@@ -563,13 +831,13 @@ object CodecCapabilityProbe {
 
         val recTier: DeviceTier = when {
             (hevc4k60 || av1Usable) &&
-                (ramGb >= 12 || av1Usable || modelStr.contains("Ultra", ignoreCase = true)) -> {
+                (ramGb >= 12 || av1Usable || modelStr.contains("Ultra", ignoreCase = true) || mpc >= 34) -> {
                 DeviceTier.ULTRA
             }
-            hevc1440p60 && ramGb >= 8 && maxHz >= 120 -> {
+            hevc1440p60 && ramGb >= 8 && (maxHz >= 120 || mpc >= 33) -> {
                 DeviceTier.FLAGSHIP
             }
-            (hevc1440p60 || hevc1080p60) && ramGb >= 6 && maxHz >= 90 -> {
+            (hevc1440p60 || hevc1080p60) && ramGb >= 6 && (maxHz >= 90 || mpc >= 31) -> {
                 DeviceTier.HIGH
             }
             (hevc1080p60 || h2641080p60) && ramGb >= 5 -> {
@@ -617,15 +885,30 @@ object CodecCapabilityProbe {
             recommendedWidth = recW,
             recommendedHeight = recH,
             recommendedFps = recTier.defaultFps,
-            recommendedBitrateKbps = recTier.defaultBitrateKbps
+            recommendedBitrateKbps = recTier.defaultBitrateKbps,
+            gpuRenderer = detectedGpuRenderer,
+            mediaPerformanceClass = mpc
         )
     }
 
     private fun readSocName(): String {
-        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+        val raw = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             "${Build.SOC_MANUFACTURER} ${Build.SOC_MODEL}".trim().ifBlank { Build.HARDWARE }
         } else {
             Build.HARDWARE
+        }
+        return formatFriendlySocName(raw, Build.HARDWARE)
+    }
+
+    private fun readMediaPerformanceClass(): Int {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            try {
+                Build.VERSION.MEDIA_PERFORMANCE_CLASS
+            } catch (_: Throwable) {
+                0
+            }
+        } else {
+            0
         }
     }
 
@@ -696,7 +979,11 @@ object CodecCapabilityProbe {
             val expectedFp = "${Build.FINGERPRINT}|$CACHE_SCHEMA_TAG"
             if (savedFp != expectedFp) return null
             val rawJson = prefs.getString(KEY_PAYLOAD, null) ?: return null
-            DeviceScanSummary.fromJson(JSONObject(rawJson))
+            val loaded = DeviceScanSummary.fromJson(JSONObject(rawJson))
+            if (loaded.gpuRenderer.isNotBlank() && detectedGpuRenderer.isBlank()) {
+                detectedGpuRenderer = loaded.gpuRenderer
+            }
+            loaded
         } catch (_: Exception) {
             null
         }
@@ -824,13 +1111,24 @@ object CodecCapabilityProbe {
 
             val wAlign = max(2, vCaps.widthAlignment)
             val hAlign = max(2, vCaps.heightAlignment)
-            val aligned480W = max(wAlign, ((854 + (wAlign / 2)) / wAlign) * wAlign)
+            val aligned480W = if (wAlign < 16) 848 else max(wAlign, ((854 + (wAlign / 2)) / wAlign) * wAlign)
             val aligned480H = max(hAlign, ((480 + (hAlign / 2)) / hAlign) * hAlign)
             val aligned360W = max(wAlign, ((640 + (wAlign / 2)) / wAlign) * wAlign)
             val aligned360H = max(hAlign, ((360 + (hAlign / 2)) / hAlign) * hAlign)
 
-            val ok480p = vCaps.isSizeSupported(aligned480W, aligned480H)
-            val ok360p = vCaps.isSizeSupported(aligned360W, aligned360H)
+            val ok480p60 = vCaps.areSizeAndRateSupported(aligned480W, aligned480H, 60.0) ||
+                vCaps.areSizeAndRateSupported(854, 480, 60.0)
+            val ok480p30 = vCaps.areSizeAndRateSupported(aligned480W, aligned480H, 30.0) ||
+                vCaps.areSizeAndRateSupported(854, 480, 30.0) ||
+                vCaps.isSizeSupported(aligned480W, aligned480H)
+            val ok360p60 = vCaps.areSizeAndRateSupported(aligned360W, aligned360H, 60.0) ||
+                vCaps.areSizeAndRateSupported(640, 360, 60.0)
+            val ok360p30 = vCaps.areSizeAndRateSupported(aligned360W, aligned360H, 30.0) ||
+                vCaps.areSizeAndRateSupported(640, 360, 30.0) ||
+                vCaps.isSizeSupported(aligned360W, aligned360H)
+
+            val ok480p = ok480p60 || ok480p30
+            val ok360p = ok360p60 || ok360p30
 
             val anySizeSupported = ok1440p60 || ok1440p30 || ok1080p60 || ok1080p30 ||
                 ok720p60 || ok720p30 || ok480p || ok360p
@@ -848,7 +1146,11 @@ object CodecCapabilityProbe {
                 aligned480W = aligned480W,
                 aligned480H = aligned480H,
                 aligned360W = aligned360W,
-                aligned360H = aligned360H
+                aligned360H = aligned360H,
+                ok480p60 = ok480p60,
+                ok480p30 = ok480p30,
+                ok360p60 = ok360p60,
+                ok360p30 = ok360p30
             )
 
             val profileLevels = caps.profileLevels
@@ -882,7 +1184,7 @@ object CodecCapabilityProbe {
             }
 
             // Distinguish honest metadata-only scans (surfaceOk = false) from real surface/frame verification!
-            val (surfaceOk, realEncodeOk) = if (runEglEncodeVerification && !SolStreamService.isBroadcastLive) {
+            val (surfaceOk, realEncodeOk) = if (runEglEncodeVerification && !isStreamBusy()) {
                 verifyHardwareSurfaceEncoder(
                     encoderName = info.name,
                     mime = mime,
@@ -894,18 +1196,18 @@ object CodecCapabilityProbe {
                 false to false
             }
 
-            val capGate = if (runEglEncodeVerification && !SolStreamService.isBroadcastLive) {
+            val capGate = if (runEglEncodeVerification && !isStreamBusy()) {
                 surfaceOk
             } else {
                 true
             }
 
-            val verified4k60 = if (ok4k60 && surfaceOk && runEglEncodeVerification && !SolStreamService.isBroadcastLive) {
+            val verified4k60 = if (ok4k60 && surfaceOk && runEglEncodeVerification && !isStreamBusy()) {
                 verifyHardwareSurfaceEncoder(info.name, mime, 3840, 2160, 60).second
             } else {
                 false
             }
-            val verified4k30 = if ((ok4k30 || ok4k60) && surfaceOk && runEglEncodeVerification && !SolStreamService.isBroadcastLive) {
+            val verified4k30 = if ((ok4k30 || ok4k60) && surfaceOk && runEglEncodeVerification && !isStreamBusy()) {
                 verified4k60 || verifyHardwareSurfaceEncoder(info.name, mime, 3840, 2160, 30).second
             } else {
                 false
@@ -941,7 +1243,11 @@ object CodecCapabilityProbe {
                 complexityMax = eCaps?.complexityRange?.upper ?: 0,
                 verifiedSurfaceConfigure = surfaceOk,
                 verifiedRealEncode = realEncodeOk,
-                advertisedByMetadata = true
+                advertisedByMetadata = true,
+                supports480p60 = ok480p60 && capGate,
+                supports480p30 = ok480p30 && capGate,
+                supports360p60 = ok360p60 && capGate,
+                supports360p30 = ok360p30 && capGate
             )
         } catch (_: Exception) {
             null
@@ -1068,6 +1374,17 @@ object CodecCapabilityProbe {
             if (eglSurface == EGL14.EGL_NO_SURFACE) return false
             if (!EGL14.eglMakeCurrent(eglDisplay, eglSurface, eglSurface, eglContext)) return false
 
+            // Zero-cost GPU Renderer lookup while the test EGL context is already current!
+            if (detectedGpuRenderer.isBlank()) {
+                try {
+                    val renderer = GLES20.glGetString(GLES20.GL_RENDERER)?.trim().orEmpty()
+                    if (renderer.isNotBlank()) {
+                        detectedGpuRenderer = renderer
+                    }
+                } catch (_: Exception) {
+                }
+            }
+
             val stepNs = 1_000_000_000L / min(60, max(30, fps)).toLong()
             GLES20.glViewport(0, 0, width, height)
             for (f in 0..1) {
@@ -1114,14 +1431,15 @@ object CodecCapabilityProbe {
                 deviceId = -1,
                 label = "Auto (Phone Studio Mic Locked)",
                 isBluetooth = false,
-                deviceInfo = null
+                deviceInfo = null,
+                shortPillLabel = "Phone Studio"
             )
         )
 
         var builtInIndex = 1
         for (dev in inputs) {
             if (!dev.isSource) continue
-            val (label, isBt) = when (dev.type) {
+            val (label, isBt, shortLabel) = when (dev.type) {
                 AudioDeviceInfo.TYPE_BUILTIN_MIC -> {
                     val addr = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) dev.address else ""
                     val posHint = when {
@@ -1129,24 +1447,29 @@ object CodecCapabilityProbe {
                         addr.contains("back", true) || addr.contains("top", true) -> "Top/Secondary"
                         else -> "Mic #$builtInIndex"
                     }
+                    val shortPos = when {
+                        posHint.startsWith("Bottom") -> "Phone Bottom"
+                        posHint.startsWith("Top") -> "Phone Top"
+                        else -> "Phone Mic #$builtInIndex"
+                    }
                     builtInIndex++
-                    "Phone Built-in ($posHint)" to false
+                    Triple("Phone Built-in ($posHint)", false, shortPos)
                 }
                 AudioDeviceInfo.TYPE_BLUETOOTH_SCO -> {
-                    "Bluetooth Hands-Free (${dev.productName})" to true
+                    Triple("Bluetooth Hands-Free (${dev.productName})", true, "BT Mic")
                 }
                 AudioDeviceInfo.TYPE_BLE_HEADSET -> {
-                    "Bluetooth LE Headset (${dev.productName})" to true
+                    Triple("Bluetooth LE Headset (${dev.productName})", true, "BLE Mic")
                 }
                 AudioDeviceInfo.TYPE_WIRED_HEADSET -> {
-                    "Wired Headset Mic (${dev.productName})" to false
+                    Triple("Wired Headset Mic (${dev.productName})", false, "Wired Mic")
                 }
                 AudioDeviceInfo.TYPE_USB_HEADSET, AudioDeviceInfo.TYPE_USB_DEVICE -> {
-                    "USB-C Mic (${dev.productName})" to false
+                    Triple("USB-C Mic (${dev.productName})", false, "USB-C Mic")
                 }
                 else -> continue
             }
-            result.add(MicInputOption(dev.id, label, isBt, dev))
+            result.add(MicInputOption(dev.id, label, isBt, dev, shortLabel))
         }
         return result
     }
