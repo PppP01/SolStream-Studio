@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <style name="Theme.SolStream" parent="Theme.MaterialComponents.DayNight.NoActionBar">
+    <style name="Theme.SolStream" parent="Theme.MaterialComponents.NoActionBar">
         <item name="colorPrimary">#00E5FF</item>
         <item name="colorPrimaryVariant">#00B8D4</item>
         <item name="colorSecondary">#00E676</item>
