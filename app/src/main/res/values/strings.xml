@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">SolStream Studio</string>
-    <string name="accessibility_service_description">SolStream Studio game-streaming overlay and microphone-sharing helper. Displays compact floating live controls during broadcasts and never reads screen text or personal content.</string>
+    <string name="accessibility_service_description">Your voice will always be heard clearly by your teammates whether you use in-game squad voice chat (Call of Duty: Mobile, BGMI, etc.), Discord, WhatsApp, or any voice chat app. You will be able to broadcast and record your microphone audio alongside internal game audio and display the floating in-game control bar while using wired headsets, Bluetooth earphones, or your phone\'s studio microphone. SolStream Studio requires this permission to enable simultaneous microphone sharing and overlay controls in accordance with Google/Android audio policies.\n\nWe will ONLY use this service to keep your microphone audio active and display the floating stream controls while you actively use SolStream Studio with your games. We will NEVER use this service to read screen text, passwords, messages, or personal data, and we will NEVER record your microphone audio while using non-game apps or when your broadcast is stopped.</string>
 </resources>
