@@ -435,9 +435,9 @@ class SolStreamUnitTests {
 
     @Test
     fun globalSocFriendlyMapper_mapsCrypticChipCodesToCleanProcessorNames() {
-        assertEquals("Samsung Exynos 2400e", CodecCapabilityProbe.formatFriendlySocName("Samsung s5e9945"))
-        assertEquals("Snapdragon 8 Gen 3", CodecCapabilityProbe.formatFriendlySocName("Qualcomm SM8650"))
-        assertEquals("MediaTek Dimensity 8300", CodecCapabilityProbe.formatFriendlySocName("MediaTek MT6897"))
+        assertEquals("Samsung Exynos 2400e", CodecCapabilityProbe.formatFriendlySocName("Samsung s5e9945", "s5e9945"))
+        assertEquals("Snapdragon 8 Gen 3", CodecCapabilityProbe.formatFriendlySocName("Qualcomm SM8650", "qcom"))
+        assertEquals("MediaTek Dimensity 8300", CodecCapabilityProbe.formatFriendlySocName("MediaTek MT6897", "mt6897"))
     }
 
     @Test
@@ -517,6 +517,7 @@ class SolStreamUnitTests {
             )
 
             val dsp180 = MicDspProcessor(48000)
+            dsp100.applyHardwareAcousticMode(hwMode)
             dsp180.applyHardwareAcousticMode(hwMode)
             dsp180.applySettings(
                 MicDspProcessor.applyPresetToSettings(
