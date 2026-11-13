@@ -12,18 +12,21 @@
             android:height="108dp"
             android:viewportWidth="108"
             android:viewportHeight="108">
+            <!-- Deep Obsidian-Navy Studio Canvas -->
             <path
-                android:fillColor="#070B12"
+                android:fillColor="#060A12"
                 android:pathData="M0,0h108v108h-108z" />
+            <!-- Subtle Diagonal Studio Depth Sheen -->
             <path
-                android:fillColor="#0C1524"
-                android:pathData="M0,0 L108,0 L108,58 L0,92 Z" />
+                android:fillColor="#0A1220"
+                android:pathData="M0,0 L108,0 L108,64 L0,96 Z" />
+            <!-- Soft Radial Sapphire Aura (Strictly inside squircle safe zone) -->
             <path
-                android:fillColor="#112036"
-                android:pathData="M54,14 A40,40 0 1,1 53.99,14 Z" />
+                android:fillColor="#0D192B"
+                android:pathData="M54,20 A34,34 0 1,1 53.99,20 Z" />
             <path
-                android:fillColor="#080E18"
-                android:pathData="M54,22 A32,32 0 1,1 53.99,22 Z" />
+                android:fillColor="#08101D"
+                android:pathData="M54,27 A27,27 0 1,1 53.99,27 Z" />
         </vector>
     </background>
 
@@ -33,57 +36,58 @@
             android:height="108dp"
             android:viewportWidth="108"
             android:viewportHeight="108">
-            <!-- Outer Broadcast Wave Echoes (Strictly inside 66dp safe zone) -->
+
+            <!-- Design C Element: Dark Eclipse Crescent Halo (Safe Zone R=23.5) -->
+            <path
+                android:fillColor="#132744"
+                android:pathData="M54,30.5 A23.5,23.5 0 1,1 30.5,54 A20.5,20.5 0 1,0 54,30.5 Z" />
             <path
                 android:fillColor="#00000000"
-                android:pathData="M34.4,30.6 A30.5,30.5 0 0,1 73.6,30.6"
-                android:strokeWidth="1.6"
-                android:strokeColor="#6600E5FF"
+                android:pathData="M34.5,41.0 A23.0,23.0 0 0,1 73.5,41.0"
+                android:strokeWidth="1.8"
+                android:strokeColor="#4D00E5FF"
                 android:strokeLineCap="round" />
             <path
                 android:fillColor="#00000000"
-                android:pathData="M73.6,77.4 A30.5,30.5 0 0,1 34.4,77.4"
-                android:strokeWidth="1.6"
-                android:strokeColor="#66FFB300"
+                android:pathData="M73.5,67.0 A23.0,23.0 0 0,1 34.5,67.0"
+                android:strokeWidth="1.8"
+                android:strokeColor="#4D2979FF"
                 android:strokeLineCap="round" />
 
-            <!-- Primary Studio Ring Arcs -->
+            <!-- Design A Element: 3D Royal Cobalt Lower Ribbon 'S' Wing (#2979FF -> #00B0FF) -->
             <path
-                android:fillColor="#00000000"
-                android:pathData="M29.5,42.6 A27,27 0 0,1 78.5,42.6"
-                android:strokeWidth="2.5"
-                android:strokeColor="#00E5FF"
-                android:strokeLineCap="round" />
+                android:fillColor="#1E56D9"
+                android:pathData="M40.0,71.5 L61.5,71.5 L68.5,64.5 L68.5,57.5 L48.5,51.5 L44.5,56.8 L61.0,61.8 L61.0,65.2 L42.5,65.2 Z" />
             <path
-                android:fillColor="#00000000"
-                android:pathData="M78.5,65.4 A27,27 0 0,1 29.5,65.4"
-                android:strokeWidth="2.5"
-                android:strokeColor="#FFB300"
-                android:strokeLineCap="round" />
+                android:fillColor="#2979FF"
+                android:pathData="M41.2,70.2 L61.0,70.2 L67.2,64.0 L67.2,58.2 L48.8,52.6 L45.5,56.8 L61.2,61.5 L61.2,64.8 L43.2,64.8 Z" />
+            <!-- Lower Ribbon Specular Edge Highlight -->
+            <path
+                android:fillColor="#8082B1FF"
+                android:pathData="M43.0,68.8 L60.4,68.8 L61.8,67.4 L44.0,67.4 Z" />
 
-            <!-- Interlocking Esports 'S' Crest: Upper Electric Cyan Blade -->
+            <!-- Design A Element: 3D Electric Cyan Upper Ribbon 'S' Wing (#00E5FF) -->
+            <path
+                android:fillColor="#0097B2"
+                android:pathData="M68.0,36.5 L46.5,36.5 L39.5,43.5 L39.5,50.5 L59.5,56.5 L63.5,51.2 L47.0,46.2 L47.0,42.8 L65.5,42.8 Z" />
             <path
                 android:fillColor="#00E5FF"
-                android:pathData="M67,34.5 L45,34.5 L38,41.5 L38,47.5 L61,55 L65,49.5 L45.5,43.5 L45.5,41 L63.5,41 Z" />
+                android:pathData="M66.8,37.8 L47.0,37.8 L40.8,44.0 L40.8,49.8 L59.2,55.4 L62.5,51.2 L46.8,46.5 L46.8,43.2 L64.8,43.2 Z" />
+            <!-- Upper Ribbon Specular Edge Highlight -->
             <path
-                android:fillColor="#B3FFFFFF"
-                android:pathData="M65.2,36 L45.8,36 L44.2,37.6 L64.2,37.6 Z" />
+                android:fillColor="#CCFFFFFF"
+                android:pathData="M65.0,39.2 L47.6,39.2 L46.2,40.6 L64.0,40.6 Z" />
 
-            <!-- Interlocking Esports 'S' Crest: Lower Solar-Gold Blade -->
+            <!-- Design C Element: Live Crimson Broadcast Core Spark (#FF1744) -->
             <path
-                android:fillColor="#FFC400"
-                android:pathData="M41,73.5 L63,73.5 L70,66.5 L70,60.5 L47,53 L43,58.5 L62.5,64.5 L62.5,67 L44.5,67 Z" />
-            <path
-                android:fillColor="#99FFF8E1"
-                android:pathData="M42.8,72 L62.2,72 L63.8,70.4 L43.8,70.4 Z" />
-
-            <!-- Live Broadcast Pulse Indicator -->
-            <path
-                android:fillColor="#55FF1744"
-                android:pathData="M73,30.5 A5,5 0 1,1 72.99,30.5 Z" />
+                android:fillColor="#38FF1744"
+                android:pathData="M54,48.2 A5.8,5.8 0 1,1 53.99,48.2 Z" />
             <path
                 android:fillColor="#FF1744"
-                android:pathData="M73,32.5 A3,3 0 1,1 72.99,32.5 Z" />
+                android:pathData="M54,50.4 A3.6,3.6 0 1,1 53.99,50.4 Z" />
+            <path
+                android:fillColor="#FFFFFFFF"
+                android:pathData="M52.8,51.8 A1.1,1.1 0 1,1 52.79,51.8 Z" />
         </vector>
     </foreground>
 
@@ -95,25 +99,25 @@
             android:viewportHeight="108">
             <path
                 android:fillColor="#00000000"
-                android:pathData="M29.5,42.6 A27,27 0 0,1 78.5,42.6"
-                android:strokeWidth="2.6"
+                android:pathData="M34.5,41.0 A23.0,23.0 0 0,1 73.5,41.0"
+                android:strokeWidth="2.2"
                 android:strokeColor="#FFFFFFFF"
                 android:strokeLineCap="round" />
             <path
                 android:fillColor="#00000000"
-                android:pathData="M78.5,65.4 A27,27 0 0,1 29.5,65.4"
-                android:strokeWidth="2.6"
+                android:pathData="M73.5,67.0 A23.0,23.0 0 0,1 34.5,67.0"
+                android:strokeWidth="2.2"
                 android:strokeColor="#FFFFFFFF"
                 android:strokeLineCap="round" />
             <path
                 android:fillColor="#FFFFFFFF"
-                android:pathData="M67,34.5 L45,34.5 L38,41.5 L38,47.5 L61,55 L65,49.5 L45.5,43.5 L45.5,41 L63.5,41 Z" />
+                android:pathData="M66.8,37.8 L47.0,37.8 L40.8,44.0 L40.8,49.8 L59.2,55.4 L62.5,51.2 L46.8,46.5 L46.8,43.2 L64.8,43.2 Z" />
             <path
                 android:fillColor="#FFFFFFFF"
-                android:pathData="M41,73.5 L63,73.5 L70,66.5 L70,60.5 L47,53 L43,58.5 L62.5,64.5 L62.5,67 L44.5,67 Z" />
+                android:pathData="M41.2,70.2 L61.0,70.2 L67.2,64.0 L67.2,58.2 L48.8,52.6 L45.5,56.8 L61.2,61.5 L61.2,64.8 L43.2,64.8 Z" />
             <path
                 android:fillColor="#FFFFFFFF"
-                android:pathData="M73,32.5 A3,3 0 1,1 72.99,32.5 Z" />
+                android:pathData="M54,50.4 A3.6,3.6 0 1,1 53.99,50.4 Z" />
         </vector>
     </monochrome>
 
