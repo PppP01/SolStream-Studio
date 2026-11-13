@@ -232,6 +232,215 @@ class SolStreamUnitTests {
     }
 
     @Test
+    fun genderMatchedHpfCoordinator_resolvesExact60HzMale75HzNeutral95HzFemale() {
+        assertEquals(60, KeystoreVault.resolveDefaultHpfForProfile("MALE"))
+        assertEquals(75, KeystoreVault.resolveDefaultHpfForProfile("NEUTRAL"))
+        assertEquals(95, KeystoreVault.resolveDefaultHpfForProfile("FEMALE"))
+
+        val base = StreamSettings(voiceGenderProfile = "NEUTRAL", hpfCutoffHz = 75)
+        val maleApplied = MicDspProcessor.applyGenderProfileToSettings(base, "MALE")
+        assertEquals("MALE", maleApplied.voiceGenderProfile)
+        assertEquals(60, maleApplied.hpfCutoffHz)
+
+        val femaleApplied = MicDspProcessor.applyGenderProfileToSettings(maleApplied, "FEMALE")
+        assertEquals("FEMALE", femaleApplied.voiceGenderProfile)
+        assertEquals(95, femaleApplied.hpfCutoffHz)
+    }
+
+    @Test
+    fun smartClipboardGuard_stripsInvisibleWhitespaceAndDetectsRtmpUrls() {
+        val dirtyKey = "  abcd-1234-xy98\n\t\u200B\uFEFF  "
+        assertEquals("abcd-1234-xy98", KeystoreVault.sanitizeStreamKeyInput(dirtyKey))
+        assertEquals("🔒 Key Saved (••••xy98)", KeystoreVault.getMaskedKeyStatusBadge(dirtyKey))
+        assertEquals("⚠️ Empty", KeystoreVault.getMaskedKeyStatusBadge("   \n "))
+
+        assertTrue(KeystoreVault.isLikelyRtmpUrl("  rtmps://a.rtmps.youtube.com:443/live2 "))
+        assertTrue(KeystoreVault.isLikelyRtmpUrl("rtmp://live.twitch.tv/app"))
+        assertFalse(KeystoreVault.isLikelyRtmpUrl("abcd-1234-efgh-5678"))
+    }
+
+    @Test
+    fun platformAwareTierPresets_respectTwitch6MbpsAndKick8MbpsAndYoutubeHevc() {
+        val hevcReport = HardwareEncoderReport(
+            codecKey = "HEVC",
+            mimeType = MediaFormat.MIMETYPE_VIDEO_HEVC,
+            encoderName = "c2.exynos.hevc.encoder",
+            supports1440p60 = true,
+            supports1080p60 = true,
+            supportsCbr = true,
+            supportsVbr = true,
+            maxConcurrentInstances = 2,
+            complexityMin = 0,
+            complexityMax = 0,
+            verifiedSurfaceConfigure = true,
+            verifiedRealEncode = true
+        )
+        val h264Report = hevcReport.copy(
+            codecKey = "H264",
+            mimeType = MediaFormat.MIMETYPE_VIDEO_AVC,
+            encoderName = "c2.exynos.avc.encoder"
+        )
+        val scan = DeviceScanSummary(
+            deviceModel = "samsung SM-S721B",
+            socModel = "Samsung Exynos 2400e",
+            androidRelease = "16",
+            sdkInt = 36,
+            totalRamGb = 8,
+            maxDisplayHz = 120,
+            activeDisplayHz = 120,
+            hevcHardware = hevcReport,
+            h264Hardware = h264Report,
+            av1Hardware = null,
+            recommendedTier = DeviceTier.FLAGSHIP,
+            recommendedCodec = "HEVC",
+            recommendedWidth = 2560,
+            recommendedHeight = 1440
+        )
+
+        val messyUserSettings = StreamSettings(
+            platformPreset = "YOUTUBE",
+            voiceGenderProfile = "MALE",
+            maxBFrames = 2,
+            qpMaxCap = 42,
+            useVbr = true
+        )
+        val ytFlagship = KeystoreVault.applyPlatformAndVoiceAwareTierPreset(
+            messyUserSettings,
+            DeviceTier.FLAGSHIP,
+            scan
+        )
+        assertEquals("HEVC", ytFlagship.codec)
+        assertEquals(2560, ytFlagship.width)
+        assertEquals(1440, ytFlagship.height)
+        assertEquals(20000, ytFlagship.targetBitrateKbps)
+        assertEquals(60, ytFlagship.hpfCutoffHz)
+        assertEquals(0, ytFlagship.maxBFrames)
+        assertEquals(0, ytFlagship.qpMaxCap)
+        assertFalse(ytFlagship.useVbr)
+
+        val twitchFlagship = KeystoreVault.applyPlatformAndVoiceAwareTierPreset(
+            ytFlagship.copy(platformPreset = "TWITCH"),
+            DeviceTier.FLAGSHIP,
+            scan
+        )
+        assertEquals("H264", twitchFlagship.codec)
+        assertEquals(1920, twitchFlagship.width)
+        assertEquals(1080, twitchFlagship.height)
+        assertEquals(6000, twitchFlagship.targetBitrateKbps)
+        assertEquals(160, twitchFlagship.audioBitrateKbps)
+
+        val kickFlagship = KeystoreVault.applyPlatformAndVoiceAwareTierPreset(
+            ytFlagship.copy(platformPreset = "KICK"),
+            DeviceTier.FLAGSHIP,
+            scan
+        )
+        assertEquals("H264", kickFlagship.codec)
+        assertEquals(8000, kickFlagship.targetBitrateKbps)
+        assertEquals(160, kickFlagship.audioBitrateKbps)
+    }
+
+    @Test
+    fun crossPhonePresetClamping_adaptsFlagship1440pHevcPresetToBudget1080p30H264Phone() {
+        val budgetH264 = HardwareEncoderReport(
+            codecKey = "H264",
+            mimeType = MediaFormat.MIMETYPE_VIDEO_AVC,
+            encoderName = "c2.mtk.avc.encoder",
+            supports1440p60 = false,
+            supports1440p30 = false,
+            supports1080p60 = false,
+            supports1080p30 = true,
+            supportsCbr = true,
+            supportsVbr = true,
+            maxBitrateMbps = 12,
+            maxConcurrentInstances = 1,
+            complexityMin = 0,
+            complexityMax = 0,
+            verifiedSurfaceConfigure = true,
+            verifiedRealEncode = true
+        )
+        val budgetScan = DeviceScanSummary(
+            deviceModel = "Budget Phone",
+            socModel = "Helio G85",
+            androidRelease = "14",
+            sdkInt = 34,
+            totalRamGb = 4,
+            maxDisplayHz = 60,
+            activeDisplayHz = 60,
+            hevcHardware = null,
+            h264Hardware = budgetH264,
+            av1Hardware = null,
+            recommendedTier = DeviceTier.LITE,
+            recommendedCodec = "H264",
+            recommendedWidth = 1920,
+            recommendedHeight = 1080,
+            recommendedFps = 30
+        )
+
+        val flagshipPreset = StreamSettings(
+            codec = "HEVC",
+            width = 2560,
+            height = 1440,
+            fps = 60,
+            targetBitrateKbps = 20000,
+            hdr10Enabled = true,
+            dualFormatCompanionEnabled = true
+        )
+        val (clamped, wasChanged) = KeystoreVault.clampImportedSettingsToHardware(flagshipPreset, budgetScan)
+        assertTrue(wasChanged)
+        assertEquals("H264", clamped.codec)
+        assertEquals(1920, clamped.width)
+        assertEquals(1080, clamped.height)
+        assertEquals(30, clamped.fps)
+        assertEquals(12000, clamped.targetBitrateKbps)
+        assertFalse(clamped.hdr10Enabled)
+        assertFalse(clamped.dualFormatCompanionEnabled)
+    }
+
+    @Test
+    fun dualFormatCompanionSupport_checksAllHardwareEncodersIncludingH264AndAv1() {
+        val singleInstanceHevc = HardwareEncoderReport(
+            codecKey = "HEVC",
+            mimeType = MediaFormat.MIMETYPE_VIDEO_HEVC,
+            encoderName = "c2.vendor.hevc.encoder",
+            supports1440p60 = true,
+            supports1080p60 = true,
+            supportsCbr = true,
+            supportsVbr = true,
+            maxConcurrentInstances = 1,
+            complexityMin = 0,
+            complexityMax = 0,
+            verifiedSurfaceConfigure = true
+        )
+        val dualInstanceH264 = singleInstanceHevc.copy(
+            codecKey = "H264",
+            mimeType = MediaFormat.MIMETYPE_VIDEO_AVC,
+            encoderName = "c2.vendor.avc.encoder",
+            maxConcurrentInstances = 2
+        )
+        val summary = DeviceScanSummary(
+            deviceModel = "Global Flagship",
+            socModel = "Snapdragon 8 Gen 3",
+            androidRelease = "16",
+            sdkInt = 36,
+            totalRamGb = 8,
+            hevcHardware = singleInstanceHevc,
+            h264Hardware = dualInstanceH264,
+            av1Hardware = null,
+            recommendedCodec = "HEVC",
+            recommendedWidth = 2560,
+            recommendedHeight = 1440
+        )
+        assertTrue(summary.supportsDualFormatCompanion())
+    }
+
+    @Test
+    fun globalSocFriendlyMapper_mapsCrypticChipCodesToCleanProcessorNames() {
+        assertEquals("Samsung Exynos 2400e", CodecCapabilityProbe.formatFriendlySocName("Samsung s5e9945"))
+        assertEquals("Snapdragon 8 Gen 3", CodecCapabilityProbe.formatFriendlySocName("Qualcomm SM8650"))
+        assertEquals("MediaTek Dimensity 8300", CodecCapabilityProbe.formatFriendlySocName("MediaTek MT6897"))
+    }
+
+    @Test
     fun micDspSparkBlanker_clampsMultiStrikeMosquitoRacketImpulsesWhilePreservingSpeech() {
         val dsp = MicDspProcessor(48000)
         val luxe = MicDspProcessor.applyPresetToSettings(
@@ -292,6 +501,45 @@ class SolStreamUnitTests {
                 lastRms = sqrt(sumSq / speech.size)
             }
             assertTrue("$gender speech RMS should remain strong and clear (>0.06f), was $lastRms", lastRms > 0.06f)
+        }
+    }
+
+    @Test
+    fun micDsp12ModeHardwareMatrix_adaptsPhoneStudioWiredUsbAndBluetoothAndPostAgcBoost() {
+        for (hwMode in HardwareAcousticMode.entries) {
+            val dsp100 = MicDspProcessor(48000)
+            dsp100.applyHardwareAcousticMode(hwMode)
+            dsp100.applySettings(
+                MicDspProcessor.applyPresetToSettings(
+                    StreamSettings(voiceGenderProfile = "MALE", micGainPercent = 100),
+                    "SOL_LUXE"
+                )
+            )
+
+            val dsp180 = MicDspProcessor(48000)
+            dsp180.applyHardwareAcousticMode(hwMode)
+            dsp180.applySettings(
+                MicDspProcessor.applyPresetToSettings(
+                    StreamSettings(voiceGenderProfile = "MALE", micGainPercent = 180),
+                    "SOL_LUXE"
+                )
+            )
+
+            var rms100 = 0f
+            var rms180 = 0f
+            repeat(6) {
+                val frameA = FloatArray(480) { idx ->
+                    val t = idx.toDouble() / 48000.0
+                    (0.10 * sin(2.0 * PI * 115.0 * t) + 0.04 * sin(2.0 * PI * 2800.0 * t)).toFloat()
+                }
+                val frameB = frameA.clone()
+                dsp100.processMonoFrameInPlace(frameA, frameA.size)
+                dsp180.processMonoFrameInPlace(frameB, frameB.size)
+
+                rms100 = sqrt(frameA.fold(0f) { acc, v -> acc + v * v } / frameA.size)
+                rms180 = sqrt(frameB.fold(0f) { acc, v -> acc + v * v } / frameB.size)
+            }
+            assertTrue("Mode ${hwMode.name}: 180% Post-DSP Mic Boost ($rms180) must be louder than 100% ($rms100)", rms180 > rms100 * 1.35f)
         }
     }
 }
