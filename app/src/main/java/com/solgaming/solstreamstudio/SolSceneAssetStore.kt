@@ -230,8 +230,11 @@ object SolSceneAssetStore {
         val longest = max(rotW, rotH)
         val scale = if (longest > maxDim) maxDim.toFloat() / longest.toFloat() else 1.0f
 
-        if (rotationDeg == 0f && scale >= 0.999f && src.config == Bitmap.Config.ARGB_8888) {
-            return src
+        if (rotationDeg == 0f && scale >= 0.999f) {
+            if (src.config == Bitmap.Config.ARGB_8888) {
+                return src
+            }
+            return src.copy(Bitmap.Config.ARGB_8888, false) ?: src
         }
 
         val matrix = Matrix()
@@ -241,7 +244,15 @@ object SolSceneAssetStore {
         if (scale < 0.999f) {
             matrix.postScale(scale, scale)
         }
-        return Bitmap.createBitmap(src, 0, 0, src.width, src.height, matrix, true)
+        val transformed = Bitmap.createBitmap(src, 0, 0, src.width, src.height, matrix, true)
+        if (transformed.config != Bitmap.Config.ARGB_8888) {
+            val copy = transformed.copy(Bitmap.Config.ARGB_8888, false)
+            if (copy != null) {
+                if (transformed !== src) transformed.recycle()
+                return copy
+            }
+        }
+        return transformed
     }
 
     fun loadSavedBitmapForGl(context: Context, slot: AssetSlot): Bitmap? {
@@ -302,7 +313,7 @@ object SolSceneAssetStore {
             shader = LinearGradient(
                 cardRect.left, cardRect.top, cardRect.right, cardRect.bottom,
                 Color.parseColor("#00E5FF"),
-                Color.parseColor("#FFC400"),
+                Color.parseColor("#2979FF"),
                 Shader.TileMode.CLAMP
             )
         }
@@ -364,19 +375,25 @@ object SolSceneAssetStore {
         val canvas = Canvas(bmp)
         canvas.drawColor(Color.TRANSPARENT, PorterDuff.Mode.CLEAR)
 
+        val clippedText = clean.take(68)
+        val displayStr = clippedText.uppercase(Locale.US).let { if (clean == it) it else clippedText }
+
         val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             color = Color.WHITE
             typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
             textSize = 31f
         }
-        val clippedText = clean.take(68)
-        var measuredTextW = textPaint.measureText(clippedText)
-        if (measuredTextW > texW - 150f) {
-            textPaint.textSize = 24f
-            measuredTextW = min(texW - 130f, textPaint.measureText(clippedText))
-        }
 
-        val pillW = (measuredTextW + 108f).coerceIn(280f, texW - 24f)
+        // Auto-fit font size down to 17f so long 68-character banners never overflow the pill border
+        val maxAllowedTextW = texW - 116f
+        var measuredTextW = textPaint.measureText(displayStr)
+        while (measuredTextW > maxAllowedTextW && textPaint.textSize > 17f) {
+            textPaint.textSize -= 1.5f
+            measuredTextW = textPaint.measureText(displayStr)
+        }
+        measuredTextW = min(maxAllowedTextW, measuredTextW)
+
+        val pillW = (measuredTextW + 92f).coerceIn(280f, texW - 24f)
         val left = (texW - pillW) * 0.5f
         val pillRect = RectF(left, 10f, left + pillW, texH - 10f)
 
@@ -392,7 +409,7 @@ object SolSceneAssetStore {
             shader = LinearGradient(
                 pillRect.left, pillRect.top, pillRect.right, pillRect.bottom,
                 Color.parseColor("#00E5FF"),
-                Color.parseColor("#FFC400"),
+                Color.parseColor("#2979FF"),
                 Shader.TileMode.CLAMP
             )
         }
@@ -412,7 +429,7 @@ object SolSceneAssetStore {
         val fm = textPaint.fontMetrics
         val baselineY = (texH * 0.5f) - (fm.ascent + fm.descent) * 0.5f
         canvas.drawText(
-            clippedText.uppercase(Locale.US).let { if (clean == it) it else clippedText },
+            displayStr,
             pillRect.left + 56f,
             baselineY,
             textPaint
