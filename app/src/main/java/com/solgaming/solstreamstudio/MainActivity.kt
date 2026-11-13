@@ -644,7 +644,6 @@ class MainActivity : AppCompatActivity() {
             platRow.addView(b)
         }
         cardStream.addView(platRow)
-        btnPlatformPreset = actionButton("", "#1E3A5F") { cyclePlatformPreset() }.apply { visibility = View.GONE }
 
         cardStream.addView(labelText("Primary RTMPS Ingest Server URL (works with or without :443):"))
         etRtmpsUrl = styledEditText(KeystoreVault.getRtmpsUrl(this), isPassword = false)
@@ -1900,12 +1899,6 @@ class MainActivity : AppCompatActivity() {
             else -> settings.copy(platformPreset = "CUSTOM")
         }
         updateSetting(updated, requiresRestartIfLive = true)
-    }
-
-    private fun cyclePlatformPreset() {
-        val order = listOf("YOUTUBE", "TWITCH", "KICK", "CUSTOM")
-        val next = order[(order.indexOf(settings.platformPreset) + 1) % order.size]
-        selectPlatformPreset(next)
     }
 
     private fun toggleSimulcastTarget(isTwitch: Boolean) {
