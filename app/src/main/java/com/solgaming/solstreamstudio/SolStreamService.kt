@@ -112,15 +112,22 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
     private val reconnectScheduled = AtomicBoolean(false)
     private val connectionSessionGen = AtomicLong(0L)
 
-    // Real-time outbound send-queue tracking (guarantees real Queue telemetry instead of Q: N/A)
+    // Real-time outbound send-queue & live RtmpClient bitrate callback tracking
     private val inFlightVideoFrames = AtomicInteger(0)
     private val inFlightVideoBytes = AtomicLong(0L)
     @Volatile private var lastVideoSendLatencyMs: Long = 1L
+    @Volatile private var lastCallbackBitrateKbps: Int = -1
+    @Volatile private var lastCallbackBitrateElapsedMs: Long = 0L
 
-    // Manual override flags so automatic thermal saver never fights explicit user clicks
+    // Separate manual vs. automatic thermal cooldown states so manual 30FPS Cool never fights the 2s loop
     private var userManuallyOverrodeSharp = false
-    private var userManuallyOverrode30FpsSaver = false
+    private var manual30FpsSaverEnabled = false
+    private var autoThermal30FpsActive = false
+    private var autoThermalNative30BitrateTrimActive = false
     private var severeThermalLastSeenElapsedMs = 0L
+
+    // Preserves manual mic mute state across BRB / STARTING_SOON scene transitions
+    private var micWasMutedBeforeSceneSwitch = false
 
     // Dual-Layer Keyboard Privacy Blur states (Auto IME detector + Manual 1-tap override)
     @Volatile private var imeKeyboardVisible = false
@@ -230,9 +237,9 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
     }
 
     /**
-     * GPT Audit Fix #1: Per-session primary RTMP callback wrapper that holds a direct reference
-     * to the exact RtmpClient instance it was created for (clientRef), so a delayed callback from
-     * a stopped client can only disconnect its own old socket and never a newer broadcast session.
+     * Per-session primary RTMP callback wrapper that holds a direct reference to the exact
+     * RtmpClient instance it was created for (clientRef), so a delayed callback from a stopped
+     * client can only disconnect its own old socket and never a newer broadcast session.
      */
     private class PrimaryRtmpCallback(
         private val sessionGen: Long,
@@ -270,8 +277,8 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
     }
 
     /**
-     * GPT Audit Fix #2: Bounded 90-frame send queue (DiscardOldestPolicy) with safe
-     * RejectedExecutionException handling so a stalled auxiliary target never leaks RAM.
+     * Bounded 90-frame send queue (DiscardOldestPolicy) with a pre-allocated reusable ByteBuffer
+     * & BufferInfo ring so Simulcast and Companion targets operate with zero per-frame GC churn.
      */
     private inner class AuxRtmpTarget(
         val name: String,
@@ -283,6 +290,17 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
         @Volatile var connected = false
         @Volatile var stopped = false
         private val reconnecting = AtomicBoolean(false)
+
+        private val videoRingSize = 12
+        private val videoRingBuffers = Array(videoRingSize) { ByteBuffer.allocateDirect(524_288) }
+        private val videoRingInfos = Array(videoRingSize) { MediaCodec.BufferInfo() }
+        private val videoRingIdx = AtomicInteger(0)
+
+        private val audioRingSize = 16
+        private val audioRingBuffers = Array(audioRingSize) { ByteBuffer.allocateDirect(4096) }
+        private val audioRingInfos = Array(audioRingSize) { MediaCodec.BufferInfo() }
+        private val audioRingIdx = AtomicInteger(0)
+
         private val sendExecutor = ThreadPoolExecutor(
             1,
             1,
@@ -311,7 +329,9 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
                     client.setLogs(false)
                     client.setCheckServerAlive(true)
                     client.setOnlyVideo(false)
+                    RtmpTelemetryBridge.configureClientSecurityAndPings(client)
                     try { client.resizeCache(90) } catch (_: Throwable) {}
+                    try { client.clearCache() } catch (_: Throwable) {}
                     val vCodec = when (codecKey) {
                         "HEVC" -> VideoCodec.H265
                         "AV1" -> VideoCodec.AV1
@@ -349,29 +369,61 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
             }
         }
 
-        fun sendVideoFrame(frameBytes: ByteArray, ptsUs: Long, flags: Int) {
-            if (!connected || stopped) return
+        fun sendVideoBuffer(srcBuf: ByteBuffer, info: MediaCodec.BufferInfo) {
+            if (!connected || stopped || info.size <= 0) return
+            val slot = (videoRingIdx.getAndIncrement() and 0x7FFFFFFF) % videoRingSize
+            val ringBuf = synchronized(videoRingInfos[slot]) {
+                var target = videoRingBuffers[slot]
+                if (info.size > target.capacity()) {
+                    target = ByteBuffer.allocateDirect(info.size + 65536)
+                    videoRingBuffers[slot] = target
+                }
+                val dup = srcBuf.duplicate()
+                dup.position(info.offset)
+                dup.limit(info.offset + info.size)
+                target.clear()
+                target.put(dup)
+                target.flip()
+                videoRingInfos[slot].set(0, info.size, info.presentationTimeUs, info.flags)
+                target
+            }
+            val slotInfo = videoRingInfos[slot]
             executeSafely {
                 if (!connected || stopped) return@executeSafely
                 try {
-                    val info = MediaCodec.BufferInfo().apply {
-                        set(0, frameBytes.size, ptsUs, flags)
+                    synchronized(slotInfo) {
+                        client.sendVideo(ringBuf.duplicate(), slotInfo)
                     }
-                    client.sendVideo(ByteBuffer.wrap(frameBytes), info)
                 } catch (_: Exception) {
                 }
             }
         }
 
-        fun sendAudioFrame(aacBytes: ByteArray, ptsUs: Long, flags: Int) {
-            if (!connected || stopped) return
+        fun sendAudioBuffer(srcBuf: ByteBuffer, info: MediaCodec.BufferInfo) {
+            if (!connected || stopped || info.size <= 0) return
+            val slot = (audioRingIdx.getAndIncrement() and 0x7FFFFFFF) % audioRingSize
+            val ringBuf = synchronized(audioRingInfos[slot]) {
+                var target = audioRingBuffers[slot]
+                if (info.size > target.capacity()) {
+                    target = ByteBuffer.allocateDirect(info.size + 2048)
+                    audioRingBuffers[slot] = target
+                }
+                val dup = srcBuf.duplicate()
+                dup.position(info.offset)
+                dup.limit(info.offset + info.size)
+                target.clear()
+                target.put(dup)
+                target.flip()
+                audioRingInfos[slot].set(0, info.size, info.presentationTimeUs, info.flags)
+                target
+            }
+            val slotInfo = audioRingInfos[slot]
             executeSafely {
                 if (!connected || stopped) return@executeSafely
                 try {
-                    val info = MediaCodec.BufferInfo().apply {
-                        set(0, aacBytes.size, ptsUs, flags)
+                    synchronized(slotInfo) {
+                        client.sendAudio(ringBuf.duplicate(), slotInfo)
                     }
-                    client.sendAudio(ByteBuffer.wrap(aacBytes), info)
                 } catch (_: Exception) {
                 }
             }
@@ -381,6 +433,7 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
             stopped = true
             connected = false
             executeSafely {
+                try { client.clearCache() } catch (_: Throwable) {}
                 try { client.disconnect() } catch (_: Exception) {}
             }
             try { sendExecutor.shutdown() } catch (_: Exception) {}
@@ -416,6 +469,10 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
                 mainHandler.postDelayed({
                     reconnecting.set(false)
                     if (shouldAcceptConnectionCallback(broadcastActive, sessionGen, connectionSessionGen.get(), stopped)) {
+                        executeSafely {
+                            try { client.clearCache() } catch (_: Throwable) {}
+                            try { client.disconnect() } catch (_: Exception) {}
+                        }
                         startAsync()
                     }
                 }, 4000L)
@@ -471,8 +528,8 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
                 if (resultCode == Activity.RESULT_OK && resultData != null) {
                     startLiveBroadcast(resultCode, resultData)
                 } else {
-                    CodecCapabilityProbe.isBroadcastStartingOrLive = false
-                    DiagnosticsLogger.log("START_ABORT", "Screen capture permission was not granted.")
+                    // Satisfy Android's startForegroundService() contract before stopping on canceled permission
+                    satisfyForegroundContractAndStopIfIdle("Screen capture permission was not granted.")
                 }
             }
             ACTION_START_BENCHMARK, ACTION_START_GLIP_BENCH -> startPassiveCompetitorBenchmark()
@@ -481,7 +538,21 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
             ACTION_TOGGLE_BRB -> cycleSceneLive()
             ACTION_MARK_CLIP -> saveClipMarkerLive("Notification ★ Clip")
         }
-        return START_STICKY
+        // ChatGPT Audit Fix #5: START_NOT_STICKY prevents zombie service restarts with a null
+        // MediaProjection token if the OS ever reclaims the process.
+        return START_NOT_STICKY
+    }
+
+    private fun satisfyForegroundContractAndStopIfIdle(logMsg: String) {
+        CodecCapabilityProbe.isBroadcastStartingOrLive = false
+        DiagnosticsLogger.log("START_ABORT", logMsg)
+        if (!broadcastActive && !benchmarkOnlyActive) {
+            try {
+                startForeground(NOTIF_ID, buildStreamNotification("SolStream Studio Ready"))
+                stopForeground(STOP_FOREGROUND_REMOVE)
+            } catch (_: Exception) {
+            }
+        }
     }
 
     override fun onDestroy() {
@@ -531,10 +602,6 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
         }
     }
 
-    /**
-     * GPT Audit Fix #5: Verifies RECORD_AUDIO permission before promoting the Benchmark foreground
-     * service with FOREGROUND_SERVICE_TYPE_MICROPHONE on Android 14-18+, wrapped in try/catch.
-     */
     private fun startPassiveCompetitorBenchmark() {
         if (broadcastActive || benchmarkOnlyActive) return
         val hasMicPerm = ContextCompat.checkSelfPermission(
@@ -542,6 +609,7 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
             Manifest.permission.RECORD_AUDIO
         ) == PackageManager.PERMISSION_GRANTED
         if (!hasMicPerm) {
+            satisfyForegroundContractAndStopIfIdle("Benchmark aborted: Microphone permission missing.")
             Toast.makeText(
                 this,
                 "Grant Microphone permission in Card 1 first to start Benchmark mode.",
@@ -568,7 +636,9 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
         needsProjectionReapproval = false
         currentLiveStateLabel = "BENCHMARK ACTIVE (Profiling Thermal & RAM)"
         userManuallyOverrodeSharp = false
-        userManuallyOverrode30FpsSaver = false
+        manual30FpsSaverEnabled = false
+        autoThermal30FpsActive = false
+        autoThermalNative30BitrateTrimActive = false
         severeThermalLastSeenElapsedMs = 0L
 
         DiagnosticsLogger.startNewSession(
@@ -604,32 +674,11 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
         if (broadcastActive) return
         if (benchmarkOnlyActive) stopLiveBroadcast("Switching to Live Broadcast")
 
-        // Checklist #9 & #32: Immediately reserve isBroadcastStartingOrLive so background hardware scans
-        // cannot start or overlap while we promote foreground service and allocate live encoders!
+        // Immediately reserve isBroadcastStartingOrLive so background hardware scans cannot overlap
         CodecCapabilityProbe.isBroadcastStartingOrLive = true
 
-        activeSettings = KeystoreVault.loadSettings(this)
-        needsProjectionReapproval = false
-        userManuallyOverrodeSharp = false
-        userManuallyOverrode30FpsSaver = false
-        imeKeyboardVisible = false
-        manualKeyboardBlurOverride = false
-        severeThermalLastSeenElapsedMs = 0L
-        wasThermalThrottledLastTick = false
-        lastRttProbeElapsedMs = 0L
-        inFlightVideoFrames.set(0)
-        inFlightVideoBytes.set(0L)
-        lastVideoSendLatencyMs = 1L
-
-        val builtPrimaryUrl = KeystoreVault.buildActivePrimaryEndpoint(this, activeSettings)
-        if (builtPrimaryUrl.isNullOrBlank()) {
-            CodecCapabilityProbe.isBroadcastStartingOrLive = false
-            Toast.makeText(this, "Save your YouTube/RTMPS Stream Key in the Vault first.", Toast.LENGTH_LONG).show()
-            return
-        }
-
-        // Android 17/18 BackgroundAudioHardening (#32): Promote foreground service FIRST before
-        // touching MediaProjection, AudioRecord, or MediaCodec!
+        // Claude Audit Fix #3: Promote foreground service FIRST before any validation or early return
+        // so Android never throws ForegroundServiceDidNotStartInTimeException!
         val notif = buildStreamNotification("Starting SolApex™ HyperStream broadcast...")
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
@@ -648,8 +697,34 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
             return
         }
 
-        // Checklist #9: If an initial startup hardware scan is still running on a worker thread,
-        // wait cleanly up to 5000 ms for it to finish before allocating live encoders.
+        activeSettings = KeystoreVault.loadSettings(this)
+        needsProjectionReapproval = false
+        userManuallyOverrodeSharp = false
+        manual30FpsSaverEnabled = false
+        autoThermal30FpsActive = false
+        autoThermalNative30BitrateTrimActive = false
+        micWasMutedBeforeSceneSwitch = false
+        imeKeyboardVisible = false
+        manualKeyboardBlurOverride = false
+        severeThermalLastSeenElapsedMs = 0L
+        wasThermalThrottledLastTick = false
+        lastRttProbeElapsedMs = 0L
+        inFlightVideoFrames.set(0)
+        inFlightVideoBytes.set(0L)
+        lastVideoSendLatencyMs = 1L
+        lastCallbackBitrateKbps = -1
+        lastCallbackBitrateElapsedMs = 0L
+        RtmpTelemetryBridge.resetSessionByteCounter()
+
+        val builtPrimaryUrl = KeystoreVault.buildActivePrimaryEndpoint(this, activeSettings)
+        if (builtPrimaryUrl.isNullOrBlank()) {
+            CodecCapabilityProbe.isBroadcastStartingOrLive = false
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            Toast.makeText(this, "Save your YouTube/RTMPS Stream Key in the Vault first.", Toast.LENGTH_LONG).show()
+            return
+        }
+
+        // Wait cleanly up to 5000 ms if an initial startup hardware scan is finishing on a worker thread
         val scan = CodecCapabilityProbe.awaitCachedSummary(this, maxWaitMs = 5000L)
 
         primaryStreamUrl = builtPrimaryUrl
@@ -685,6 +760,7 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
             setLogs(false)
             setCheckServerAlive(true)
             setOnlyVideo(false)
+            RtmpTelemetryBridge.configureClientSecurityAndPings(this)
             try { resizeCache(120) } catch (_: Throwable) {}
         }
         primaryCb.clientRef = client
@@ -721,8 +797,8 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
             !activeSettings.isVertical &&
             scan.supportsDualFormatCompanion()
         ) {
-            // Checklist #18: Mode 2 Split-Encode Simulcast — Primary encoder sends 1440p/4K HEVC to
-            // YouTube while Secondary Hardware Encoder outputs 1080p60 H.264 CBR to Twitch/Kick!
+            // Mode 2 Split-Encode Simulcast: Primary encoder sends 1440p/4K HEVC to YouTube while
+            // Secondary Hardware Encoder outputs 1080p60 H.264 CBR to Twitch/Kick!
             splitEncodeSimulcastActive = true
         }
         DiagnosticsLogger.activeSimulcastDesc = targetNames.joinToString(" + ")
@@ -810,13 +886,8 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
                     }
                 }
                 if (auxTargets.isNotEmpty() && !splitEncodeSimulcastActive) {
-                    val dup = bb.duplicate()
-                    val bytes = ByteArray(info.size)
-                    dup.position(info.offset)
-                    dup.limit(info.offset + info.size)
-                    dup.get(bytes)
                     for (aux in auxTargets) {
-                        aux.sendVideoFrame(bytes, info.presentationTimeUs, info.flags)
+                        aux.sendVideoBuffer(bb, info)
                     }
                 }
             },
@@ -835,25 +906,13 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
             },
             onCompanionVideo = { bb, info ->
                 if (splitEncodeSimulcastActive) {
-                    if (auxTargets.isNotEmpty()) {
-                        val dup = bb.duplicate()
-                        val bytes = ByteArray(info.size)
-                        dup.position(info.offset)
-                        dup.limit(info.offset + info.size)
-                        dup.get(bytes)
-                        for (aux in auxTargets) {
-                            aux.sendVideoFrame(bytes, info.presentationTimeUs, info.flags)
-                        }
+                    for (aux in auxTargets) {
+                        aux.sendVideoBuffer(bb, info)
                     }
                 } else {
                     val comp = companionTarget ?: return@startPipeline
                     if (comp.connected) {
-                        val dup = bb.duplicate()
-                        val bytes = ByteArray(info.size)
-                        dup.position(info.offset)
-                        dup.limit(info.offset + info.size)
-                        dup.get(bytes)
-                        comp.sendVideoFrame(bytes, info.presentationTimeUs, info.flags)
+                        comp.sendVideoBuffer(bb, info)
                     }
                 }
             },
@@ -906,15 +965,10 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
                     DiagnosticsLogger.avDriftMs = (aacInfo.presentationTimeUs - vPts) / 1000L
                 }
                 if (auxTargets.isNotEmpty() || companionTarget != null) {
-                    val dup = aacBuf.duplicate()
-                    val bytes = ByteArray(aacInfo.size)
-                    dup.position(aacInfo.offset)
-                    dup.limit(aacInfo.offset + aacInfo.size)
-                    dup.get(bytes)
                     for (aux in auxTargets) {
-                        aux.sendAudioFrame(bytes, aacInfo.presentationTimeUs, aacInfo.flags)
+                        aux.sendAudioBuffer(aacBuf, aacInfo)
                     }
-                    companionTarget?.sendAudioFrame(bytes, aacInfo.presentationTimeUs, aacInfo.flags)
+                    companionTarget?.sendAudioBuffer(aacBuf, aacInfo)
                 }
             }
         )
@@ -970,7 +1024,7 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
     }
 
     /**
-     * Checklist #20: Instant Wi-Fi <-> 5G Mobile Data Multipath Failover Watcher.
+     * Instant Wi-Fi <-> 5G Mobile Data Multipath Failover Watcher (#20):
      * When both Wi-Fi and 5G Mobile Data are open, detects the exact millisecond Android switches
      * the default internet pipe and triggers a fast 300 ms reconnect over the new network.
      */
@@ -1025,6 +1079,19 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
 
     private fun computeDynamicAbrFloorBps(configuredMaxBps: Int): Int {
         return max(400_000, min(6_000_000, (configuredMaxBps * 35) / 100))
+    }
+
+    /**
+     * Computes the safe recommended bitrate floor for native 30 FPS streams so thermal relief
+     * NEVER cuts bitrate if the user is already at or below a normal 30 FPS bitrate!
+     */
+    private fun computeNative30FpsSafeThermalFloorBps(): Int {
+        val maxDim = max(activeSettings.width, activeSettings.height)
+        return when {
+            maxDim >= 2560 -> 12_000_000 // 12.0 Mbps floor for 1440p30 / 4K30
+            maxDim >= 1920 -> 8_000_000  // 8.0 Mbps floor for 1080p30
+            else -> maxConfiguredBitrateBps // Never cut bitrate for heat at <= 720p30
+        }
     }
 
     private fun copyToByteArray(src: ByteBuffer): ByteArray {
@@ -1102,6 +1169,7 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
                 if (!shouldAcceptConnectionCallback(broadcastActive, sessionGen, connectionSessionGen.get())) {
                     return@execute
                 }
+                try { currentClient.clearCache() } catch (_: Throwable) {}
                 try { currentClient.disconnect() } catch (_: Exception) {}
                 val sps = cachedSps
                 if (sps != null) {
@@ -1124,7 +1192,7 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
             return
         }
 
-        // Checklist #34: Snapshot the true active mic status BEFORE stopping the audio engine!
+        // Snapshot the true active mic status BEFORE stopping the audio engine!
         DiagnosticsLogger.lockFinalMicStatusBeforeStop()
 
         connectionSessionGen.incrementAndGet()
@@ -1187,6 +1255,7 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
 
         Thread({
             if (clientToClose != null) {
+                try { clientToClose.clearCache() } catch (_: Throwable) {}
                 try { clientToClose.disconnect() } catch (_: Exception) {}
             }
             try { audioToClose?.stopStreamingAudio() } catch (_: Exception) {}
@@ -1228,7 +1297,7 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
         }
     }
 
-    // === 2-SECOND QUEUE-AWARE PING GUARD ABR 2.0 + ZOMBIE-SOCKET + YOUR EXACT THERMAL BITRATE RULES ===
+    // === 2-SECOND QUEUE-AWARE PING GUARD ABR 2.0 + ZOMBIE-SOCKET + EXACT 60FPS & 30FPS THERMAL RULES ===
     private fun runHealthAndRecoveryTick() {
         val (tempC, thermal) = DiagnosticsLogger.sampleDeviceHealth(this)
         val headroom = DiagnosticsLogger.lastThermalHeadroom
@@ -1245,7 +1314,12 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
                 val qBytes = if (bridgeBytes >= 0L) bridgeBytes else inFlightVideoBytes.get().coerceAtLeast(0L)
                 var rttMs = RtmpTelemetryBridge.readRttMs(client)
                 val droppedVideo = RtmpTelemetryBridge.readDroppedVideoFrames(client)
-                val sentKbps = RtmpTelemetryBridge.readSentBitrateKbps(client)
+
+                val sentKbps = if (nowElapsed - lastCallbackBitrateElapsedMs <= 4500L && lastCallbackBitrateKbps >= 0) {
+                    lastCallbackBitrateKbps
+                } else {
+                    RtmpTelemetryBridge.readSentBitrateKbps(client)
+                }
 
                 DiagnosticsLogger.lastQueueFrames = qFrames
                 DiagnosticsLogger.lastQueueCapacity = qCap
@@ -1262,22 +1336,21 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
                 val droppedDelta = max(0L, droppedVideo - lastDroppedTotal)
                 lastDroppedTotal = droppedVideo
 
-                // Zombie-Socket Watchdog: if socket claims connected, VideoPipeline is producing frames,
-                // but outbound sent throughput is 0 kbps with a backed-up queue or high send latency for 3 ticks (6s),
-                // force an immediate clean reconnect!
+                // Zombie-Socket Watchdog: uses verified non-negative sentKbps (or >1200ms blocking send stall)
                 if (rtmpConnected && vPipe.actualEncodedFps >= 15) {
-                    val isBackedUpAndStalled = (sentKbps in 0..5) &&
-                        ((qFrames >= 25) || (qBytes > 1_200_000L) || (droppedDelta >= 10L) || (lastVideoSendLatencyMs > 900L))
-                    if (isBackedUpAndStalled) {
+                    val zeroSentConfirmed = (sentKbps in 0..5) &&
+                        ((qFrames >= 25) || (qBytes > 1_200_000L) || (droppedDelta >= 10L))
+                    val severeBlockingSendStall = (lastVideoSendLatencyMs > 1200L) && (qFrames >= 20 || droppedDelta >= 8L)
+                    if (zeroSentConfirmed || severeBlockingSendStall) {
                         zeroThroughputStallTicks++
                         if (zeroThroughputStallTicks >= 3) {
                             zeroThroughputStallTicks = 0
                             DiagnosticsLogger.log(
                                 "ZOMBIE_SOCKET",
-                                "Detected silent Wi-Fi/router stall (0 kbps outbound for 6s with queued frames); forcing clean RTMPS reconnect.",
-                                "qFrames=$qFrames qKB=${qBytes / 1024} dropsDelta=$droppedDelta sendMs=$lastVideoSendLatencyMs"
+                                "Detected silent Wi-Fi/router stall (6s outbound socket stall with queued frames); forcing clean RTMPS reconnect.",
+                                "sentKbps=$sentKbps qFrames=$qFrames qKB=${qBytes / 1024} dropsDelta=$droppedDelta sendMs=$lastVideoSendLatencyMs"
                             )
-                            scheduleSilentReconnect("Silent socket stall (0 kbps for 6s)", connectionSessionGen.get())
+                            scheduleSilentReconnect("Silent socket stall (6s)", connectionSessionGen.get())
                         }
                     } else {
                         zeroThroughputStallTicks = 0
@@ -1286,10 +1359,7 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
                     zeroThroughputStallTicks = 0
                 }
 
-                // === YOUR EXACT THERMAL & ABR BITRATE RULES (#26) ===
-                // 1. NEVER trim bitrate for heat while streaming at 60 FPS!
-                // 2. Only step bitrate down (-40%) when Severe warmth (or manual 30FPS Cool) steps a 60 FPS stream down to 30 FPS.
-                // 3. Apply linked scaling across both Primary and Companion encoders when Dual-Format is active.
+                // === YOUR EXACT THERMAL & ABR BITRATE RULES (60 FPS + NATIVE 30 FPS) ===
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                     val needModerateRelief = thermal >= PowerManager.THERMAL_STATUS_MODERATE &&
                         (tempC >= 44.0f || headroom >= 0.90f)
@@ -1318,27 +1388,48 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
                             vPipe.liveGpuSharpen = false
                             activeSettings = activeSettings.copy(gpuSharpen = false)
                         }
-                        if (!userManuallyOverrode30FpsSaver && !vPipe.thermalThrottle30Fps && activeSettings.fps > 30) {
-                            vPipe.thermalThrottle30Fps = true
-                            val propMbps = String.format(Locale.US, "%.1f", (maxConfiguredBitrateBps * 0.60) / 1_000_000.0)
-                            DiagnosticsLogger.log(
-                                "THERMAL",
-                                "Phone reached Severe warmth; stepped 60 FPS stream to 30 FPS & ${propMbps} Mbps (-40% encoder heat)."
-                            )
+                        if (activeSettings.fps > 30) {
+                            if (!autoThermal30FpsActive) {
+                                autoThermal30FpsActive = true
+                                vPipe.thermalThrottle30Fps = true
+                                val propMbps = String.format(Locale.US, "%.1f", (maxConfiguredBitrateBps * 0.60) / 1_000_000.0)
+                                DiagnosticsLogger.log(
+                                    "THERMAL",
+                                    "Phone reached Severe warmth; stepped 60 FPS stream to 30 FPS & ${propMbps} Mbps (-40% encoder heat)."
+                                )
+                            }
+                        } else {
+                            // Native 30 FPS stream in Severe warmth: only trim bitrate (-25%) if target > safe 30-FPS floor!
+                            val safe30FloorBps = computeNative30FpsSafeThermalFloorBps()
+                            if (!autoThermalNative30BitrateTrimActive && maxConfiguredBitrateBps > safe30FloorBps) {
+                                autoThermalNative30BitrateTrimActive = true
+                                val trimmedBps = max(safe30FloorBps, (maxConfiguredBitrateBps * 75) / 100)
+                                val propMbps = String.format(Locale.US, "%.1f", trimmedBps / 1_000_000.0)
+                                DiagnosticsLogger.log(
+                                    "THERMAL",
+                                    "Phone reached Severe warmth on 30 FPS stream; trimmed high bitrate to ${propMbps} Mbps (-25% encoder heat)."
+                                )
+                            }
                         }
                     } else if (thermal <= PowerManager.THERMAL_STATUS_MODERATE) {
-                        if (userManuallyOverrode30FpsSaver &&
-                            (thermal <= PowerManager.THERMAL_STATUS_LIGHT || tempC <= 43.4f)
-                        ) {
-                            userManuallyOverrode30FpsSaver = false
-                        }
                         val cooldownSatisfied = (nowElapsed - severeThermalLastSeenElapsedMs >= 45_000L) ||
                             (tempC in 1.0f..43.8f && (headroom < 0f || headroom <= 0.85f))
-                        if (!userManuallyOverrode30FpsSaver && vPipe.thermalThrottle30Fps && cooldownSatisfied) {
-                            vPipe.thermalThrottle30Fps = false
+
+                        if (autoThermal30FpsActive && cooldownSatisfied) {
+                            autoThermal30FpsActive = false
+                            vPipe.thermalThrottle30Fps = manual30FpsSaverEnabled
+                            if (!manual30FpsSaverEnabled) {
+                                DiagnosticsLogger.log(
+                                    "THERMAL",
+                                    "SoC cooled safely; restored full 60 FPS broadcast cadence & 100% target bitrate."
+                                )
+                            }
+                        }
+                        if (autoThermalNative30BitrateTrimActive && cooldownSatisfied) {
+                            autoThermalNative30BitrateTrimActive = false
                             DiagnosticsLogger.log(
                                 "THERMAL",
-                                "SoC cooled safely; restored full 60 FPS broadcast cadence & 100% target bitrate."
+                                "SoC cooled safely; restored 100% target bitrate on 30 FPS stream."
                             )
                         }
                         if (vPipe.companionPausedByThermal && thermal <= PowerManager.THERMAL_STATUS_LIGHT) {
@@ -1347,36 +1438,48 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
                     }
                 }
 
-                // Exact Thermal Ceiling: 60% ONLY when a 60 FPS stream is throttled to 30 FPS; 100% at all 60 FPS times!
-                val is30FpsCooldownActive = vPipe.thermalThrottle30Fps && activeSettings.fps > 30
-                val newThermalCeilingBps = if (is30FpsCooldownActive) {
-                    max(minAdaptiveBitrateBps, (maxConfiguredBitrateBps * 60) / 100)
-                } else {
-                    maxConfiguredBitrateBps
+                val is60To30CooldownActive = (autoThermal30FpsActive || manual30FpsSaverEnabled) && activeSettings.fps > 30
+                val isNative30TrimActive = (autoThermalNative30BitrateTrimActive || manual30FpsSaverEnabled) && activeSettings.fps <= 30
+
+                val newThermalCeilingBps = when {
+                    is60To30CooldownActive -> max(minAdaptiveBitrateBps, (maxConfiguredBitrateBps * 60) / 100)
+                    isNative30TrimActive -> {
+                        val safe30Floor = computeNative30FpsSafeThermalFloorBps()
+                        if (maxConfiguredBitrateBps > safe30Floor) {
+                            max(safe30Floor, (maxConfiguredBitrateBps * 75) / 100)
+                        } else {
+                            maxConfiguredBitrateBps
+                        }
+                    }
+                    else -> maxConfiguredBitrateBps
                 }
                 activeThermalCeilingBps = newThermalCeilingBps
 
+                val anyThermalBitrateThrottle = is60To30CooldownActive || (isNative30TrimActive && newThermalCeilingBps < maxConfiguredBitrateBps)
+
                 // Linked Dual-Encoder Thermal Governor (#26)
-                if (is30FpsCooldownActive && !wasThermalThrottledLastTick) {
+                if (anyThermalBitrateThrottle && !wasThermalThrottledLastTick) {
                     wasThermalThrottledLastTick = true
-                    if (activeBitrateBps > newThermalCeilingBps) {
+                    if (activeBitrateBps > newThermalCeilingBps && vPipe.activeSceneMode == "LIVE") {
                         activeBitrateBps = newThermalCeilingBps
                         vPipe.setBitrateOnFly(activeBitrateBps)
                     }
-                    val scaledCompBps = max(1_200_000, (maxConfiguredCompanionBps * 60) / 100)
+                    val compRatio = if (is60To30CooldownActive) 60 else 75
+                    val scaledCompBps = max(1_200_000, (maxConfiguredCompanionBps * compRatio) / 100)
                     vPipe.setCompanionBitrateOnFly(scaledCompBps)
-                } else if (!is30FpsCooldownActive && wasThermalThrottledLastTick) {
+                } else if (!anyThermalBitrateThrottle && wasThermalThrottledLastTick) {
                     wasThermalThrottledLastTick = false
                     vPipe.setCompanionBitrateOnFly(maxConfiguredCompanionBps)
-                    // If Ping Guard ABR is OFF (or network is calm with 0 drops), restore 100% primary bitrate immediately
                     if (!activeSettings.adaptiveBitrate || (droppedDelta == 0L && qFrames <= 5)) {
                         activeBitrateBps = maxConfiguredBitrateBps
-                        vPipe.setBitrateOnFly(activeBitrateBps)
+                        if (vPipe.activeSceneMode == "LIVE") {
+                            vPipe.setBitrateOnFly(activeBitrateBps)
+                        }
                     }
                 }
 
-                // Queue-Aware Ping Guard ABR 2.0 (#26: never drops from background RTT probes when qFrames <= 8 & droppedDelta == 0)
-                if (activeSettings.adaptiveBitrate && rtmpConnected) {
+                // Queue-Aware Ping Guard ABR 2.0
+                if (activeSettings.adaptiveBitrate && rtmpConnected && vPipe.activeSceneMode == "LIVE") {
                     val queueCongested = (qCap > 0 && qFrames > (qCap * 35) / 100) ||
                         (qFrames > 35) ||
                         (qBytes > 1_600_000L) ||
@@ -1529,7 +1632,7 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
 
         btnOvNsMode = makePillMiniBtn("NS:RNNOISE", "#10B981") { cycleNsModeLive() }
         btnOvNsLevel = makePillMiniBtn("Lv:2 (88%)", "#10B981") { cycleRnnoiseLive() }
-        btnOvHpf = makePillMiniBtn("HPF:75Hz", "#38BDF8") { cycleHpfLive() }
+        btnOvHpf = makePillMiniBtn("HPF:65Hz", "#38BDF8") { cycleHpfLive() }
         audioPane.addView(makeAlignedGridRow(btnOvNsMode!!, btnOvNsLevel!!, btnOvHpf!!))
 
         btnOvEq = makePillMiniBtn("EQ:ON", "#38BDF8") { toggleVoiceEqLive() }
@@ -1886,7 +1989,7 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
     }
 
     /**
-     * Checklist #36: Short Closed Pill (● 05:36 | 17.6M | 60fps | Mic:ON | 38.4°C)
+     * Short Closed Pill (● 05:36 | 17.6M | 60fps | Mic:ON | 38.4°C)
      * that never cuts off on screen, while keeping SoC %, Game FPS, and Queue (ms) inside the Open Pill!
      */
     private fun updatePillTelemetryUI() {
@@ -2010,8 +2113,13 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
         // Tab 2 (Net / Bitrate / Detailed Telemetry)
         tvOvBitrateReadout?.text = String.format(Locale.US, "%.1f Mbps", activeBitrateBps / 1_000_000.0)
         btnOvAbrToggle?.text = if (activeSettings.adaptiveBitrate) "ABR:ON" else "ABR:OFF"
-        val saver30 = vPipe?.thermalThrottle30Fps == true
-        btnOvThermal30Saver?.text = if (saver30) "30FPS Cool:ACTIVE" else "30FPS Cool:AUTO"
+        val saver30 = vPipe?.thermalThrottle30Fps == true || manual30FpsSaverEnabled || autoThermalNative30BitrateTrimActive
+        val saverLabel = when {
+            manual30FpsSaverEnabled -> "30FPS Cool:ON"
+            saver30 -> "30FPS Cool:ACTIVE"
+            else -> "30FPS Cool:AUTO"
+        }
+        btnOvThermal30Saver?.text = saverLabel
         btnOvThermal30Saver?.setTextColor(Color.parseColor(if (saver30) "#F59E0B" else "#10B981"))
 
         val outFps = vPipe?.actualEncodedFps ?: 0
@@ -2054,10 +2162,13 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
 
     private fun toggleMicMuteLive() {
         val dsp = audioEngine?.micDsp ?: return
-        dsp.streamMicMuted = !dsp.streamMicMuted
+        val newMuted = !dsp.streamMicMuted
+        dsp.streamMicMuted = newMuted
+        // If user manually toggles mic mute while in BRB/STARTING_SOON, remember their choice when returning to LIVE
+        micWasMutedBeforeSceneSwitch = newMuted
         refreshExpandedControlsState()
         updatePillTelemetryUI()
-        updateStreamNotification(if (dsp.streamMicMuted) "LIVE (Stream Mic Muted)" else "LIVE Broadcast Active")
+        updateStreamNotification(if (newMuted) "LIVE (Stream Mic Muted)" else "LIVE Broadcast Active")
         notifyDashboardStateChanged()
     }
 
@@ -2070,7 +2181,8 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
 
     private fun cycleSceneLive() {
         val vPipe = videoPipeline ?: return
-        val next = when (vPipe.activeSceneMode) {
+        val prevScene = vPipe.activeSceneMode
+        val next = when (prevScene) {
             "LIVE" -> "BRB"
             "BRB" -> "STARTING_SOON"
             else -> "LIVE"
@@ -2078,7 +2190,15 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
         vPipe.setSceneMode(next)
         audioEngine?.streamSceneIsLive = (next == "LIVE")
         if (activeSettings.brbMuteMicToo) {
-            audioEngine?.micDsp?.streamMicMuted = (next != "LIVE")
+            val dsp = audioEngine?.micDsp
+            if (dsp != null) {
+                if (prevScene == "LIVE" && next != "LIVE") {
+                    micWasMutedBeforeSceneSwitch = dsp.streamMicMuted
+                    dsp.streamMicMuted = true
+                } else if (next == "LIVE") {
+                    dsp.streamMicMuted = micWasMutedBeforeSceneSwitch
+                }
+            }
         }
         if (next != "LIVE") {
             vPipe.setBitrateOnFly(min(activeBitrateBps, 1_500_000))
@@ -2190,8 +2310,7 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
     }
 
     /**
-     * Checklist #22: Expands Zoom to 10 steps (100%..250%) and automatically activates SMART
-     * framing whenever Zoom is tapped so the stream zooms immediately!
+     * Expands Zoom to 10 steps (100%..250%) and automatically activates SMART framing whenever Zoom is tapped!
      */
     private fun cycleSmartZoomLive() {
         val order = SMART_ZOOM_STEPS
@@ -2265,12 +2384,21 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
         val nextIdx = (closestIdx + dir).coerceIn(0, stepsKbps.size - 1)
         val nextKbps = stepsKbps[nextIdx]
 
-        activeBitrateBps = nextKbps * 1000
+        val vPipe = videoPipeline
+        if (vPipe != null) {
+            if (vPipe.activeSceneMode == "LIVE") {
+                vPipe.setBitrateOnFly(nextKbps * 1000)
+                activeBitrateBps = vPipe.currentBitrateBps
+            } else {
+                activeBitrateBps = nextKbps * 1000
+            }
+        } else {
+            activeBitrateBps = nextKbps * 1000
+        }
         maxConfiguredBitrateBps = activeBitrateBps
         activeThermalCeilingBps = activeBitrateBps
         minAdaptiveBitrateBps = computeDynamicAbrFloorBps(maxConfiguredBitrateBps)
-        videoPipeline?.setBitrateOnFly(activeBitrateBps)
-        saveAndPushSettings(activeSettings.copy(targetBitrateKbps = nextKbps))
+        saveAndPushSettings(activeSettings.copy(targetBitrateKbps = activeBitrateBps / 1000))
     }
 
     private fun toggleAbrLive() =
@@ -2278,20 +2406,40 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
 
     private fun toggleThermal30FpsSaverLive() {
         val vPipe = videoPipeline ?: return
-        userManuallyOverrode30FpsSaver = true
-        val newThrottleState = !vPipe.thermalThrottle30Fps
-        vPipe.thermalThrottle30Fps = newThrottleState
+        val currentlyThrottled = manual30FpsSaverEnabled || autoThermal30FpsActive || autoThermalNative30BitrateTrimActive
+        val newThrottleState = !currentlyThrottled
+        manual30FpsSaverEnabled = newThrottleState
+        if (!newThrottleState) {
+            autoThermal30FpsActive = false
+            autoThermalNative30BitrateTrimActive = false
+        }
+        vPipe.thermalThrottle30Fps = newThrottleState && activeSettings.fps > 30
         wasThermalThrottledLastTick = newThrottleState
-        if (newThrottleState && activeSettings.fps > 30) {
-            val scaledBps = max(minAdaptiveBitrateBps, (maxConfiguredBitrateBps * 60) / 100)
+
+        if (newThrottleState) {
+            val scaledBps = if (activeSettings.fps > 30) {
+                max(minAdaptiveBitrateBps, (maxConfiguredBitrateBps * 60) / 100)
+            } else {
+                val safe30Floor = computeNative30FpsSafeThermalFloorBps()
+                if (maxConfiguredBitrateBps > safe30Floor) {
+                    max(safe30Floor, (maxConfiguredBitrateBps * 75) / 100)
+                } else {
+                    maxConfiguredBitrateBps
+                }
+            }
             activeBitrateBps = scaledBps
             activeThermalCeilingBps = scaledBps
-            vPipe.setBitrateOnFly(activeBitrateBps)
-            vPipe.setCompanionBitrateOnFly(max(1_200_000, (maxConfiguredCompanionBps * 60) / 100))
+            if (vPipe.activeSceneMode == "LIVE") {
+                vPipe.setBitrateOnFly(activeBitrateBps)
+            }
+            val compRatio = if (activeSettings.fps > 30) 60 else 75
+            vPipe.setCompanionBitrateOnFly(max(1_200_000, (maxConfiguredCompanionBps * compRatio) / 100))
         } else {
             activeBitrateBps = maxConfiguredBitrateBps
             activeThermalCeilingBps = maxConfiguredBitrateBps
-            vPipe.setBitrateOnFly(activeBitrateBps)
+            if (vPipe.activeSceneMode == "LIVE") {
+                vPipe.setBitrateOnFly(activeBitrateBps)
+            }
             vPipe.setCompanionBitrateOnFly(maxConfiguredCompanionBps)
         }
         refreshExpandedControlsState()
@@ -2317,8 +2465,7 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
 
     private fun onPrimaryConnectionSuccess(sessionGen: Long, sourceClient: RtmpClient?) {
         if (!shouldAcceptConnectionCallback(broadcastActive, sessionGen, connectionSessionGen.get())) {
-            // GPT Audit Fix #1: Disconnect ONLY the stale sourceClient that fired this callback,
-            // NEVER the current rtmpClient of a newer broadcast session!
+            // Disconnect ONLY the stale sourceClient that fired this callback, NEVER a newer session!
             netExecutor.execute { try { sourceClient?.disconnect() } catch (_: Exception) {} }
             return
         }
@@ -2345,6 +2492,8 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
 
     private fun onPrimaryNewBitrate(sessionGen: Long, bitrate: Long) {
         if (!shouldAcceptConnectionCallback(broadcastActive, sessionGen, connectionSessionGen.get())) return
+        lastCallbackBitrateKbps = (bitrate.coerceAtLeast(0L) / 1000L).toInt()
+        lastCallbackBitrateElapsedMs = SystemClock.elapsedRealtime()
     }
 
     private fun onPrimaryConnectionFailed(sessionGen: Long, reason: String) {
@@ -2497,18 +2646,32 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
         private var mRtt: Method? = null
         private var mDroppedVideo: Method? = null
         private var mSentBitrate: Method? = null
+        private var mBytesSend: Method? = null
+        private var mShouldSendPings: Method? = null
+        private var mSetTlsHostVerification: Method? = null
+
+        @Volatile private var prevTotalBytesSent: Long = -1L
+        @Volatile private var prevBytesSampleTimeMs: Long = 0L
+
+        fun resetSessionByteCounter() {
+            prevTotalBytesSent = -1L
+            prevBytesSampleTimeMs = 0L
+        }
 
         @Synchronized
         private fun ensureResolved(client: RtmpClient) {
             if (resolved) return
             resolved = true
             val cls = client.javaClass
-            mCacheItems = findZeroArg(cls, "getItemsInCacheCount", "getCacheItemsCount")
+            mCacheItems = findZeroArg(cls, "getItemsInCache", "getItemsInCacheCount", "getCacheItemsCount")
             mCacheSize = findZeroArg(cls, "getCacheSize", "getMaxCacheSize")
-            mQueueBytes = findZeroArg(cls, "getSentQueueBytes", "getBytesInQueue")
+            mQueueBytes = findZeroArg(cls, "getQueueBytesOut", "getSentQueueBytes", "getBytesInQueue")
             mRtt = findZeroArg(cls, "getRtt", "getPingRtt")
             mDroppedVideo = findZeroArg(cls, "getDroppedVideoFrames", "getDroppedFrames")
             mSentBitrate = findZeroArg(cls, "getBitrate", "getSentBitrate")
+            mBytesSend = findZeroArg(cls, "getBytesSend", "getBytesSent")
+            mShouldSendPings = findBooleanArg(cls, "shouldSendPings", "setShouldSendPings")
+            mSetTlsHostVerification = findBooleanArg(cls, "setTlsHostVerification", "enableTlsHostVerification")
         }
 
         private fun findZeroArg(cls: Class<*>, vararg names: String): Method? {
@@ -2519,6 +2682,36 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
                 }
             }
             return null
+        }
+
+        private fun findBooleanArg(cls: Class<*>, vararg names: String): Method? {
+            for (n in names) {
+                try {
+                    return cls.getMethod(n, Boolean::class.javaPrimitiveType ?: Boolean::class.java).apply {
+                        isAccessible = true
+                    }
+                } catch (_: Exception) {
+                }
+            }
+            return null
+        }
+
+        /**
+         * Enables TLS Hostname Verification and active RTMP Ping RTT measurement on RtmpClient.
+         */
+        fun configureClientSecurityAndPings(client: RtmpClient) {
+            ensureResolved(client)
+            try { mShouldSendPings?.invoke(client, true) } catch (_: Throwable) {}
+            try {
+                if (mSetTlsHostVerification != null) {
+                    mSetTlsHostVerification?.invoke(client, true)
+                } else {
+                    val f = client.javaClass.getDeclaredField("tlsHostVerification")
+                    f.isAccessible = true
+                    f.setBoolean(client, true)
+                }
+            } catch (_: Throwable) {
+            }
         }
 
         fun readCacheItemsCount(client: RtmpClient): Int {
@@ -2548,7 +2741,28 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
 
         fun readSentBitrateKbps(client: RtmpClient): Int {
             ensureResolved(client)
-            return try { ((mSentBitrate?.invoke(client) as? Number)?.toLong() ?: -1L).toInt() / 1000 } catch (_: Exception) { -1 }
+            try {
+                val direct = (mSentBitrate?.invoke(client) as? Number)?.toLong() ?: -1L
+                if (direct >= 0L) return (direct / 1000L).toInt()
+            } catch (_: Exception) {
+            }
+            return try {
+                val totalBytes = (mBytesSend?.invoke(client) as? Number)?.toLong() ?: return -1
+                val nowMs = SystemClock.elapsedRealtime()
+                val prevB = prevTotalBytesSent
+                val prevT = prevBytesSampleTimeMs
+                prevTotalBytesSent = totalBytes
+                prevBytesSampleTimeMs = nowMs
+                if (prevB >= 0L && totalBytes >= prevB && nowMs > prevT) {
+                    val deltaBytes = totalBytes - prevB
+                    val deltaMs = (nowMs - prevT).coerceAtLeast(1L)
+                    ((deltaBytes * 8L) / deltaMs).toInt()
+                } else {
+                    -1
+                }
+            } catch (_: Exception) {
+                -1
+            }
         }
     }
 
