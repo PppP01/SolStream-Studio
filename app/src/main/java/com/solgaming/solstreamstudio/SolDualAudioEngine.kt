@@ -49,6 +49,7 @@ import kotlin.math.min
 import kotlin.math.pow
 import kotlin.math.roundToInt
 import kotlin.math.sin
+import kotlin.math.sqrt
 
 data class MicCalibrationAdvice(
     val measuredNoiseFloorDb: Int,
@@ -136,7 +137,7 @@ class SolDualAudioEngine(private val context: Context) {
 
     private var tpdfSeed: Int = 0x6D2B79F5
 
-    // 64-bit Stereo Biquad for Game Sub-Punch (65 Hz) & Footstep Focus (2.85 kHz)
+    // 64-bit Stereo Biquad for Game Sub-Punch (62 Hz) & Dual-Band Footstep Focus (250 Hz + 2,450 Hz)
     private class StereoBiquad64 {
         var b0 = 1.0; var b1 = 0.0; var b2 = 0.0
         var a1 = 0.0; var a2 = 0.0
@@ -177,7 +178,7 @@ class SolDualAudioEngine(private val context: Context) {
             z1L = b1 * xd - a1 * y + z2L
             z2L = b2 * xd - a2 * y
             if (!z1L.isFinite() || abs(z1L) < 1e-24) z1L = 0.0
-            if (!z2L.isFinite() || abs(z2L) < 1e-24) z2R = 0.0
+            if (!z2L.isFinite() || abs(z2L) < 1e-24) z2L = 0.0
             return y.toFloat()
         }
 
@@ -191,17 +192,24 @@ class SolDualAudioEngine(private val context: Context) {
             if (!z2R.isFinite() || abs(z2R) < 1e-24) z2R = 0.0
             return y.toFloat()
         }
+
+        fun reset() {
+            z1L = 0.0; z2L = 0.0
+            z1R = 0.0; z2R = 0.0
+        }
     }
 
-    // Isolated 68 Hz Sub-Bass Band-Pass for AI Dynamic Bass-Priority Ducking (boosts +2.0 dB idle, dips -50% when speaking!)
-    private val gameSubBandExtractor = StereoBiquad64().apply { configureBandPass(68.0, 0.78) }
-    private val gameFootstepFilter = StereoBiquad64().apply { configurePeaking(2850.0, 1.25, 2.0) }
-    private val gameFootstepBandExtractor = StereoBiquad64().apply { configureBandPass(2850.0, 1.35) }
+    // Phase-safe 62 Hz Sub-Bass Band-Pass (+0.42f [+3.0 dB] when silent, ducks to 0.0f when speaking!)
+    private val gameSubBandExtractor = StereoBiquad64().apply { configureBandPass(62.0, 0.75) }
+    // Dual-Band Footstep Focus: 250 Hz indoor boot thump (+1.6 dB) + 2,450 Hz outdoor gravel/metal crunch (+2.4 dB) + Sonar Lift
+    private val gameFootstepLowThumpFilter = StereoBiquad64().apply { configurePeaking(250.0, 1.30, 1.6) }
+    private val gameFootstepFilter = StereoBiquad64().apply { configurePeaking(2450.0, 1.00, 2.4) }
+    private val gameFootstepBandExtractor = StereoBiquad64().apply { configureBandPass(2450.0, 1.20) }
 
     private var sideLowPassState = 0.0f
     private var gameBlastEnv = 0.0f
     private var gameBlastGain = 1.0f
-    private var subPunchVoiceGainSmooth = 0.26f
+    private var subPunchVoiceGainSmooth = 0.0f
     private var sonarFootstepExtraLiftSmooth = 0.0f
 
     // 64-sample Look-Ahead 4x Cubic Inter-Sample True-Peak Limiter state (-1.16 dBTP ceiling)
@@ -422,14 +430,19 @@ class SolDualAudioEngine(private val context: Context) {
         // Snapshot the true active mic status BEFORE tearing down audio so Session Reports never say "MIC STOPPED"
         DiagnosticsLogger.lockFinalMicStatusBeforeStop()
         isRunning = false
+        pendingMicRouteRefresh = false
         unregisterDynamicAudioRouteWatcher()
+
+        // ChatGPT Audit Fix #2: Stop micRecord & gameRecord FIRST to immediately unblock any
+        // blocking AudioRecord.read() call inside mixerThread before joining or releasing resources!
+        try { micRecord?.stop() } catch (_: Exception) {}
+        try { gameRecord?.stop() } catch (_: Exception) {}
 
         val mixerRef = mixerThread
         val drainRef = drainThread
         try { mixerRef?.join(1500) } catch (_: Exception) {}
         try { drainRef?.join(1500) } catch (_: Exception) {}
 
-        // GPT Audit #6: If either worker thread is still alive after initial join, interrupt and wait briefly before releasing codec
         if (mixerRef?.isAlive == true || drainRef?.isAlive == true) {
             try { mixerRef?.interrupt() } catch (_: Exception) {}
             try { drainRef?.interrupt() } catch (_: Exception) {}
@@ -520,7 +533,7 @@ class SolDualAudioEngine(private val context: Context) {
         }
     }
 
-    // === DRIFT-LOCKED STEREO GAME CIRCULAR BUFFER + 15-STAGE FLOAT MIXER ===
+    // === DRIFT-LOCKED STEREO GAME CIRCULAR BUFFER + 12-STAGE SOLLUXE 2.0 FLOAT MIXER ===
     private fun runRealtimeFloatMixLoop(
         codec: MediaCodec,
         mediaProjection: MediaProjection?,
@@ -567,9 +580,21 @@ class SolDualAudioEngine(private val context: Context) {
         var delayWriteIdx = 0
         var lastAppliedDelayFrames = 0
 
+        // Reset all game soundstage & limiter filter states cleanly on start
+        gameSubBandExtractor.reset()
+        gameFootstepLowThumpFilter.reset()
+        gameFootstepFilter.reset()
+        gameFootstepBandExtractor.reset()
+        sideLowPassState = 0.0f
+        gameBlastEnv = 0.0f
+        gameBlastGain = 1.0f
+        subPunchVoiceGainSmooth = 0.0f
+        sonarFootstepExtraLiftSmooth = 0.0f
         lookAheadBufL.fill(0f)
         lookAheadBufR.fill(0f)
         lookAheadIdx = 0
+        prevSampleL0 = 0f; prevSampleL1 = 0f; prevSampleL2 = 0f
+        prevSampleR0 = 0f; prevSampleR1 = 0f; prevSampleR2 = 0f
         limiterEnvGain = 1.0f
 
         var duckGainSmooth = 1.0f
@@ -606,9 +631,10 @@ class SolDualAudioEngine(private val context: Context) {
                     DiagnosticsLogger.log("CALL_SHIELD", "Phone call ended — restoring 48 kHz stream studio microphone.")
                 }
 
-                if (pendingMicRouteRefresh && !inPhoneCall) {
+                if (pendingMicRouteRefresh && !inPhoneCall && isRunning) {
                     pendingMicRouteRefresh = false
                     releaseMicSafely()
+                    if (!isRunning) break
                     val reopened = buildMicAudioRecord(
                         context = context,
                         requestedSource = activeMicAudioSource,
@@ -616,6 +642,14 @@ class SolDualAudioEngine(private val context: Context) {
                         enableHwNs = activeHwNsEnabled,
                         enableSpeakerAec = activeSpeakerAecEnabled
                     )
+                    if (!isRunning) {
+                        if (reopened != null) {
+                            try { reopened.second?.release() } catch (_: Exception) {}
+                            try { reopened.third?.release() } catch (_: Exception) {}
+                            try { reopened.first.stop(); reopened.first.release() } catch (_: Exception) {}
+                        }
+                        break
+                    }
                     if (reopened != null) {
                         micRecord = reopened.first
                         hwNoiseSuppressor = reopened.second
@@ -646,6 +680,7 @@ class SolDualAudioEngine(private val context: Context) {
                         AudioRecord.READ_BLOCKING
                     ) ?: -1
                 }
+                if (!isRunning) break
 
                 var micPeakRaw = 0f
                 if (micRead > 0 && !inPhoneCall) {
@@ -660,7 +695,7 @@ class SolDualAudioEngine(private val context: Context) {
                     micMonoBuf.fill(0f)
                 }
 
-                if (!inPhoneCall) {
+                if (!inPhoneCall && isRunning) {
                     if (micRead <= 0 || micPeakRaw < 1e-7f) {
                         consecutiveZeroOrSilencedReads++
                         if (micRead <= 0) {
@@ -691,7 +726,7 @@ class SolDualAudioEngine(private val context: Context) {
                     0f
                 }
 
-                // 2. Run 10-Stage 32-bit Float / 64-bit Double SolLuxe™ 2.0 Voice DSP + C 48kHz RNNoise on Mic ONLY
+                // 2. Run 12-Stage 32-bit Float / 64-bit Double SolLuxe™ 2.0 Voice DSP + C 48kHz RNNoise on Mic ONLY
                 micDsp.processMonoFrameInPlace(micMonoBuf, MONO_SAMPLES_PER_10MS)
 
                 // 3. Apply Bluetooth / Facecam Mic Sync Delay Ring Buffer (0 - 200 ms) with clean zeroing on change
@@ -793,7 +828,8 @@ class SolDualAudioEngine(private val context: Context) {
                         Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q &&
                         totalFramesMixed > 0 &&
                         (totalFramesMixed % 300L) == 0L &&
-                        gameRebuildAttempts < 12
+                        gameRebuildAttempts < 12 &&
+                        isRunning
                     ) {
                         gameRebuildAttempts++
                         val rebuilt = buildGameAudioRecord(mediaProjection)
@@ -805,7 +841,7 @@ class SolDualAudioEngine(private val context: Context) {
                     }
                 }
 
-                // 5. VAD Auto-Ducking, AI Dynamic Bass-Priority Ducking, Sonar Footstep Lift & 250% Game Gain
+                // 5. VAD Auto-Ducking, Phase-Safe Theater Sub-Punch, Dual-Band Footstep Focus & 250% Game Gain
                 val speechNow = micDsp.vadSpeechActive
                 val targetDuck = if (speechNow && vadDuckingAmount > 0.01f) {
                     (1.0f - vadDuckingAmount).coerceIn(0.20f, 1.0f)
@@ -824,21 +860,15 @@ class SolDualAudioEngine(private val context: Context) {
                 val footOn = gameFootstepFocusEnabled
                 val blastOn = gameBlastTamerEnabled
 
-                // AI Dynamic Bass-Priority Ducking (#29):
-                // When Sub-Punch is ON, boost 65-120 Hz sub-bass by +2.0 dB (+0.26x) when silent,
-                // and dip 65-120 Hz sub-bass by -50% (-0.36x) during speech so explosions never muddy deep voice!
-                val targetSubVoiceGain = if (!subOn) {
-                    0.0f
-                } else if (speechNow) {
-                    -0.36f
-                } else {
-                    0.26f
-                }
+                // Phase-Safe Theater Sub-Punch (62 Hz, Q=0.75):
+                // Boosts 62 Hz by +0.42f (+3.0 dB deep theater thump) when silent, and smoothly ducks
+                // that extra boost down to 0.0f (100% neutral un-colored game audio) when you speak!
+                val targetSubVoiceGain = if (!subOn || speechNow) 0.0f else 0.42f
 
-                // Sonar Footstep Lift (#29): when both Footstep Focus + Blast Tamer are ON and gunfire is quiet,
-                // gently lift 2.85 kHz footsteps by an extra +1.8 dB (+0.22x), dropping to 0.0x during gunshots.
-                val targetSonarLift = if (footOn && blastOn && gameBlastEnv < 0.14f) {
-                    ((0.14f - gameBlastEnv) / 0.14f).coerceIn(0.0f, 1.0f) * 0.22f
+                // Sonar Footstep Lift: whenever Footstep Focus is ON and gunfire is quiet (gameBlastEnv < 0.14f),
+                // gently lift 2,450 Hz footsteps by an extra +1.8 dB (+0.23f), dropping to 0.0f during gunshots.
+                val targetSonarLift = if (footOn && gameBlastEnv < 0.14f) {
+                    ((0.14f - gameBlastEnv) / 0.14f).coerceIn(0.0f, 1.0f) * 0.23f
                 } else {
                     0.0f
                 }
@@ -851,49 +881,54 @@ class SolDualAudioEngine(private val context: Context) {
                     var gL = gameFrameBuf[sIdx * 2] * effectiveGameGain
                     var gR = gameFrameBuf[sIdx * 2 + 1] * effectiveGameGain
 
-                    if (subOn) {
-                        val subRate = if (targetSubVoiceGain < subPunchVoiceGainSmooth) 0.012f else 0.0025f
-                        subPunchVoiceGainSmooth += subRate * (targetSubVoiceGain - subPunchVoiceGainSmooth)
+                    val subRate = if (targetSubVoiceGain < subPunchVoiceGainSmooth) 0.015f else 0.0025f
+                    subPunchVoiceGainSmooth += subRate * (targetSubVoiceGain - subPunchVoiceGainSmooth)
+                    if (subOn || subPunchVoiceGainSmooth > 0.001f) {
                         val subBandL = gameSubBandExtractor.processL(gL)
                         val subBandR = gameSubBandExtractor.processR(gR)
                         gL += subBandL * subPunchVoiceGainSmooth
                         gR += subBandR * subPunchVoiceGainSmooth
                     }
+
                     if (footOn) {
+                        // Dual-Band Footstep Focus: 250 Hz indoor boot thump + 2,450 Hz outdoor gravel/metal crunch
+                        gL = gameFootstepLowThumpFilter.processL(gL)
+                        gR = gameFootstepLowThumpFilter.processR(gR)
                         gL = gameFootstepFilter.processL(gL)
                         gR = gameFootstepFilter.processR(gR)
-                        if (blastOn) {
-                            val sonarRate = if (targetSonarLift < sonarFootstepExtraLiftSmooth) 0.025f else 0.003f
-                            sonarFootstepExtraLiftSmooth += sonarRate * (targetSonarLift - sonarFootstepExtraLiftSmooth)
-                            val footBandL = gameFootstepBandExtractor.processL(gL)
-                            val footBandR = gameFootstepBandExtractor.processR(gR)
-                            gL += footBandL * sonarFootstepExtraLiftSmooth
-                            gR += footBandR * sonarFootstepExtraLiftSmooth
-                        }
+
+                        val sonarRate = if (targetSonarLift < sonarFootstepExtraLiftSmooth) 0.025f else 0.003f
+                        sonarFootstepExtraLiftSmooth += sonarRate * (targetSonarLift - sonarFootstepExtraLiftSmooth)
+                        val footBandL = gameFootstepBandExtractor.processL(gL)
+                        val footBandR = gameFootstepBandExtractor.processR(gR)
+                        gL += footBandL * sonarFootstepExtraLiftSmooth
+                        gR += footBandR * sonarFootstepExtraLiftSmooth
                     }
+
                     if (wideOn) {
-                        // Phase-safe Mid-Side (M/S) spatial matrix: widens >200 Hz stereo cues by +26%
-                        // while keeping bass (<200 Hz) anchored center for 100% mono speaker compatibility
-                        val mid = 0.5f * (gL + gR)
+                        // Loudness-Normalized Mid-Side (M/S) spatial matrix: mid * 0.94f + widenedSide * 1.28f above 200 Hz
+                        val mid = 0.5f * (gL + gR) * 0.94f
                         val side = 0.5f * (gL - gR)
                         sideLowPassState += 0.026f * (side - sideLowPassState)
                         val sideHigh = side - sideLowPassState
-                        val widenedSide = sideLowPassState + (sideHigh * 1.26f)
+                        val widenedSide = sideLowPassState + (sideHigh * 1.28f)
                         gL = mid + widenedSide
                         gR = mid - widenedSide
                     }
 
                     val peakG = max(abs(gL), abs(gR))
-                    gameBlastEnv += (if (peakG > gameBlastEnv) 0.08f else 0.002f) * (peakG - gameBlastEnv)
+                    // Smooth 35 ms release (0.0006f) on gameBlastEnv so grenade bass never flutters
+                    gameBlastEnv += (if (peakG > gameBlastEnv) 0.08f else 0.0006f) * (peakG - gameBlastEnv)
 
                     if (blastOn) {
-                        val blastThresh = 0.48f
+                        val blastThresh = 0.46f
                         val targetBlast = if (gameBlastEnv > blastThresh) {
                             (blastThresh / gameBlastEnv).pow(0.60f).coerceIn(0.38f, 1.0f)
                         } else {
                             1.0f
                         }
-                        gameBlastGain += 0.05f * (targetBlast - gameBlastGain)
+                        val blastRate = if (targetBlast < gameBlastGain) 0.08f else 0.0006f
+                        gameBlastGain += blastRate * (targetBlast - gameBlastGain)
                         gL *= gameBlastGain
                         gR *= gameBlastGain
                     }
@@ -975,7 +1010,7 @@ class SolDualAudioEngine(private val context: Context) {
                     }
                 }
 
-                if ((totalFramesMixed % 300L) == 0L && !inPhoneCall) {
+                if ((totalFramesMixed % 300L) == 0L && !inPhoneCall && isRunning) {
                     verifyActiveMicConfiguration(micRecord, forceLog = false)
                 }
 
@@ -1022,6 +1057,7 @@ class SolDualAudioEngine(private val context: Context) {
     }
 
     private fun attemptAutomaticMicRecovery(onStatusChanged: (() -> Unit)?) {
+        if (!isRunning) return
         try {
             val cur = micRecord
             if (cur != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
@@ -1037,6 +1073,8 @@ class SolDualAudioEngine(private val context: Context) {
             }
 
             releaseMicSafely()
+            if (!isRunning) return
+
             val fallbackSrc = if (activeMicAudioSource == 0) {
                 MediaRecorder.AudioSource.VOICE_RECOGNITION
             } else {
@@ -1049,6 +1087,14 @@ class SolDualAudioEngine(private val context: Context) {
                 enableHwNs = activeHwNsEnabled,
                 enableSpeakerAec = activeSpeakerAecEnabled
             )
+            if (!isRunning) {
+                if (reopened != null) {
+                    try { reopened.second?.release() } catch (_: Exception) {}
+                    try { reopened.third?.release() } catch (_: Exception) {}
+                    try { reopened.first.stop(); reopened.first.release() } catch (_: Exception) {}
+                }
+                return
+            }
             if (reopened != null) {
                 micRecord = reopened.first
                 hwNoiseSuppressor = reopened.second
@@ -1092,7 +1138,7 @@ class SolDualAudioEngine(private val context: Context) {
     }
 
     private fun verifyActiveMicConfiguration(rec: AudioRecord?, forceLog: Boolean = false) {
-        if (rec == null) return
+        if (rec == null || !isRunning) return
         try {
             val routedDev = rec.routedDevice
             if (routedDev != null) {
@@ -1582,9 +1628,9 @@ class SolDualAudioEngine(private val context: Context) {
                 val pcmOut = ByteArray(MONO_SAMPLES_PER_10MS * 2)
                 val bb = ByteBuffer.wrap(pcmOut).order(ByteOrder.LITTLE_ENDIAN)
 
-                var quietRmsSum = 0.0
+                var quietEnergySum = 0.0
                 var quietCount = 0
-                var speechRmsSum = 0.0
+                var speechEnergySum = 0.0
                 var speechCount = 0
                 var maxSpeechPeakDb = -90.0f
                 var sibilanceTriggerFrames = 0
@@ -1593,13 +1639,13 @@ class SolDualAudioEngine(private val context: Context) {
                     FileOutputStream(outFile).use { fos ->
                         val totalFrames = 1000 // 10.0 seconds (1000 * 10ms)
                         for (frame in 0 until totalFrames) {
-                            if (SolStreamService.isBroadcastLive) break
+                            if (SolStreamService.isBroadcastLive || CodecCapabilityProbe.isBroadcastStartingOrLive) break
                             if (frame % 100 == 0) {
                                 val secLeft = 10 - (frame / 100)
                                 val phaseInstruction = if (frame < 300) {
                                     "Phase 1/2 (${secLeft}s) [${hwMode.title}]: Hold phone in your 2-hand grip & STAY SILENT..."
                                 } else {
-                                    "Phase 2/2 (${secLeft}s) [${settings.voiceGenderProfile}]: Speak normal & loud callouts ('Enemy B', 'Rush mid')!"
+                                    "Phase 2/2 (${secLeft}s) [${settings.voiceGenderProfile}]: Speak normal & sweet/loud callouts ('Enemy B', 'Rush mid')!"
                                 }
                                 onProgress(phaseInstruction)
                             }
@@ -1611,13 +1657,13 @@ class SolDualAudioEngine(private val context: Context) {
                                 }
                                 dsp.processMonoFrameInPlace(floatBuf, MONO_SAMPLES_PER_10MS)
 
-                                val frameRmsDb = dsp.lastRmsDb
+                                val frameRmsLin = MicDspProcessor.dbToLinear(dsp.lastRmsDb).toDouble()
                                 val framePeakDb = dsp.lastPeakDb
                                 if (frame in 30 until 290) {
-                                    quietRmsSum += frameRmsDb
+                                    quietEnergySum += frameRmsLin * frameRmsLin
                                     quietCount++
                                 } else if (frame >= 310 && dsp.vadSpeechActive) {
-                                    speechRmsSum += frameRmsDb
+                                    speechEnergySum += frameRmsLin * frameRmsLin
                                     speechCount++
                                     if (framePeakDb > maxSpeechPeakDb) maxSpeechPeakDb = framePeakDb
                                     if (framePeakDb > -5.5f) sibilanceTriggerFrames++
@@ -1633,8 +1679,16 @@ class SolDualAudioEngine(private val context: Context) {
                         }
                     }
 
-                    val avgQuietDb = if (quietCount > 0) (quietRmsSum / quietCount).roundToInt() else -62
-                    val avgSpeechDb = if (speechCount > 0) (speechRmsSum / speechCount).roundToInt() else -20
+                    val avgQuietDb = if (quietCount > 0) {
+                        MicDspProcessor.linearToDb(sqrt(quietEnergySum / quietCount).toFloat()).roundToInt()
+                    } else {
+                        -62
+                    }
+                    val avgSpeechDb = if (speechCount > 0) {
+                        MicDspProcessor.linearToDb(sqrt(speechEnergySum / speechCount).toFloat()).roundToInt()
+                    } else {
+                        -20
+                    }
                     val peakDb = maxSpeechPeakDb.roundToInt()
 
                     val recGain = when {
@@ -1739,6 +1793,7 @@ class SolDualAudioEngine(private val context: Context) {
                     val buf = ByteArray(4096)
                     FileInputStream(inFile).use { fis ->
                         while (true) {
+                            if (SolStreamService.isBroadcastLive || CodecCapabilityProbe.isBroadcastStartingOrLive) break
                             val r = fis.read(buf)
                             if (r <= 0) break
                             track.write(buf, 0, r)
