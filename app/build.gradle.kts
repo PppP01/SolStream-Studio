@@ -20,6 +20,7 @@ val keystoreStorePass = System.getenv("SIGNING_STORE_PASSWORD")?.trim()
 val keystoreKeyAlias = System.getenv("SIGNING_KEY_ALIAS")?.trim()
 val keystoreKeyPass = System.getenv("SIGNING_KEY_PASSWORD")?.trim()
 val requestedNdkVersion = System.getenv("SOL_NDK_VERSION")?.trim()
+val isPullRequestEvent = System.getenv("GITHUB_EVENT_NAME")?.trim() == "pull_request"
 
 val hasReleaseKeystore = !keystoreBase64.isNullOrBlank() &&
     !keystoreStorePass.isNullOrBlank() &&
@@ -33,7 +34,7 @@ gradle.taskGraph.whenReady {
                 task.name.startsWith("bundle") ||
                 task.name.startsWith("package"))
     }
-    if (requestsReleaseApk && !hasReleaseKeystore) {
+    if (requestsReleaseApk && !hasReleaseKeystore && !isPullRequestEvent) {
         throw GradleException(
             "Release signing credentials are missing! Set SIGNING_KEY_BASE64, " +
                 "SIGNING_STORE_PASSWORD, SIGNING_KEY_ALIAS, and SIGNING_KEY_PASSWORD in GitHub Secrets."
@@ -52,8 +53,8 @@ android {
         applicationId = "com.solgaming.solstreamstudio"
         minSdk = 29
         targetSdk = 36
-        versionCode = 8
-        versionName = "1.2.0"
+        versionCode = 9
+        versionName = "1.2.1"
 
         ndk {
             abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64")
@@ -106,6 +107,8 @@ android {
             isShrinkResources = true
             if (hasReleaseKeystore) {
                 signingConfig = signingConfigs.getByName("release")
+            } else {
+                signingConfig = signingConfigs.getByName("debug")
             }
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
