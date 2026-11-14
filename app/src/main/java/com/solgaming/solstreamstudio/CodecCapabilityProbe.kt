@@ -42,6 +42,7 @@ import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.locks.ReentrantLock
+import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
@@ -59,7 +60,7 @@ enum class DeviceTier(
     LITE(
         id = "LITE",
         title = "Lite",
-        badgeSummary = "Budget / Mobile-Data Safe • 720p30/1080p30 + Full 10-Stage SolLuxe™ Voice",
+        badgeSummary = "Budget / Mobile-Data Safe • 720p30/1080p30 + Full 12-Stage SolLuxe™ 2.0 Voice",
         defaultWidth = 1920,
         defaultHeight = 1080,
         defaultFps = 30,
@@ -69,7 +70,7 @@ enum class DeviceTier(
     BALANCED(
         id = "BALANCED",
         title = "Balanced",
-        badgeSummary = "Mid-Range Smooth • 1080p60 + Full 10-Stage SolLuxe™ Voice Studio",
+        badgeSummary = "Mid-Range Smooth • 1080p60 + Full 12-Stage SolLuxe™ 2.0 Voice Studio",
         defaultWidth = 1920,
         defaultHeight = 1080,
         defaultFps = 60,
@@ -89,7 +90,7 @@ enum class DeviceTier(
     FLAGSHIP(
         id = "FLAGSHIP",
         title = "Flagship",
-        badgeSummary = "Flagship Esports • 1440p60 HEVC + SOL LUXE Voice + 256k Master AAC",
+        badgeSummary = "Flagship Esports • 1440p60 HEVC + SOL LUXE 2.0 Voice + 256k Master AAC",
         defaultWidth = 2560,
         defaultHeight = 1440,
         defaultFps = 60,
@@ -279,7 +280,8 @@ data class DeviceScanSummary(
 
     fun friendlyHardwareLine(): String {
         val cleanSoc = CodecCapabilityProbe.formatFriendlySocName(socModel)
-        val cleanGpu = gpuRenderer.trim().takeIf { it.isNotBlank() && !it.equals("Unknown", true) }
+        val cleanGpu = CodecCapabilityProbe.formatFriendlyGpuName(gpuRenderer, shortBadge = false)
+            .takeIf { it.isNotBlank() && !it.equals("Unknown", true) }
         val chipPart = if (cleanGpu != null && !cleanSoc.contains(cleanGpu, ignoreCase = true)) {
             "$cleanSoc • $cleanGpu"
         } else {
@@ -291,8 +293,9 @@ data class DeviceScanSummary(
 
     fun toBadgeText(): String {
         val parts = mutableListOf<String>()
-        val glTag = if (gpuRenderer.isNotBlank()) {
-            "GL ES $maxGlEsVersion (${gpuRenderer.take(18)})"
+        val shortGpu = CodecCapabilityProbe.formatFriendlyGpuName(gpuRenderer, shortBadge = true)
+        val glTag = if (shortGpu.isNotBlank()) {
+            "GL ES $maxGlEsVersion ($shortGpu)"
         } else {
             "GL ES $maxGlEsVersion"
         }
@@ -363,7 +366,7 @@ data class DeviceScanSummary(
         fun fromJson(obj: JSONObject): DeviceScanSummary {
             return DeviceScanSummary(
                 deviceModel = obj.optString("deviceModel", "${Build.MANUFACTURER} ${Build.MODEL}"),
-                socModel = obj.optString("socModel", Build.HARDWARE),
+                socModel = obj.optString("socModel", Build.HARDWARE ?: ""),
                 androidRelease = obj.optString("androidRelease", "${Build.VERSION.SDK_INT}"),
                 sdkInt = obj.optInt("sdkInt", Build.VERSION.SDK_INT),
                 totalRamGb = obj.optInt("totalRamGb", 8),
@@ -428,7 +431,7 @@ object CodecCapabilityProbe {
     private const val CACHE_PREFS = "solstream_hw_probe_cache_v3"
     private const val KEY_FINGERPRINT = "cached_fingerprint"
     private const val KEY_PAYLOAD = "cached_scan_json"
-    private const val CACHE_SCHEMA_TAG = "ultra_v120_r1"
+    private const val CACHE_SCHEMA_TAG = "ultra_v121_r1"
 
     private val scanLock = ReentrantLock()
     private val activeHardwareProbeRunning = AtomicBoolean(false)
@@ -446,7 +449,7 @@ object CodecCapabilityProbe {
      */
     @Volatile var isBroadcastStartingOrLive: Boolean = false
 
-    // 10-second rate-limit cache for PowerManager.getThermalHeadroom() (Android 11-17 requires >=10s interval)
+    // 10-second rate-limit cache for PowerManager.getThermalHeadroom() (Android 11-18 requires >=10s interval)
     private val thermalPollLock = Any()
     @Volatile private var lastThermalHeadroomPollMs: Long = 0L
     @Volatile private var cachedThermalHeadroomRatio: Float = Float.NaN
@@ -471,10 +474,13 @@ object CodecCapabilityProbe {
     }
 
     /**
-     * Maps cryptic SoC model strings (e.g., s5e9945, SM8650, MT6897) to clean global processor names.
+     * Maps cryptic SoC model strings (e.g., s5e9945, SM8650, SM6450, MT6897) to clean global processor names.
+     * Uses nullable defaults so JVM JUnit tests (where Build.HARDWARE is null) never throw NPE.
      */
-    fun formatFriendlySocName(rawSoc: String, hardwareFallback: String = Build.HARDWARE): String {
-        val combined = "$rawSoc $hardwareFallback".trim()
+    fun formatFriendlySocName(rawSoc: String?, hardwareFallback: String? = Build.HARDWARE): String {
+        val safeRaw = rawSoc?.trim().orEmpty()
+        val safeHw = hardwareFallback?.trim().orEmpty()
+        val combined = "$safeRaw $safeHw".trim()
         val u = combined.uppercase(Locale.US)
         return when {
             u.contains("S5E9945") -> "Samsung Exynos 2400e"
@@ -494,8 +500,12 @@ object CodecCapabilityProbe {
             u.contains("SM8350") -> "Snapdragon 888"
             u.contains("SM8250") -> "Snapdragon 865/870"
             u.contains("SM7675") -> "Snapdragon 7+ Gen 3"
+            u.contains("SM7635") -> "Snapdragon 7s Gen 3"
             u.contains("SM7550") -> "Snapdragon 7 Gen 3"
             u.contains("SM7475") -> "Snapdragon 7+ Gen 2"
+            u.contains("SM7435") -> "Snapdragon 7s Gen 2"
+            u.contains("SM6450") -> "Snapdragon 6 Gen 1"
+            u.contains("SM6375") -> "Snapdragon 695"
             u.contains("MT6991") -> "MediaTek Dimensity 9400"
             u.contains("MT6989") -> "MediaTek Dimensity 9300"
             u.contains("MT6985") -> "MediaTek Dimensity 9200"
@@ -504,19 +514,55 @@ object CodecCapabilityProbe {
             u.contains("MT6896") -> "MediaTek Dimensity 8200"
             u.contains("MT6895") -> "MediaTek Dimensity 8100"
             u.contains("MT6886") -> "MediaTek Dimensity 7200"
+            u.contains("MT6878") -> "MediaTek Dimensity 7300"
+            u.contains("MT6877") -> "MediaTek Dimensity 7050"
+            u.contains("MT6835") -> "MediaTek Dimensity 6300"
             u.contains("TENSOR G5") || u.contains("LAGUNA") -> "Google Tensor G5"
             u.contains("TENSOR G4") || u.contains("ZUMA PRO") -> "Google Tensor G4"
             u.contains("TENSOR G3") || u.contains("ZUMA") -> "Google Tensor G3"
             u.contains("TENSOR G2") || u.contains("CLOUDRIPPER") -> "Google Tensor G2"
             u.contains("TENSOR") || u.contains("GS101") || u.contains("GS201") -> "Google Tensor"
-            rawSoc.isNotBlank() -> rawSoc
-            else -> hardwareFallback
+            safeRaw.isNotBlank() -> safeRaw
+            safeHw.isNotBlank() -> safeHw
+            else -> "Android SoC"
+        }
+    }
+
+    /**
+     * Cleans verbose OpenGL/Vulkan wrapper strings such as
+     * "ANGLE ((Samsung Xclipse 940) on Vulkan 1.3.304)" into "Samsung Xclipse 940 (Vulkan)"
+     * or compact badge form "Xclipse 940".
+     */
+    fun formatFriendlyGpuName(rawGpu: String?, shortBadge: Boolean = false): String {
+        val raw = rawGpu?.trim().orEmpty()
+        if (raw.isBlank()) return ""
+
+        val innerMatch = Regex("\\(\\(([^)]+)\\)").find(raw)?.groupValues?.getOrNull(1)?.trim()
+        val hasVulkan = raw.contains("Vulkan", ignoreCase = true)
+        val base = when {
+            !innerMatch.isNullOrBlank() -> innerMatch
+            raw.startsWith("ANGLE (", ignoreCase = true) ->
+                raw.removePrefix("ANGLE (").removeSuffix(")").substringBefore(" on Vulkan").trim()
+            else -> raw
+        }
+
+        return if (shortBadge) {
+            base.replace("Samsung ", "", ignoreCase = true)
+                .replace("Qualcomm ", "", ignoreCase = true)
+                .replace("ARM ", "", ignoreCase = true)
+                .replace("(TM)", "", ignoreCase = true)
+                .trim()
+                .take(18)
+        } else if (hasVulkan && !base.contains("Vulkan", ignoreCase = true)) {
+            "$base (Vulkan)"
+        } else {
+            base
         }
     }
 
     /**
      * Reads zero-permission live idle/active hardware telemetry (Battery 0.1C temp, 10s rate-limited
-     * PowerManager thermal headroom, available RAM, and AC/Bypass charging state).
+     * PowerManager thermal headroom, available RAM, and Samsung Game Booster Bypass/Pause PD state).
      */
     fun readLiveHardwareHealth(context: Context): LiveHardwareHealth {
         val appCtx = context.applicationContext
@@ -533,8 +579,32 @@ object CodecCapabilityProbe {
                 val plugged = intent.getIntExtra(BatteryManager.EXTRA_PLUGGED, 0)
                 isPlugged = plugged != 0
                 val status = intent.getIntExtra(BatteryManager.EXTRA_STATUS, -1)
+                val level = intent.getIntExtra(BatteryManager.EXTRA_LEVEL, 50)
+                val scale = intent.getIntExtra(BatteryManager.EXTRA_SCALE, 100).coerceAtLeast(1)
+                val battPct = (level * 100) / scale
+
+                // Detect Samsung Game Booster 'Pause USB PD charging when gaming' (Bypass Charging):
+                // When active, plugged != 0, while status is NOT_CHARGING or DISCHARGING (or current is <= ~0 mA while <98% full).
+                var pausePdByCurrent = false
+                if (isPlugged && battPct in 15..97) {
+                    try {
+                        val bm = appCtx.getSystemService(Context.BATTERY_SERVICE) as? BatteryManager
+                        val curNow = bm?.getIntProperty(BatteryManager.BATTERY_PROPERTY_CURRENT_NOW) ?: Int.MIN_VALUE
+                        if (curNow != Int.MIN_VALUE && curNow != 0 && abs(curNow) in 1..40) {
+                            pausePdByCurrent = true
+                        }
+                    } catch (_: Exception) {
+                    }
+                }
+
+                val isBypassPaused = isPlugged && (
+                    status == BatteryManager.BATTERY_STATUS_NOT_CHARGING ||
+                        (status == BatteryManager.BATTERY_STATUS_DISCHARGING && battPct < 99) ||
+                        pausePdByCurrent
+                    )
+
                 powerLabel = when {
-                    plugged != 0 && status == BatteryManager.BATTERY_STATUS_NOT_CHARGING -> "Bypass / Direct AC"
+                    isBypassPaused -> "Bypass / Pause PD Active"
                     (plugged and BatteryManager.BATTERY_PLUGGED_AC) != 0 -> "AC Fast Power"
                     (plugged and BatteryManager.BATTERY_PLUGGED_USB) != 0 -> "USB Power"
                     (plugged and BatteryManager.BATTERY_PLUGGED_WIRELESS) != 0 -> "Wireless Power"
@@ -893,9 +963,9 @@ object CodecCapabilityProbe {
 
     private fun readSocName(): String {
         val raw = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            "${Build.SOC_MANUFACTURER} ${Build.SOC_MODEL}".trim().ifBlank { Build.HARDWARE }
+            "${Build.SOC_MANUFACTURER} ${Build.SOC_MODEL}".trim().ifBlank { Build.HARDWARE ?: "" }
         } else {
-            Build.HARDWARE
+            Build.HARDWARE ?: ""
         }
         return formatFriendlySocName(raw, Build.HARDWARE)
     }
@@ -1176,7 +1246,7 @@ object CodecCapabilityProbe {
                 false
             }
 
-            val maxMbps = ((vCaps.bitrateRange?.upper ?: 50_000_000) / 1_000_000).coerceIn(8, 120)
+            val maxMbps = ((vCaps.bitrateRange?.upper ?: 50_000_000) / 1_000_000).coerceIn(4, 120)
             val maxInstances = try {
                 caps.maxSupportedInstances.coerceAtLeast(1)
             } catch (_: Exception) {
