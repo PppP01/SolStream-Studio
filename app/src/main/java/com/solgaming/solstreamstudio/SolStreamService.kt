@@ -86,10 +86,15 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
         Thread(r, "SolIngestRttProbe").apply { isDaemon = true }
     }
 
-    private var rtmpClient: RtmpClient? = null
+    @Volatile private var rtmpClient: RtmpClient? = null
     private val auxTargets = mutableListOf<AuxRtmpTarget>()
     private var companionTarget: AuxRtmpTarget? = null
     private var splitEncodeSimulcastActive = false
+
+    private var activeVideoCodecEnum: VideoCodec = VideoCodec.H265
+    private var activeNegotiatedWidth: Int = 1920
+    private var activeNegotiatedHeight: Int = 1080
+    private var activeNegotiatedFps: Int = 60
 
     private var videoPipeline: SolVideoPipeline? = null
     private var audioEngine: SolDualAudioEngine? = null
@@ -109,6 +114,7 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
     @Volatile private var broadcastActive = false
     @Volatile private var benchmarkOnlyActive = false
     @Volatile private var rtmpConnected = false
+    @Volatile private var connectAttemptStartElapsedMs: Long = 0L
     private val reconnectScheduled = AtomicBoolean(false)
     private val connectionSessionGen = AtomicLong(0L)
 
@@ -124,7 +130,8 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
     private var manual30FpsSaverEnabled = false
     private var autoThermal30FpsActive = false
     private var autoThermalNative30BitrateTrimActive = false
-    private var severeThermalLastSeenElapsedMs = 0L
+    private var severeThermalEnteredElapsedMs = 0L
+    private var stickySevereOverrideUntilElapsedMs = 0L
 
     // Preserves manual mic mute state across BRB / STARTING_SOON scene transitions
     private var micWasMutedBeforeSceneSwitch = false
@@ -239,7 +246,7 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
     /**
      * Per-session primary RTMP callback wrapper that holds a direct reference to the exact
      * RtmpClient instance it was created for (clientRef), so a delayed callback from a stopped
-     * client can only disconnect its own old socket and never a newer broadcast session.
+     * or replaced client can only disconnect its own old socket and never the active client.
      */
     private class PrimaryRtmpCallback(
         private val sessionGen: Long,
@@ -248,7 +255,7 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
         @Volatile var clientRef: RtmpClient? = null
 
         override fun onConnectionStarted(url: String) {
-            service.onPrimaryConnectionStarted(sessionGen)
+            service.onPrimaryConnectionStarted(sessionGen, clientRef)
         }
 
         override fun onConnectionSuccess() {
@@ -256,19 +263,19 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
         }
 
         override fun onNewBitrate(bitrate: Long) {
-            service.onPrimaryNewBitrate(sessionGen, bitrate)
+            service.onPrimaryNewBitrate(sessionGen, clientRef, bitrate)
         }
 
         override fun onConnectionFailed(reason: String) {
-            service.onPrimaryConnectionFailed(sessionGen, reason)
+            service.onPrimaryConnectionFailed(sessionGen, clientRef, reason)
         }
 
         override fun onDisconnect() {
-            service.onPrimaryDisconnect(sessionGen)
+            service.onPrimaryDisconnect(sessionGen, clientRef)
         }
 
         override fun onAuthError() {
-            service.onPrimaryAuthError(sessionGen)
+            service.onPrimaryAuthError(sessionGen, clientRef)
         }
 
         override fun onAuthSuccess() {
@@ -538,8 +545,7 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
             ACTION_TOGGLE_BRB -> cycleSceneLive()
             ACTION_MARK_CLIP -> saveClipMarkerLive("Notification ★ Clip")
         }
-        // ChatGPT Audit Fix #5: START_NOT_STICKY prevents zombie service restarts with a null
-        // MediaProjection token if the OS ever reclaims the process.
+        // START_NOT_STICKY prevents zombie service restarts with a null MediaProjection token
         return START_NOT_STICKY
     }
 
@@ -639,7 +645,8 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
         manual30FpsSaverEnabled = false
         autoThermal30FpsActive = false
         autoThermalNative30BitrateTrimActive = false
-        severeThermalLastSeenElapsedMs = 0L
+        severeThermalEnteredElapsedMs = 0L
+        stickySevereOverrideUntilElapsedMs = 0L
 
         DiagnosticsLogger.startNewSession(
             this,
@@ -670,6 +677,36 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
         }
     }
 
+    /**
+     * Builds a fresh, clean RtmpClient instance configured with TLS Hostname Verification,
+     * active RTMP Ping RTT tracking, negotiated video resolution/FPS/codec, and cached SPS/PPS/VPS headers.
+     */
+    private fun buildConfiguredPrimaryRtmpClient(sessionGen: Long): RtmpClient {
+        val cb = PrimaryRtmpCallback(sessionGen, this)
+        val newClient = RtmpClient(cb).apply {
+            setLogs(false)
+            setCheckServerAlive(true)
+            setOnlyVideo(false)
+            RtmpTelemetryBridge.configureClientSecurityAndPings(this)
+            try { resizeCache(120) } catch (_: Throwable) {}
+            try { clearCache() } catch (_: Throwable) {}
+            setVideoCodec(activeVideoCodecEnum)
+            setVideoResolution(activeNegotiatedWidth, activeNegotiatedHeight)
+            setFps(activeNegotiatedFps)
+            setAudioInfo(SolDualAudioEngine.SAMPLE_RATE, true)
+            val sps = cachedSps
+            if (sps != null) {
+                setVideoInfo(
+                    ByteBuffer.wrap(sps),
+                    cachedPps?.let { ByteBuffer.wrap(it) },
+                    cachedVps?.let { ByteBuffer.wrap(it) }
+                )
+            }
+        }
+        cb.clientRef = newClient
+        return newClient
+    }
+
     private fun startLiveBroadcast(resultCode: Int, resultData: Intent) {
         if (broadcastActive) return
         if (benchmarkOnlyActive) stopLiveBroadcast("Switching to Live Broadcast")
@@ -677,8 +714,7 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
         // Immediately reserve isBroadcastStartingOrLive so background hardware scans cannot overlap
         CodecCapabilityProbe.isBroadcastStartingOrLive = true
 
-        // Claude Audit Fix #3: Promote foreground service FIRST before any validation or early return
-        // so Android never throws ForegroundServiceDidNotStartInTimeException!
+        // Promote foreground service FIRST before any validation or early return
         val notif = buildStreamNotification("Starting SolApex™ HyperStream broadcast...")
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
@@ -706,9 +742,11 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
         micWasMutedBeforeSceneSwitch = false
         imeKeyboardVisible = false
         manualKeyboardBlurOverride = false
-        severeThermalLastSeenElapsedMs = 0L
+        severeThermalEnteredElapsedMs = 0L
+        stickySevereOverrideUntilElapsedMs = 0L
         wasThermalThrottledLastTick = false
         lastRttProbeElapsedMs = 0L
+        connectAttemptStartElapsedMs = SystemClock.elapsedRealtime()
         inFlightVideoFrames.set(0)
         inFlightVideoBytes.set(0L)
         lastVideoSendLatencyMs = 1L
@@ -754,17 +792,6 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
 
         val originNs = System.nanoTime()
         val originUs = originNs / 1000L
-
-        val primaryCb = PrimaryRtmpCallback(mySessionGen, this)
-        val client = RtmpClient(primaryCb).apply {
-            setLogs(false)
-            setCheckServerAlive(true)
-            setOnlyVideo(false)
-            RtmpTelemetryBridge.configureClientSecurityAndPings(this)
-            try { resizeCache(120) } catch (_: Throwable) {}
-        }
-        primaryCb.clientRef = client
-        rtmpClient = client
 
         auxTargets.clear()
         companionTarget = null
@@ -859,7 +886,7 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
                 cachedSps = spsArr
                 cachedPps = ppsArr
                 cachedVps = vpsArr
-                client.setVideoInfo(
+                this@SolStreamService.rtmpClient?.setVideoInfo(
                     ByteBuffer.wrap(spsArr),
                     ppsArr?.let { ByteBuffer.wrap(it) },
                     vpsArr?.let { ByteBuffer.wrap(it) }
@@ -871,12 +898,13 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
                 }
             },
             onEncodedVideo = { bb, info ->
-                if (rtmpConnected) {
+                val activeClient = this@SolStreamService.rtmpClient
+                if (rtmpConnected && activeClient != null) {
                     inFlightVideoFrames.incrementAndGet()
                     inFlightVideoBytes.addAndGet(info.size.toLong())
                     val t0Ns = System.nanoTime()
                     try {
-                        client.sendVideo(bb, info)
+                        activeClient.sendVideo(bb, info)
                     } finally {
                         val elapsedMs = ((System.nanoTime() - t0Ns) / 1_000_000L).coerceAtLeast(0L)
                         lastVideoSendLatencyMs = elapsedMs
@@ -939,15 +967,17 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
             splitEncodeSimulcastActive = false
         }
 
-        val mappedVideoCodec = when (videoInfo.codecKey) {
+        activeVideoCodecEnum = when (videoInfo.codecKey) {
             "HEVC" -> VideoCodec.H265
             "AV1" -> VideoCodec.AV1
             else -> VideoCodec.H264
         }
-        client.setVideoCodec(mappedVideoCodec)
-        client.setVideoResolution(videoInfo.outWidth, videoInfo.outHeight)
-        client.setFps(videoInfo.fps)
-        client.setAudioInfo(SolDualAudioEngine.SAMPLE_RATE, true)
+        activeNegotiatedWidth = videoInfo.outWidth
+        activeNegotiatedHeight = videoInfo.outHeight
+        activeNegotiatedFps = videoInfo.fps
+
+        val initialClient = buildConfiguredPrimaryRtmpClient(mySessionGen)
+        rtmpClient = initialClient
 
         val audioOk = aEngine.startStreamingAudio(
             settings = activeSettings,
@@ -957,8 +987,9 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
                 mainHandler.post { refreshExpandedControlsState() }
             },
             onEncodedAac = { aacBuf, aacInfo ->
-                if (rtmpConnected) {
-                    client.sendAudio(aacBuf, aacInfo)
+                val activeClient = this@SolStreamService.rtmpClient
+                if (rtmpConnected && activeClient != null) {
+                    activeClient.sendAudio(aacBuf, aacInfo)
                 }
                 val vPts = vPipeline.lastSentVideoPtsUs
                 if (vPts > 0L) {
@@ -1013,7 +1044,7 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
         updateStreamNotification("LIVE: ${videoInfo.outWidth}x${videoInfo.outHeight}@${videoInfo.fps} (${videoInfo.codecKey})")
         notifyDashboardStateChanged()
 
-        connectRtmpAsync(primaryStreamUrl, mySessionGen, client)
+        connectRtmpAsync(primaryStreamUrl, mySessionGen, initialClient)
         for (aux in auxTargets) {
             aux.startAsync()
         }
@@ -1101,17 +1132,31 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
         return out
     }
 
+    /**
+     * Spawns each RTMPS connect attempt on a dedicated non-blocking daemon thread so a half-open
+     * socket on an older client can never stall subsequent reconnect attempts!
+     */
     private fun connectRtmpAsync(url: String, sessionGen: Long, targetClient: RtmpClient) {
-        netExecutor.execute {
-            if (!shouldAcceptConnectionCallback(broadcastActive, sessionGen, connectionSessionGen.get())) return@execute
+        connectAttemptStartElapsedMs = SystemClock.elapsedRealtime()
+        Thread({
+            if (!shouldAcceptConnectionCallback(broadcastActive, sessionGen, connectionSessionGen.get()) ||
+                targetClient !== rtmpClient
+            ) {
+                return@Thread
+            }
             try {
                 val endpointLabel = if (usingBackupUrl) "Backup RTMPS (?backup=1)" else "Primary RTMPS"
                 DiagnosticsLogger.log("NETWORK", "Connecting to $endpointLabel server (TLS Host Verified)...")
                 targetClient.connect(url)
             } catch (e: Exception) {
-                DiagnosticsLogger.log("NET_ERR", "RTMPS connect exception (${e.javaClass.simpleName}).", e.message ?: "")
-                scheduleSilentReconnect("Connect exception", sessionGen)
+                if (targetClient === rtmpClient) {
+                    DiagnosticsLogger.log("NET_ERR", "RTMPS connect exception (${e.javaClass.simpleName}).", e.message ?: "")
+                    scheduleSilentReconnect("Connect exception", sessionGen)
+                }
             }
+        }, "SolRtmpConnectAttempt").apply {
+            isDaemon = true
+            start()
         }
     }
 
@@ -1143,9 +1188,9 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
         } else {
             when (reconnectCount) {
                 1 -> 1200L
-                2 -> 2500L
-                3 -> 4500L
-                else -> 7000L
+                2 -> 2200L
+                3 -> 3800L
+                else -> 5500L
             }
         }
 
@@ -1164,23 +1209,24 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
             if (!shouldAcceptConnectionCallback(broadcastActive, sessionGen, connectionSessionGen.get())) {
                 return@postDelayed
             }
-            val currentClient = rtmpClient ?: return@postDelayed
-            netExecutor.execute {
-                if (!shouldAcceptConnectionCallback(broadcastActive, sessionGen, connectionSessionGen.get())) {
-                    return@execute
+            // Report #2A Fix: Always build a brand-new RtmpClient instance on reconnect and close
+            // the old wedged client asynchronously so a stuck socket read can NEVER block reconnect!
+            val oldClient = rtmpClient
+            val freshClient = buildConfiguredPrimaryRtmpClient(sessionGen)
+            rtmpClient = freshClient
+            RtmpTelemetryBridge.resetSessionByteCounter()
+
+            if (oldClient != null) {
+                Thread({
+                    try { oldClient.clearCache() } catch (_: Throwable) {}
+                    try { oldClient.disconnect() } catch (_: Exception) {}
+                }, "SolOldRtmpClose").apply {
+                    isDaemon = true
+                    start()
                 }
-                try { currentClient.clearCache() } catch (_: Throwable) {}
-                try { currentClient.disconnect() } catch (_: Exception) {}
-                val sps = cachedSps
-                if (sps != null) {
-                    currentClient.setVideoInfo(
-                        ByteBuffer.wrap(sps),
-                        cachedPps?.let { ByteBuffer.wrap(it) },
-                        cachedVps?.let { ByteBuffer.wrap(it) }
-                    )
-                }
-                connectRtmpAsync(targetUrl, sessionGen, currentClient)
             }
+
+            connectRtmpAsync(targetUrl, sessionGen, freshClient)
         }, delayMs)
     }
 
@@ -1297,7 +1343,7 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
         }
     }
 
-    // === 2-SECOND QUEUE-AWARE PING GUARD ABR 2.0 + ZOMBIE-SOCKET + EXACT 60FPS & 30FPS THERMAL RULES ===
+    // === 2-SECOND QUEUE-AWARE PING GUARD ABR 2.0 + CONNECT-TIMEOUT + ZOMBIE-SOCKET + THERMAL GOVERNOR ===
     private fun runHealthAndRecoveryTick() {
         val (tempC, thermal) = DiagnosticsLogger.sampleDeviceHealth(this)
         val headroom = DiagnosticsLogger.lastThermalHeadroom
@@ -1336,6 +1382,21 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
                 val droppedDelta = max(0L, droppedVideo - lastDroppedTotal)
                 lastDroppedTotal = droppedVideo
 
+                // Report #2A Fix (8.5s Connect-Timeout Watchdog when !rtmpConnected):
+                // If an initial connect or reconnect attempt hangs in a half-open TCP/TLS handshake
+                // for >=8.5 seconds without succeeding or failing, force the next reconnect attempt!
+                if (!rtmpConnected && !reconnectScheduled.get() &&
+                    connectAttemptStartElapsedMs > 0L &&
+                    nowElapsed - connectAttemptStartElapsedMs >= 8_500L
+                ) {
+                    connectAttemptStartElapsedMs = nowElapsed
+                    DiagnosticsLogger.log(
+                        "CONN_TIMEOUT",
+                        "RTMPS handshake timed out after 8.5s; cycling to fresh socket reconnect..."
+                    )
+                    scheduleSilentReconnect("Handshake timeout (8.5s)", connectionSessionGen.get())
+                }
+
                 // Zombie-Socket Watchdog: uses verified non-negative sentKbps (or >1200ms blocking send stall)
                 if (rtmpConnected && vPipe.actualEncodedFps >= 15) {
                     val zeroSentConfirmed = (sentKbps in 0..5) &&
@@ -1359,7 +1420,7 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
                     zeroThroughputStallTicks = 0
                 }
 
-                // === YOUR EXACT THERMAL & ABR BITRATE RULES (60 FPS + NATIVE 30 FPS) ===
+                // === YOUR EXACT THERMAL & ABR BITRATE RULES (60 FPS + NATIVE 30 FPS + STICKY SEVERE GUARD) ===
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                     val needModerateRelief = thermal >= PowerManager.THERMAL_STATUS_MODERATE &&
                         (tempC >= 44.0f || headroom >= 0.90f)
@@ -1373,7 +1434,6 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
                     }
 
                     if (thermal >= PowerManager.THERMAL_STATUS_SEVERE) {
-                        severeThermalLastSeenElapsedMs = nowElapsed
                         if (thermal >= PowerManager.THERMAL_STATUS_CRITICAL &&
                             companionTarget != null &&
                             !vPipe.companionPausedByThermal
@@ -1388,32 +1448,75 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
                             vPipe.liveGpuSharpen = false
                             activeSettings = activeSettings.copy(gpuSharpen = false)
                         }
-                        if (activeSettings.fps > 30) {
-                            if (!autoThermal30FpsActive) {
-                                autoThermal30FpsActive = true
-                                vPipe.thermalThrottle30Fps = true
-                                val propMbps = String.format(Locale.US, "%.1f", (maxConfiguredBitrateBps * 0.60) / 1_000_000.0)
+
+                        // Report #2A Sticky-Severe Guard: If OS status stays stuck on SEVERE for >=90s
+                        // after our -40% cooldown has already cooled physical battery temp to <=42.6°C (headroom <=0.88f),
+                        // restore 60 FPS instead of staying trapped at 30 FPS for an hour!
+                        val physicallyCooledUnderStickySevere =
+                            (autoThermal30FpsActive || autoThermalNative30BitrateTrimActive) &&
+                                severeThermalEnteredElapsedMs > 0L &&
+                                (nowElapsed - severeThermalEnteredElapsedMs >= 90_000L) &&
+                                tempC in 1.0f..42.6f &&
+                                (headroom < 0f || headroom <= 0.88f) &&
+                                thermal == PowerManager.THERMAL_STATUS_SEVERE
+
+                        if (physicallyCooledUnderStickySevere) {
+                            stickySevereOverrideUntilElapsedMs = nowElapsed + 60_000L
+                            if (autoThermal30FpsActive) {
+                                autoThermal30FpsActive = false
+                                vPipe.thermalThrottle30Fps = manual30FpsSaverEnabled
+                                if (!manual30FpsSaverEnabled) {
+                                    DiagnosticsLogger.log(
+                                        "THERMAL",
+                                        "Physical temp cooled to ${String.format(Locale.US, "%.1f°C", tempC)}; restored full 60 FPS & 100% target bitrate."
+                                    )
+                                }
+                            }
+                            if (autoThermalNative30BitrateTrimActive) {
+                                autoThermalNative30BitrateTrimActive = false
                                 DiagnosticsLogger.log(
                                     "THERMAL",
-                                    "Phone reached Severe warmth; stepped 60 FPS stream to 30 FPS & ${propMbps} Mbps (-40% encoder heat)."
+                                    "Physical temp cooled to ${String.format(Locale.US, "%.1f°C", tempC)}; restored 100% target bitrate on 30 FPS stream."
                                 )
                             }
                         } else {
-                            // Native 30 FPS stream in Severe warmth: only trim bitrate (-25%) if target > safe 30-FPS floor!
-                            val safe30FloorBps = computeNative30FpsSafeThermalFloorBps()
-                            if (!autoThermalNative30BitrateTrimActive && maxConfiguredBitrateBps > safe30FloorBps) {
-                                autoThermalNative30BitrateTrimActive = true
-                                val trimmedBps = max(safe30FloorBps, (maxConfiguredBitrateBps * 75) / 100)
-                                val propMbps = String.format(Locale.US, "%.1f", trimmedBps / 1_000_000.0)
-                                DiagnosticsLogger.log(
-                                    "THERMAL",
-                                    "Phone reached Severe warmth on 30 FPS stream; trimmed high bitrate to ${propMbps} Mbps (-25% encoder heat)."
-                                )
+                            val inStickyGrace = nowElapsed < stickySevereOverrideUntilElapsedMs &&
+                                tempC <= 43.3f &&
+                                (headroom < 0f || headroom <= 0.92f) &&
+                                thermal == PowerManager.THERMAL_STATUS_SEVERE
+
+                            if (!inStickyGrace) {
+                                if (activeSettings.fps > 30) {
+                                    if (!autoThermal30FpsActive) {
+                                        autoThermal30FpsActive = true
+                                        severeThermalEnteredElapsedMs = nowElapsed
+                                        vPipe.thermalThrottle30Fps = true
+                                        val propMbps = String.format(Locale.US, "%.1f", (maxConfiguredBitrateBps * 0.60) / 1_000_000.0)
+                                        DiagnosticsLogger.log(
+                                            "THERMAL",
+                                            "Phone reached Severe warmth; stepped 60 FPS stream to 30 FPS & ${propMbps} Mbps (-40% encoder heat)."
+                                        )
+                                    }
+                                } else {
+                                    val safe30FloorBps = computeNative30FpsSafeThermalFloorBps()
+                                    if (!autoThermalNative30BitrateTrimActive && maxConfiguredBitrateBps > safe30FloorBps) {
+                                        autoThermalNative30BitrateTrimActive = true
+                                        severeThermalEnteredElapsedMs = nowElapsed
+                                        val trimmedBps = max(safe30FloorBps, (maxConfiguredBitrateBps * 75) / 100)
+                                        val propMbps = String.format(Locale.US, "%.1f", trimmedBps / 1_000_000.0)
+                                        DiagnosticsLogger.log(
+                                            "THERMAL",
+                                            "Phone reached Severe warmth on 30 FPS stream; trimmed high bitrate to ${propMbps} Mbps (-25% encoder heat)."
+                                        )
+                                    }
+                                }
                             }
                         }
                     } else if (thermal <= PowerManager.THERMAL_STATUS_MODERATE) {
-                        val cooldownSatisfied = (nowElapsed - severeThermalLastSeenElapsedMs >= 45_000L) ||
-                            (tempC in 1.0f..43.8f && (headroom < 0f || headroom <= 0.85f))
+                        // Report #2A & #2B Fix: Restore 60 FPS immediately when OS drops to Moderate Warmth
+                        // (including 89% / 0.89f headroom in Report #2B) without waiting 45 extra seconds!
+                        val cooldownSatisfied = (tempC in 1.0f..43.9f && (headroom < 0f || headroom <= 0.94f)) ||
+                            (severeThermalEnteredElapsedMs > 0L && nowElapsed - severeThermalEnteredElapsedMs >= 30_000L)
 
                         if (autoThermal30FpsActive && cooldownSatisfied) {
                             autoThermal30FpsActive = false
@@ -2458,15 +2561,24 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
         }
     }
 
-    // === PER-SESSION GENERATION-GUARDED PRIMARY RTMP CALLBACK HANDLERS ===
-    private fun onPrimaryConnectionStarted(sessionGen: Long) {
-        if (!shouldAcceptConnectionCallback(broadcastActive, sessionGen, connectionSessionGen.get())) return
+    // === PER-SESSION & PER-CLIENT GUARDED PRIMARY RTMP CALLBACK HANDLERS ===
+    private fun onPrimaryConnectionStarted(sessionGen: Long, sourceClient: RtmpClient?) {
+        if (!shouldAcceptConnectionCallback(broadcastActive, sessionGen, connectionSessionGen.get()) ||
+            sourceClient !== rtmpClient
+        ) {
+            return
+        }
     }
 
     private fun onPrimaryConnectionSuccess(sessionGen: Long, sourceClient: RtmpClient?) {
-        if (!shouldAcceptConnectionCallback(broadcastActive, sessionGen, connectionSessionGen.get())) {
-            // Disconnect ONLY the stale sourceClient that fired this callback, NEVER a newer session!
-            netExecutor.execute { try { sourceClient?.disconnect() } catch (_: Exception) {} }
+        if (!shouldAcceptConnectionCallback(broadcastActive, sessionGen, connectionSessionGen.get()) ||
+            sourceClient !== rtmpClient
+        ) {
+            // Disconnect ONLY the stale sourceClient that fired this callback, NEVER the active rtmpClient!
+            Thread({ try { sourceClient?.disconnect() } catch (_: Exception) {} }).apply {
+                isDaemon = true
+                start()
+            }
             return
         }
         rtmpConnected = true
@@ -2483,6 +2595,8 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
                 cachedVps?.let { ByteBuffer.wrap(it) }
             )
         }
+        // Immediately request a fresh IDR keyframe so YouTube resumes decoding in 0 ms after any reconnect
+        videoPipeline?.requestSyncFrame()
         probeIngestTcpRttIfNeeded()
         mainHandler.post {
             updatePillTelemetryUI()
@@ -2490,19 +2604,31 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
         }
     }
 
-    private fun onPrimaryNewBitrate(sessionGen: Long, bitrate: Long) {
-        if (!shouldAcceptConnectionCallback(broadcastActive, sessionGen, connectionSessionGen.get())) return
+    private fun onPrimaryNewBitrate(sessionGen: Long, sourceClient: RtmpClient?, bitrate: Long) {
+        if (!shouldAcceptConnectionCallback(broadcastActive, sessionGen, connectionSessionGen.get()) ||
+            sourceClient !== rtmpClient
+        ) {
+            return
+        }
         lastCallbackBitrateKbps = (bitrate.coerceAtLeast(0L) / 1000L).toInt()
         lastCallbackBitrateElapsedMs = SystemClock.elapsedRealtime()
     }
 
-    private fun onPrimaryConnectionFailed(sessionGen: Long, reason: String) {
-        if (!shouldAcceptConnectionCallback(broadcastActive, sessionGen, connectionSessionGen.get())) return
+    private fun onPrimaryConnectionFailed(sessionGen: Long, sourceClient: RtmpClient?, reason: String) {
+        if (!shouldAcceptConnectionCallback(broadcastActive, sessionGen, connectionSessionGen.get()) ||
+            sourceClient !== rtmpClient
+        ) {
+            return
+        }
         scheduleSilentReconnect(reason, sessionGen)
     }
 
-    private fun onPrimaryDisconnect(sessionGen: Long) {
-        if (!shouldAcceptConnectionCallback(broadcastActive, sessionGen, connectionSessionGen.get())) return
+    private fun onPrimaryDisconnect(sessionGen: Long, sourceClient: RtmpClient?) {
+        if (!shouldAcceptConnectionCallback(broadcastActive, sessionGen, connectionSessionGen.get()) ||
+            sourceClient !== rtmpClient
+        ) {
+            return
+        }
         rtmpConnected = false
         mainHandler.post {
             updatePillTelemetryUI()
@@ -2510,8 +2636,12 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
         }
     }
 
-    private fun onPrimaryAuthError(sessionGen: Long) {
-        if (!shouldAcceptConnectionCallback(broadcastActive, sessionGen, connectionSessionGen.get())) return
+    private fun onPrimaryAuthError(sessionGen: Long, sourceClient: RtmpClient?) {
+        if (!shouldAcceptConnectionCallback(broadcastActive, sessionGen, connectionSessionGen.get()) ||
+            sourceClient !== rtmpClient
+        ) {
+            return
+        }
         rtmpConnected = false
         DiagnosticsLogger.log("AUTH_ERR", "RTMPS server rejected the Stream Key (Auth Error).")
         mainHandler.post {
