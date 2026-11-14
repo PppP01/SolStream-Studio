@@ -13,18 +13,22 @@ import android.content.pm.PackageManager
 import android.os.Build
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyInfo
+import android.security.keystore.KeyPermanentlyInvalidatedException
 import android.security.keystore.KeyProperties
 import android.util.Base64
 import org.json.JSONObject
 import java.net.URI
 import java.nio.charset.StandardCharsets
 import java.security.KeyStore
+import java.security.UnrecoverableKeyException
 import java.util.Locale
 import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
 import javax.crypto.SecretKeyFactory
 import javax.crypto.spec.GCMParameterSpec
+import kotlin.math.max
+import kotlin.math.min
 
 data class StreamSettings(
     // === Core Tier & Platform ===
@@ -53,8 +57,8 @@ data class StreamSettings(
     val glEngineMode: String = "AUTO",            // "AUTO", "ES30", "ES20"
     val upscalerMode: String = "BICUBIC",         // "BILINEAR", "BICUBIC", "LANCZOS"
     val hdr10Enabled: Boolean = false,            // True 10-Bit HLG10 HDR (when HW Main10 supported)
-    val cinematicFilmic: Boolean = false,         // Stackable SDR ACES Filmic S-Curve
-    val amoledVivid: Boolean = false,             // Stackable SDR Mid-Tone Saturation Pop
+    val cinematicFilmic: Boolean = false,         // Stackable SDR ACES Filmic S-Curve (with Shadow Toe Guard)
+    val amoledVivid: Boolean = false,             // Stackable SDR Mid-Tone Saturation Pop (Skin-Tone Safe)
     val shadowBoost: Boolean = false,             // Stackable AI Adaptive Dark-Corner Enemy Clarifier
     val colorTempFilter: String = "NEUTRAL",      // "NEUTRAL", "WARM", "COOL"
     val gpuSharpen: Boolean = false,              // Stackable Contrast-Adaptive Crisp Sharpen
@@ -71,34 +75,34 @@ data class StreamSettings(
     val minimapShieldEnabled: Boolean = false,    // Stream-sniper / Privacy zone blur
     val minimapShieldCorner: String = "TOP_RIGHT",// "TOP_RIGHT", "TOP_RIGHT_SMALL", "TOP_RIGHT_LARGE", "TOP_LEFT", "BOTTOM_LEFT", "BOTTOM_RIGHT", "CENTER_BOX", "KEYBOARD"
 
-    // === 15-Stage Isolated 32-Bit Float SolLuxe™ 2.0 Voice + Stereo Game Soundstage ===
+    // === 12-Stage Isolated 32-Bit Float / 64-Bit Double SolLuxe™ 2.0 Voice + Stereo Game Soundstage ===
     val micDeviceId: Int = -1,
     val micAudioSource: Int = 0,                  // 0 = AUTO, 1 = MIC, 6 = VOICE_RECOGNITION, 7 = VOICE_COMM
     val audioBitrateKbps: Int = 256,              // 64, 96, 128, 160, 192, 256, 320 kbps
-    val voiceGenderProfile: String = "NEUTRAL",   // Pick-1: "NEUTRAL", "MALE", "FEMALE"
+    val voiceGenderProfile: String = "NEUTRAL",   // Pick-1: "NEUTRAL" (65Hz), "MALE" (50Hz), "FEMALE" (85Hz)
     val voicePreset: String = "SOL_LUXE",         // "RAW", "CLEAN", "NEURAL", "STUDIO", "VELVET", "SOL_LUXE"
     val noiseSuppressMode: String = "RNNOISE",    // Pick-1: "OFF", "LIGHT", "RNNOISE", "HW_NS"
     val rnnoiseLevel: Int = 2,                    // Strength: 0 = Off, 1 = Gentle (65%), 2 = Natural (88%), 3 = Max (100%)
-    val hpfCutoffHz: Int = 75,                    // 0, 50, 60(Male), 70, 75(Neutral), 80, 85, 95(Female), 105, 120 Hz
+    val hpfCutoffHz: Int = 65,                    // 0, 50(Male), 55, 60, 65(Neutral), 70, 75, 85(Female), 95, 105, 120 Hz
     val transientTamerEnabled: Boolean = true,    // Stage 2: Spark/Hammer & Grip Blanker
     val noiseGateEnabled: Boolean = true,         // Stage 4: 0-ms Instant Vocal Gate & Breath Expander
-    val voiceEqEnabled: Boolean = true,           // Stage 5: Cardioid Proximity & Narrow Q=2.2 3-Band EQ
-    val deEsserEnabled: Boolean = true,           // Stage 9: Post-Compressor Split-Band Sibilance Tamer
-    val velvetWarmthEnabled: Boolean = true,      // Stage 6: 2f Sub-Harmonic Tube Warmth + Silk Air Shelf
-    val compressorEnabled: Boolean = true,        // Stage 8: Broadcast 12ms-Punch 3:1 Leveler
-    val whisperLiftEnabled: Boolean = true,       // Stage 8: Upward Low-Level Callout Booster
-    val slowAgcEnabled: Boolean = true,           // Stage 8: Speech-Gated Slow Broadcast Loudness Ride
+    val voiceEqEnabled: Boolean = true,           // Stage 5/7/8: Deep Proximity, Grip Mud Cut, 920Hz Velvet Dip & Presence
+    val deEsserEnabled: Boolean = true,           // Stage 11: Post-Compressor Split-Band Sibilance Tamer
+    val velvetWarmthEnabled: Boolean = true,      // Stage 6/8: True f0/2 Sub-Octave Synth + 2f Tube + Silk Air Shelf
+    val compressorEnabled: Boolean = true,        // Stage 10: High-Pass Sidechain 12ms-Punch 3:1 Leveler
+    val whisperLiftEnabled: Boolean = true,       // Stage 10: Upward Low-Level Callout Booster
+    val slowAgcEnabled: Boolean = true,           // Stage 10: Speech-Gated Slow Broadcast Loudness Ride
     val speakerAecEnabled: Boolean = false,       // Stage 0: Default OFF (Forced disabled on earphones; ON for speaker players)
-    val micGainPercent: Int = 130,                // Stage 10: True Post-DSP Mic Boost (50..250%)
+    val micGainPercent: Int = 130,                // Stage 12: True Post-DSP Mic Boost (50..250%)
     val gameGainPercent: Int = 100,               // 0..250% (Protected by 4x Cubic Look-Ahead Limiter)
-    val gameCinemaWideEnabled: Boolean = false,   // Stackable Game Bus: Mid-Side 3D spatial widener
-    val gameSubPunchEnabled: Boolean = false,     // Stackable Game Bus: +1.8 dB @ 65 Hz theater sub-punch (Auto-ducks on speech)
-    val gameFootstepFocusEnabled: Boolean = false,// Stackable Game Bus: +2.0 dB @ 2.85 kHz footstep lift + Sonar Smart Lift
-    val gameBlastTamerEnabled: Boolean = false,   // Stackable Game Bus: tames harsh explosion spikes
+    val gameCinemaWideEnabled: Boolean = false,   // Stackable Game Bus: Loudness-normalized Mid-Side 3D widener
+    val gameSubPunchEnabled: Boolean = false,     // Stackable Game Bus: +3.0 dB @ 62 Hz theater sub-punch (Phase-safe voice duck)
+    val gameFootstepFocusEnabled: Boolean = false,// Stackable Game Bus: Dual-Band 250Hz Thump + 2450Hz Crunch + Sonar Lift
+    val gameBlastTamerEnabled: Boolean = false,   // Stackable Game Bus: Smooth 35ms release explosion spike tamer
     val vadDuckingPercent: Int = 0,               // 0, 10, 15, 20, 25, 30, 35, 40, 50, 60, 70%
     val micSyncDelayMs: Int = 0,                  // 0, 15, 30, 45, 60, 80, 100, 120, 150, 180, 200 ms
 
-    // === Survival, Privacy & v1.2.0 Extensions ===
+    // === Survival, Privacy & v1.2.1 Extensions ===
     val brbMuteMicToo: Boolean = true,
     val wifiLowLatencyLock: Boolean = true,
     val overlayPosition: String = "FULL",         // "FULL", "TOP_LEFT", "TOP_RIGHT", "BOTTOM_LEFT", "BOTTOM_RIGHT"
@@ -134,12 +138,15 @@ object KeystoreVault {
     /**
      * Single shared coordinator for gender-matched High-Pass Filter cutoffs across
      * Card 0 (Tier Presets), Card 4 (Voice Studio), and the in-game Floating Pill.
+     * - MALE: 50 Hz (preserves 55-95 Hz deep baritone chest + f0/2 sub-octave warmth)
+     * - NEUTRAL: 65 Hz
+     * - FEMALE: 85 Hz
      */
     fun resolveDefaultHpfForProfile(genderProfile: String): Int {
         return when (genderProfile.uppercase(Locale.US)) {
-            "MALE" -> 60
-            "FEMALE" -> 95
-            else -> 75
+            "MALE" -> 50
+            "FEMALE" -> 85
+            else -> 65
         }
     }
 
@@ -399,35 +406,39 @@ object KeystoreVault {
         val resolvedBitrateKbps: Int
         val resolvedAudioKbps: Int
 
+        val h264Supports1080p = h264Report == null || h264Report.supports1080p60 || h264Report.supports1080p30
+
         if (isTwitchPrimary || (singleEncodeSimulcastActive && current.simulcastTwitchEnabled)) {
             resolvedCodec = "H264"
-            resolvedW = if (tier == DeviceTier.LITE && h264Report?.supports1080p30 == false) 1280 else 1920
+            resolvedW = if (tier == DeviceTier.LITE && !h264Supports1080p) 1280 else 1920
             resolvedH = if (resolvedW == 1280) 720 else 1080
             resolvedFps = if (tier == DeviceTier.LITE) 30 else 60
             resolvedBitrateKbps = if (tier == DeviceTier.LITE) 4500 else 6000
             resolvedAudioKbps = if (tier == DeviceTier.LITE) 128 else 160
         } else if (isKickPrimary || (singleEncodeSimulcastActive && current.simulcastKickEnabled)) {
             resolvedCodec = "H264"
-            resolvedW = if (tier == DeviceTier.LITE && h264Report?.supports1080p30 == false) 1280 else 1920
+            resolvedW = if (tier == DeviceTier.LITE && !h264Supports1080p) 1280 else 1920
             resolvedH = if (resolvedW == 1280) 720 else 1080
             resolvedFps = if (tier == DeviceTier.LITE) 30 else 60
             resolvedBitrateKbps = if (tier == DeviceTier.LITE) 5000 else 8000
             resolvedAudioKbps = 160
         } else {
             resolvedCodec = if (hevcOk) "HEVC" else "H264"
-            val can1440p60 = (if (resolvedCodec == "HEVC") hevcReport?.supports1440p60 else h264Report?.supports1440p60) ?: true
-            val can1080p60 = (if (resolvedCodec == "HEVC") hevcReport?.supports1080p60 else h264Report?.supports1080p60) ?: true
+            val activeRep = if (resolvedCodec == "HEVC") hevcReport else h264Report
+            val can1440p60 = activeRep?.supports1440p60 ?: true
+            val can1080p60 = activeRep?.supports1080p60 ?: true
+            val can1080pAny = activeRep == null || activeRep.supports1080p60 || activeRep.supports1080p30
             when (tier) {
                 DeviceTier.LITE -> {
-                    resolvedW = 1920
-                    resolvedH = 1080
+                    resolvedW = if (can1080pAny) 1920 else 1280
+                    resolvedH = if (resolvedW == 1920) 1080 else 720
                     resolvedFps = 30
-                    resolvedBitrateKbps = 8000
+                    resolvedBitrateKbps = if (resolvedW == 1920) 8000 else 4500
                     resolvedAudioKbps = 128
                 }
                 DeviceTier.BALANCED -> {
-                    resolvedW = 1920
-                    resolvedH = 1080
+                    resolvedW = if (can1080pAny) 1920 else 1280
+                    resolvedH = if (resolvedW == 1920) 1080 else 720
                     resolvedFps = if (can1080p60) 60 else 30
                     resolvedBitrateKbps = 12000
                     resolvedAudioKbps = 160
@@ -512,33 +523,33 @@ object KeystoreVault {
         }
 
         val report = scan.findReport(codec) ?: scan.hevcHardware ?: scan.h264Hardware
-        var w = imported.width
-        var h = imported.height
+        var longDim = max(imported.width, imported.height)
+        var shortDim = min(imported.width, imported.height)
         var fps = imported.fps
 
         if (report != null) {
-            if (w >= 3840 && !(if (fps >= 60) report.supports4k60 else (report.supports4k30 || report.supports4k60))) {
-                w = 2560
-                h = 1440
+            if (longDim >= 3840 && !(if (fps >= 60) report.supports4k60 else (report.supports4k30 || report.supports4k60))) {
+                longDim = 2560
+                shortDim = 1440
                 changed = true
             }
-            if (w >= 2560 && !(if (fps >= 60) report.supports1440p60 else (report.supports1440p30 || report.supports1440p60))) {
-                w = 1920
-                h = 1080
+            if (longDim >= 2560 && !(if (fps >= 60) report.supports1440p60 else (report.supports1440p30 || report.supports1440p60))) {
+                longDim = 1920
+                shortDim = 1080
                 changed = true
             }
-            if (w >= 1920 && fps >= 60 && !report.supports1080p60) {
+            if (longDim >= 1920 && fps >= 60 && !report.supports1080p60) {
                 if (report.supports1080p30) {
                     fps = 30
                 } else {
-                    w = 1280
-                    h = 720
+                    longDim = 1280
+                    shortDim = 720
                 }
                 changed = true
             }
         }
 
-        val maxChipKbps = ((report?.maxBitrateMbps ?: 50) * 1000).coerceIn(8000, 100_000)
+        val maxChipKbps = ((report?.maxBitrateMbps ?: 50) * 1000).coerceIn(4000, 100_000)
         val clampedBps = imported.targetBitrateKbps.coerceIn(500, maxChipKbps)
         if (clampedBps != imported.targetBitrateKbps) changed = true
 
@@ -550,8 +561,8 @@ object KeystoreVault {
 
         return imported.copy(
             codec = codec,
-            width = w,
-            height = h,
+            width = longDim,
+            height = shortDim,
             fps = fps,
             targetBitrateKbps = clampedBps,
             hdr10Enabled = hdrOk,
@@ -660,6 +671,20 @@ object KeystoreVault {
             val cipher = Cipher.getInstance("AES/GCM/NoPadding")
             cipher.init(Cipher.DECRYPT_MODE, key, GCMParameterSpec(128, iv))
             String(cipher.doFinal(ct), StandardCharsets.UTF_8)
+        } catch (_: KeyPermanentlyInvalidatedException) {
+            try {
+                val ks = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
+                ks.deleteEntry(MASTER_KEY_ALIAS)
+                cachedSecurityLabel = null
+            } catch (_: Exception) {}
+            ""
+        } catch (_: UnrecoverableKeyException) {
+            try {
+                val ks = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
+                ks.deleteEntry(MASTER_KEY_ALIAS)
+                cachedSecurityLabel = null
+            } catch (_: Exception) {}
+            ""
         } catch (_: Exception) {
             ""
         }
