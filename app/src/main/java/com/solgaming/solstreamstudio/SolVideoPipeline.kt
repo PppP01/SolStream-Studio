@@ -34,6 +34,7 @@ import android.os.HandlerThread
 import android.os.PerformanceHintManager
 import android.os.Process
 import android.util.DisplayMetrics
+import android.view.Display
 import android.view.Surface
 import android.view.WindowManager
 import java.io.ByteArrayOutputStream
@@ -152,6 +153,7 @@ class SolVideoPipeline(private val context: Context) {
 
     @Volatile private var pendingCaptureWidth = 0
     @Volatile private var pendingCaptureHeight = 0
+    @Volatile private var capturedContentVisible = true
 
     private val codecReleaseLock = Any()
     private val projectionCallbackLock = Any()
@@ -315,6 +317,7 @@ class SolVideoPipeline(private val context: Context) {
         thermalThrottle30Fps = false
         thermalModerateCoolerActive = false
         companionPausedByThermal = false
+        capturedContentVisible = true
         lastSentVideoPtsUs = -1L
         actualEncodedFps = 0
         actualEncodedBitrateBps = 0
@@ -380,7 +383,7 @@ class SolVideoPipeline(private val context: Context) {
                 startShort = initialShort,
                 startFps = initialFps
             )
-            // GPT Audit Fix #3: strictly respect the hardware encoder's chipMaxBps ceiling
+            // Strictly respect the hardware encoder's chipMaxBps ceiling
             val candidateMaxBps = (candidate.maxBitrateMbps.coerceIn(4, 100) * 1_000_000)
             val wantHdr10 = canRecord10BitEgl && candidate.supports10BitHdr
 
@@ -489,8 +492,8 @@ class SolVideoPipeline(private val context: Context) {
         val (rawScreenW, rawScreenH, densityDpi) = readPhysicalDisplayMetrics()
         val panelLong = evenDimension(max(rawScreenW, rawScreenH).coerceAtLeast(1280))
         val panelShort = evenDimension(min(rawScreenW, rawScreenH).coerceAtLeast(720))
-        val capWidth = if (settings.isVertical) panelShort else panelLong
-        val capHeight = if (settings.isVertical) panelLong else panelShort
+        val capWidth = if (settings.isVertical && !isDisplayCurrentlyLandscape()) panelShort else panelLong
+        val capHeight = if (capWidth == panelShort) panelLong else panelShort
         pendingCaptureWidth = 0
         pendingCaptureHeight = 0
 
@@ -513,13 +516,21 @@ class SolVideoPipeline(private val context: Context) {
                 override fun onCapturedContentResize(width: Int, height: Int) {
                     val safeW = evenDimension(width)
                     val safeH = evenDimension(height)
-                    if (isRunning && safeW >= 128 && safeH >= 128) {
-                        pendingCaptureWidth = safeW
-                        pendingCaptureHeight = safeH
+                    if (!isRunning || safeW < 128 || safeH < 128) return
+
+                    // Report #2A Vulkan PSS Memory Guard:
+                    // When streaming in 16:9 Landscape (!settings.isVertical), ignore temporary portrait
+                    // resize callbacks (safeW < safeH) fired when the game is minimized to the home screen
+                    // or notification shade. This prevents Vulkan from allocating a second ~187 MB swapchain!
+                    if (!settings.isVertical && (safeW < safeH || !capturedContentVisible)) {
+                        return
                     }
+                    pendingCaptureWidth = safeW
+                    pendingCaptureHeight = safeH
                 }
 
                 override fun onCapturedContentVisibilityChanged(isVisible: Boolean) {
+                    capturedContentVisible = isVisible
                     if (isRunning && !isVisible) {
                         DiagnosticsLogger.log(
                             "CAPTURE_VIS",
@@ -570,6 +581,8 @@ class SolVideoPipeline(private val context: Context) {
                 use10BitEgl = finalConfigured.actualIsHdr10,
                 initialCapWidth = capWidth,
                 initialCapHeight = capHeight,
+                panelLong = panelLong,
+                panelShort = panelShort,
                 densityDpi = densityDpi,
                 outWidth = outWidth,
                 outHeight = outHeight,
@@ -720,6 +733,17 @@ class SolVideoPipeline(private val context: Context) {
         return if (v % 2 == 0) v else v - 1
     }
 
+    private fun isDisplayCurrentlyLandscape(): Boolean {
+        return try {
+            val dm = context.getSystemService(Context.DISPLAY_SERVICE) as DisplayManager
+            val display = dm.getDisplay(Display.DEFAULT_DISPLAY)
+            val rot = display?.rotation ?: Surface.ROTATION_0
+            rot == Surface.ROTATION_90 || rot == Surface.ROTATION_270
+        } catch (_: Exception) {
+            false
+        }
+    }
+
     private fun readPhysicalDisplayMetrics(): Triple<Int, Int, Int> {
         val wm = context.getSystemService(Context.WINDOW_SERVICE) as WindowManager
         val densityDpi = context.resources.displayMetrics.densityDpi.coerceAtLeast(160)
@@ -735,8 +759,8 @@ class SolVideoPipeline(private val context: Context) {
     }
 
     /**
-     * GPT Audit Fix #1: When strictCodecOnly is true (Single-Encode Twitch/Kick Simulcast or
-     * Twitch/Kick Primary Preset), strictly returns ONLY H.264 hardware encoders and never falls back to HEVC/AV1.
+     * When strictCodecOnly is true (Single-Encode Twitch/Kick Simulcast or Twitch/Kick Primary Preset),
+     * strictly returns ONLY H.264 hardware encoders and never falls back to HEVC/AV1.
      */
     private fun resolveCandidateHardwareEncoders(
         scan: DeviceScanSummary,
@@ -952,7 +976,7 @@ class SolVideoPipeline(private val context: Context) {
                 }
                 val isActualVbr = actualMode == MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR
 
-                // GPT Audit Fix #4: Strictly require explicit HLG or ST2084 transfer or 10-bit profile in outputFormat before reporting HDR10 active
+                // Strictly require explicit HLG or ST2084 transfer or 10-bit profile in outputFormat before reporting HDR10 active
                 val verifiedHdrOutput = if (tryHdrThisAttempt && outFmt != null) {
                     try {
                         val hasHdrTransfer = outFmt.containsKey(MediaFormat.KEY_COLOR_TRANSFER) && (
@@ -1000,8 +1024,7 @@ class SolVideoPipeline(private val context: Context) {
     }
 
     /**
-     * GPT Audit Fix #4: Ensures EGL14.eglTerminate(dpy) is always called in finally when probing
-     * 10-bit recordable EGLConfig support.
+     * Ensures EGL14.eglTerminate(dpy) is always called in finally when probing 10-bit recordable EGLConfig support.
      */
     private fun canCreateRecordable10BitEglConfig(): Boolean {
         var dpy: EGLDisplay = EGL14.EGL_NO_DISPLAY
@@ -1088,6 +1111,8 @@ class SolVideoPipeline(private val context: Context) {
         use10BitEgl: Boolean,
         initialCapWidth: Int,
         initialCapHeight: Int,
+        panelLong: Int,
+        panelShort: Int,
         densityDpi: Int,
         outWidth: Int,
         outHeight: Int,
@@ -1349,19 +1374,22 @@ class SolVideoPipeline(private val context: Context) {
                 if (reqW >= 128 && reqH >= 128 && (reqW != activeCapW || reqH != activeCapH)) {
                     pendingCaptureWidth = 0
                     pendingCaptureHeight = 0
-                    activeCapW = reqW
-                    activeCapH = reqH
-                    try {
-                        st.setDefaultBufferSize(activeCapW, activeCapH)
-                        synchronized(codecReleaseLock) {
-                            virtualDisplay?.resize(activeCapW, activeCapH, densityDpi)
+                    // Double-guard: on 16:9 Landscape streams, never resize VirtualDisplay to a portrait size!
+                    if (isVerticalPrimary || reqW >= reqH) {
+                        activeCapW = reqW
+                        activeCapH = reqH
+                        try {
+                            st.setDefaultBufferSize(activeCapW, activeCapH)
+                            synchronized(codecReleaseLock) {
+                                virtualDisplay?.resize(activeCapW, activeCapH, densityDpi)
+                            }
+                            DiagnosticsLogger.log(
+                                "CAPTURE_RESIZE",
+                                "Adapted incoming game capture size seamlessly without interrupting stream.",
+                                "capture=${activeCapW}x${activeCapH} -> stream=${outWidth}x${outHeight}"
+                            )
+                        } catch (_: Exception) {
                         }
-                        DiagnosticsLogger.log(
-                            "CAPTURE_RESIZE",
-                            "Adapted incoming game capture size seamlessly without interrupting stream.",
-                            "capture=${activeCapW}x${activeCapH} -> stream=${outWidth}x${outHeight}"
-                        )
-                    } catch (_: Exception) {
                     }
                 }
 
@@ -1397,6 +1425,13 @@ class SolVideoPipeline(private val context: Context) {
                     DiagnosticsLogger.repeatedFramesCount = repeatedFramesTotal
                     freshWindowStartMs = nowMs
                     freshFramesInWindow = 0
+
+                    // If streaming 9:16 Vertical Shorts in "Entire Screen" mode and the user rotates into
+                    // a Landscape game (CODM) from the Portrait dashboard, adapt capture to Landscape once!
+                    if (isVerticalPrimary && activeCapW < activeCapH && isDisplayCurrentlyLandscape()) {
+                        pendingCaptureWidth = panelLong
+                        pendingCaptureHeight = panelShort
+                    }
                 }
 
                 if (nowMs - lastRoiPushMs > 2500L) {
@@ -1474,7 +1509,7 @@ class SolVideoPipeline(private val context: Context) {
                     posterTexId = 0
                 }
 
-                // Checklist #23: Live Mid-Stream Text Banner Refresh (updates on the very next frame when text is edited)
+                // Live Mid-Stream Text Banner Refresh (updates on the very next frame when text is edited)
                 val wantBanner = liveBannerEnabled && liveBannerText.isNotBlank()
                 val curBannerSig = if (wantBanner) "${liveBannerPosition}:${liveBannerText.trim()}" else ""
                 if (wantBanner && (bannerTexId == 0 || curBannerSig != loadedBannerSig)) {
@@ -1696,7 +1731,7 @@ class SolVideoPipeline(private val context: Context) {
         val framing = liveFramingMode
         val zoomPct = liveSmartZoomPercent
 
-        // Checklist #25: 40% Cooler 9:16 BLUR Canvas
+        // 40% Cooler 9:16 BLUR Canvas:
         // When streaming 9:16 Shorts with a blurred backdrop, compute how much of the vertical height
         // is covered by the sharp center gameplay and use hardware glScissor to blur ONLY the visible
         // top and bottom letterbox bars (skipping fragment shader blur work inside the covered middle!).
@@ -1832,7 +1867,7 @@ class SolVideoPipeline(private val context: Context) {
             GLES20.glDisable(GLES20.GL_SCISSOR_TEST)
         }
 
-        // Checklist #23: 5-Position Aspect-Ratio-Preserving .PNG Overlay (Full-Screen Frame or 4 Corner Logos)
+        // 5-Position Aspect-Ratio-Preserving .PNG Overlay (Full-Screen Frame or 4 Corner Logos)
         if (overlayTexId != 0) {
             val posMode = liveOverlayPosition
             if (posMode == "FULL") {
@@ -2438,7 +2473,7 @@ class SolVideoPipeline(private val context: Context) {
     companion object {
         /**
          * Resolves the exact OpenGL glScissor rectangle for all 8 Privacy Blur Shield zones
-         * across any landscape (16:9) or vertical (9:16) output resolution[cite: 14].
+         * across any landscape (16:9) or vertical (9:16) output resolution.
          */
         internal fun resolvePrivacyBlurRect(dstW: Int, dstH: Int, zone: String): ScissorRect {
             return when (zone.uppercase(Locale.US)) {
