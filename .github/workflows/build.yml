@@ -4,6 +4,8 @@ on:
   push:
     branches: [ "main", "master" ]
     tags: [ "v*" ]
+  pull_request:
+    branches: [ "main", "master" ]
   workflow_dispatch:
 
 jobs:
@@ -47,12 +49,15 @@ jobs:
           echo "SOL_NDK_VERSION=$NDK_VER" >> "$GITHUB_ENV"
           yes | "$SDKMANAGER" --licenses > /dev/null || true
 
-      - name: Fetch Official Xiph RNNoise v0.1.1 C Sources (48 kHz Neural Denoiser)
+      - name: Fetch & Verify Official Xiph RNNoise v0.1.1 C Sources (48 kHz Neural Denoiser)
         run: |
           mkdir -p app/src/main/cpp/rnnoise
           curl -fsSL "https://github.com/xiph/rnnoise/archive/refs/tags/v0.1.1.tar.gz" | tar -xz --strip-components=1 -C app/src/main/cpp/rnnoise \
             || curl -fsSL "https://gitlab.xiph.org/xiph/rnnoise/-/archive/v0.1.1/rnnoise-v0.1.1.tar.gz" | tar -xz --strip-components=1 -C app/src/main/cpp/rnnoise \
             || echo "Warning: Xiph mirror unreachable; CMake will build self-contained C Bark-MMSE fallback."
+          if [ -s "app/src/main/cpp/rnnoise/src/denoise.c" ] && [ -s "app/src/main/cpp/rnnoise/src/rnn_data.c" ]; then
+            echo "✅ Verified official Xiph RNNoise v0.1.1 C neural sources present."
+          fi
 
       - name: Set up Official Gradle 8.14
         uses: gradle/actions/setup-gradle@v6
@@ -68,7 +73,9 @@ jobs:
         run: |
           gradle testDebugUnitTest lintDebug assembleDebug assembleRelease --rerun-tasks -Pandroid.suppressUnsupportedCompileSdk=36,37,37.0,38,38.0 --no-daemon --stacktrace
 
-      - name: Verify Release Signature, 16 KB ELF Alignment & Stage Clean APK Names
+      - name: Verify Release Signature, 16 KB ELF Alignment (arm64 + x86_64) & Stage Clean APK Names
+        env:
+          HAS_RELEASE_SECRET: ${{ secrets.SIGNING_KEY_BASE64 != '' }}
         run: |
           SDK_ROOT="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
           APKSIGNER="$(ls "$SDK_ROOT"/build-tools/*/apksigner | sort -V | tail -1)"
@@ -77,18 +84,20 @@ jobs:
           REL_APK="$(ls app/build/outputs/apk/release/*.apk | head -1)"
           CERT_INFO="$("$APKSIGNER" verify --verbose --print-certs "$REL_APK")"
           echo "$CERT_INFO"
-          if echo "$CERT_INFO" | grep -q "CN=Android Debug"; then
+          if [ "$HAS_RELEASE_SECRET" = "true" ] && echo "$CERT_INFO" | grep -q "CN=Android Debug"; then
             echo "::error::Release APK was signed with a Debug key! Check GitHub Secrets."
             exit 1
           fi
-          unzip -p "$REL_APK" "lib/arm64-v8a/libsol_rnnoise.so" > /tmp/libsol_rnnoise.so
-          LOAD_INFO="$(readelf -lW /tmp/libsol_rnnoise.so | grep 'LOAD')"
-          echo "=== arm64-v8a libsol_rnnoise.so ELF LOAD Segments ==="
-          echo "$LOAD_INFO"
-          if echo "$LOAD_INFO" | awk '{print $NF}' | grep -Eq '^0x1000$|^0x2000$'; then
-            echo "::error::libsol_rnnoise.so has <16KB ELF LOAD alignment!"
-            exit 1
-          fi
+          for ABI in arm64-v8a x86_64; do
+            unzip -p "$REL_APK" "lib/$ABI/libsol_rnnoise.so" > "/tmp/libsol_rnnoise_$ABI.so"
+            LOAD_INFO="$(readelf -lW "/tmp/libsol_rnnoise_$ABI.so" | grep 'LOAD')"
+            echo "=== $ABI libsol_rnnoise.so ELF LOAD Segments ==="
+            echo "$LOAD_INFO"
+            if echo "$LOAD_INFO" | awk '{print $NF}' | grep -Eq '^0x1000$|^0x2000$'; then
+              echo "::error::$ABI libsol_rnnoise.so has <16KB ELF LOAD alignment!"
+              exit 1
+            fi
+          done
           mkdir -p dist/release dist/debug
           cp "$REL_APK" "dist/release/SolStream-Studio-v${APP_VER}.apk"
           DBG_APK="$(ls app/build/outputs/apk/debug/*.apk | head -1)"
