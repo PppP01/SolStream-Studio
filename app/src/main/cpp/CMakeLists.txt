@@ -44,6 +44,7 @@ else()
 endif()
 
 # Standard IEEE-754 -O3 (without -ffast-math, which Xiph arch.h blocks)
+# Includes -Wno-null-dereference to silence upstream Xiph rnnoise/src/rnn.c assert macro warnings
 target_compile_options(sol_rnnoise PRIVATE
     -O3
     -std=gnu11
@@ -51,9 +52,10 @@ target_compile_options(sol_rnnoise PRIVATE
     -Wno-unused-parameter
     -Wno-unused-function
     -Wno-sign-compare
+    -Wno-null-dereference
 )
 
-# Enforce 16 KB ELF LOAD segment alignment for Android 15–17+ compliance
+# Enforce 16 KB ELF LOAD segment alignment for Android 15–18+ compliance
 target_link_options(sol_rnnoise PRIVATE
     "-Wl,-z,max-page-size=16384"
     "-Wl,-z,common-page-size=16384"
