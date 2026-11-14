@@ -34,6 +34,7 @@ import android.os.Handler
 import android.os.Looper
 import android.os.PerformanceHintManager
 import android.os.Process
+import android.os.SystemClock
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
@@ -130,10 +131,12 @@ class SolDualAudioEngine(private val context: Context) {
     private var drainThread: Thread? = null
     private var audioDeviceCallback: AudioDeviceCallback? = null
 
-    // State deduplication for [MIC_OK] logging so verifyActiveMicConfiguration never spams DiagnosticsLogger
+    // State deduplication for [MIC_OK] logging & 48 kHz HAL sample-rate protection
     private var lastLoggedMicSessionId: Int = -1
     private var lastLoggedMicRoute: String = ""
     private var lastLoggedMicSilenced: Boolean? = null
+    private var lastLoggedMicSampleRate: Int = -1
+    private var lastHalRateRelockElapsedMs: Long = 0L
 
     private var tpdfSeed: Int = 0x6D2B79F5
 
@@ -262,6 +265,8 @@ class SolDualAudioEngine(private val context: Context) {
         lastLoggedMicSessionId = -1
         lastLoggedMicRoute = ""
         lastLoggedMicSilenced = null
+        lastLoggedMicSampleRate = -1
+        lastHalRateRelockElapsedMs = 0L
 
         activeMicDeviceId = settings.micDeviceId
         activeMicAudioSource = settings.micAudioSource
@@ -601,7 +606,6 @@ class SolDualAudioEngine(private val context: Context) {
         var gameMuteSmooth = 1.0f
         var consecutiveZeroOrSilencedReads = 0
         var totalFramesMixed = 0L
-        var silenceFallbackFrames = 0
         var gameRebuildAttempts = 0
         var lastGameSignalMs = System.currentTimeMillis()
         var lastDriftCorrectionFrame = 0L
@@ -698,11 +702,10 @@ class SolDualAudioEngine(private val context: Context) {
                 if (!inPhoneCall && isRunning) {
                     if (micRead <= 0 || micPeakRaw < 1e-7f) {
                         consecutiveZeroOrSilencedReads++
+                        // When micRead <= 0, READ_BLOCKING returned immediately without blocking for 10 ms.
+                        // Always sleep 10 ms on non-blocking error reads so the mixer never spins CPU or jumps PTS!
                         if (micRead <= 0) {
-                            silenceFallbackFrames++
-                            if (silenceFallbackFrames <= 5) {
-                                try { Thread.sleep(10) } catch (_: InterruptedException) {}
-                            }
+                            try { Thread.sleep(10) } catch (_: InterruptedException) { break }
                         }
                         if (consecutiveZeroOrSilencedReads >= 120) {
                             attemptAutomaticMicRecovery(onStatusChanged)
@@ -710,7 +713,6 @@ class SolDualAudioEngine(private val context: Context) {
                         }
                     } else {
                         consecutiveZeroOrSilencedReads = 0
-                        silenceFallbackFrames = 0
                         if (micStatusText != "MIC OK") {
                             micStatusText = "MIC OK"
                             DiagnosticsLogger.micStatusLabel = "MIC OK ($routedMicLabel)"
@@ -872,6 +874,7 @@ class SolDualAudioEngine(private val context: Context) {
                 } else {
                     0.0f
                 }
+                if (!footOn) sonarFootstepExtraLiftSmooth = 0.0f
 
                 mixedOutByteBuf.clear()
 
@@ -1142,6 +1145,18 @@ class SolDualAudioEngine(private val context: Context) {
         try {
             val routedDev = rec.routedDevice
             if (routedDev != null) {
+                // If user is in Auto (-1) mode and Android routed our mic to a Bluetooth SCO/BLE call mic,
+                // immediately lock onto the Phone's Built-in Studio Mic!
+                val isUnwantedBtMic = activeMicDeviceId == -1 && (
+                    routedDev.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO ||
+                        routedDev.type == AudioDeviceInfo.TYPE_BLE_HEADSET
+                    )
+                if (isUnwantedBtMic) {
+                    resolveTargetMicDevice(context, -1)?.let { studioDev ->
+                        try { rec.setPreferredDevice(studioDev) } catch (_: Exception) {}
+                    }
+                }
+
                 routedMicLabel = "${routedDev.productName} (${DiagnosticsLogger.audioDeviceTypeName(routedDev.type)})"
                 shortMicPillLabel = when (routedDev.type) {
                     AudioDeviceInfo.TYPE_BUILTIN_MIC -> "Phone Studio"
@@ -1160,14 +1175,37 @@ class SolDualAudioEngine(private val context: Context) {
                 if (cfg != null) {
                     val isSilenced = cfg.isClientSilenced
                     val sessId = rec.audioSessionId
+                    val actualFmt = cfg.format
+                    val halRate = actualFmt.sampleRate
+
+                    // Report #2B Fix: If Android's audio HAL down-clocked our Built-in Studio Mic below 48 kHz
+                    // (e.g., to 16000 Hz when switching into CODM's voice chat), release any direct device pin
+                    // so VOICE_RECOGNITION uses Android's 48 kHz Default Routing wideband mixer, or refresh once per 60s.
+                    val isBuiltInOrWired = routedDev == null || (
+                        routedDev.type != AudioDeviceInfo.TYPE_BLUETOOTH_SCO &&
+                            routedDev.type != AudioDeviceInfo.TYPE_BLE_HEADSET
+                        )
+                    if (!isSilenced && isBuiltInOrWired && halRate in 8000..32000) {
+                        val nowElapsed = SystemClock.elapsedRealtime()
+                        if (activeMicDeviceId == -1 && routedDev?.type == AudioDeviceInfo.TYPE_BUILTIN_MIC) {
+                            try { rec.setPreferredDevice(null) } catch (_: Exception) {}
+                        }
+                        if (nowElapsed - lastHalRateRelockElapsedMs >= 60_000L) {
+                            lastHalRateRelockElapsedMs = nowElapsed
+                            pendingMicRouteRefresh = true
+                        }
+                    }
+
                     val stateChanged = forceLog ||
                         sessId != lastLoggedMicSessionId ||
                         routedMicLabel != lastLoggedMicRoute ||
-                        isSilenced != lastLoggedMicSilenced
+                        isSilenced != lastLoggedMicSilenced ||
+                        halRate != lastLoggedMicSampleRate
 
                     lastLoggedMicSessionId = sessId
                     lastLoggedMicRoute = routedMicLabel
                     lastLoggedMicSilenced = isSilenced
+                    lastLoggedMicSampleRate = halRate
 
                     if (isSilenced) {
                         micStatusText = "MIC SILENCED BY OS"
@@ -1176,11 +1214,10 @@ class SolDualAudioEngine(private val context: Context) {
                         micStatusText = "MIC OK"
                         DiagnosticsLogger.micStatusLabel = "MIC OK ($routedMicLabel)"
                         if (stateChanged) {
-                            val actualFmt = cfg.format
                             DiagnosticsLogger.log(
                                 "MIC_OK",
                                 "Stream microphone active on $routedMicLabel (${activeAcousticModeLabel}).",
-                                "session=$sessId fmt=${actualFmt.sampleRate}Hz/${actualFmt.channelCount}ch"
+                                "session=$sessId fmt=${halRate}Hz/${actualFmt.channelCount}ch"
                             )
                         }
                     }
@@ -1440,6 +1477,16 @@ class SolDualAudioEngine(private val context: Context) {
                 targetDevice.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO ||
                     targetDevice.type == AudioDeviceInfo.TYPE_BLE_HEADSET
                 )
+            val isExternalWiredOrUsbMic = targetDevice != null && (
+                targetDevice.type == AudioDeviceInfo.TYPE_WIRED_HEADSET ||
+                    targetDevice.type == AudioDeviceInfo.TYPE_USB_HEADSET ||
+                    targetDevice.type == AudioDeviceInfo.TYPE_USB_DEVICE
+                )
+            // Only pin setPreferredDevice upfront when user explicitly picked a device (preferredDeviceId != -1)
+            // or when an external Wired/USB-C mic is plugged in. Leaving Auto (-1) Built-in Mic unpinned
+            // allows VOICE_RECOGNITION to use Android's 48000 Hz Default Routing wideband mixer even when
+            // CODM is already running in MODE_IN_COMMUNICATION!
+            val shouldPinDeviceUpfront = (preferredDeviceId != -1) || isExternalWiredOrUsbMic
 
             val sourcePriority = when {
                 enableSpeakerAec -> listOf(
@@ -1495,7 +1542,7 @@ class SolDualAudioEngine(private val context: Context) {
                     val created = builder.build()
                     rec = created
                     if (created.state == AudioRecord.STATE_INITIALIZED) {
-                        if (targetDevice != null) {
+                        if (targetDevice != null && shouldPinDeviceUpfront) {
                             try {
                                 created.setPreferredDevice(targetDevice)
                             } catch (_: Exception) {
@@ -1561,9 +1608,16 @@ class SolDualAudioEngine(private val context: Context) {
 
                         created.startRecording()
                         if (targetDevice != null) {
-                            try {
-                                created.setPreferredDevice(targetDevice)
-                            } catch (_: Exception) {
+                            val routed = created.routedDevice
+                            val routedToBtCallMic = routed != null && (
+                                routed.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO ||
+                                    routed.type == AudioDeviceInfo.TYPE_BLE_HEADSET
+                                )
+                            if (shouldPinDeviceUpfront || ( !isExplicitBluetoothMic && routedToBtCallMic )) {
+                                try {
+                                    created.setPreferredDevice(targetDevice)
+                                } catch (_: Exception) {
+                                }
                             }
                         }
                         return Triple(created, attachedNs, attachedAec)
