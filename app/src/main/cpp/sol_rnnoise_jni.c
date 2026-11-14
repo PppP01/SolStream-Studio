@@ -32,7 +32,7 @@ typedef struct {
 } SolDenoiserCtx;
 
 static inline float sol_clampf(float v, float lo, float hi) {
-    if (!isfinite(v)) return 0.0f;
+    if (!isfinite(v) || fabsf(v) < 1e-20f) return 0.0f;
     if (v < lo) return lo;
     if (v > hi) return hi;
     return v;
@@ -118,8 +118,11 @@ Java_com_solgaming_solstreamstudio_SolNativeRnnoise_nativeProcessFrame480(
     float wet = sol_clampf((float)wetStrength, 0.0f, 1.0f);
     float dry = 1.0f - wet;
 
-    jfloat *samples = (*env)->GetFloatArrayElements(env, inOutFrame480, NULL);
-    if (samples == NULL) {
+    /* Zero-allocation stack buffer transfer (avoids JVM array pinning or heap copies every 10 ms) */
+    jfloat samples[SOL_FRAME_LEN];
+    (*env)->GetFloatArrayRegion(env, inOutFrame480, 0, SOL_FRAME_LEN, samples);
+    if ((*env)->ExceptionCheck(env)) {
+        (*env)->ExceptionClear(env);
         return -1.0f;
     }
 
@@ -195,8 +198,8 @@ Java_com_solgaming_solstreamstudio_SolNativeRnnoise_nativeProcessFrame480(
         ctx->smoothGainHigh += 0.015f * (targetHigh - ctx->smoothGainHigh);
 
         /* Split into <450 Hz, 450..3800 Hz, and >3800 Hz @ 48 kHz */
-        ctx->lpLow += 0.057f * (s - ctx->lpLow);
-        ctx->lpMid += 0.390f * (s - ctx->lpMid);
+        ctx->lpLow = sol_clampf(ctx->lpLow + 0.057f * (s - ctx->lpLow), -1.0f, 1.0f);
+        ctx->lpMid = sol_clampf(ctx->lpMid + 0.390f * (s - ctx->lpMid), -1.0f, 1.0f);
 
         float lowBand = ctx->lpLow;
         float midBand = ctx->lpMid - lowBand;
@@ -209,6 +212,6 @@ Java_com_solgaming_solstreamstudio_SolNativeRnnoise_nativeProcessFrame480(
     }
 #endif
 
-    (*env)->ReleaseFloatArrayElements(env, inOutFrame480, samples, 0);
+    (*env)->SetFloatArrayRegion(env, inOutFrame480, 0, SOL_FRAME_LEN, samples);
     return vadProb;
 }
