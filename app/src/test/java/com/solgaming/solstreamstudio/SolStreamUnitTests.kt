@@ -232,19 +232,20 @@ class SolStreamUnitTests {
     }
 
     @Test
-    fun genderMatchedHpfCoordinator_resolvesExact60HzMale75HzNeutral95HzFemale() {
-        assertEquals(60, KeystoreVault.resolveDefaultHpfForProfile("MALE"))
-        assertEquals(75, KeystoreVault.resolveDefaultHpfForProfile("NEUTRAL"))
-        assertEquals(95, KeystoreVault.resolveDefaultHpfForProfile("FEMALE"))
+    fun genderMatchedHpfCoordinator_resolvesExact50HzMale65HzNeutral85HzFemale() {
+        assertEquals(50, KeystoreVault.resolveDefaultHpfForProfile("MALE"))
+        assertEquals(65, KeystoreVault.resolveDefaultHpfForProfile("NEUTRAL"))
+        assertEquals(85, KeystoreVault.resolveDefaultHpfForProfile("FEMALE"))
+        assertTrue(MicDspProcessor.HPF_CUTOFF_STEPS.containsAll(listOf(0, 50, 55, 60, 65, 70, 75, 85, 95)))
 
-        val base = StreamSettings(voiceGenderProfile = "NEUTRAL", hpfCutoffHz = 75)
+        val base = StreamSettings(voiceGenderProfile = "NEUTRAL", hpfCutoffHz = 65)
         val maleApplied = MicDspProcessor.applyGenderProfileToSettings(base, "MALE")
         assertEquals("MALE", maleApplied.voiceGenderProfile)
-        assertEquals(60, maleApplied.hpfCutoffHz)
+        assertEquals(50, maleApplied.hpfCutoffHz)
 
         val femaleApplied = MicDspProcessor.applyGenderProfileToSettings(maleApplied, "FEMALE")
         assertEquals("FEMALE", femaleApplied.voiceGenderProfile)
-        assertEquals(95, femaleApplied.hpfCutoffHz)
+        assertEquals(85, femaleApplied.hpfCutoffHz)
     }
 
     @Test
@@ -283,8 +284,8 @@ class SolStreamUnitTests {
         val scan = DeviceScanSummary(
             deviceModel = "samsung SM-S721B",
             socModel = "Samsung Exynos 2400e",
-            androidRelease = "16",
-            sdkInt = 36,
+            androidRelease = "17",
+            sdkInt = 37,
             totalRamGb = 8,
             maxDisplayHz = 120,
             activeDisplayHz = 120,
@@ -313,7 +314,7 @@ class SolStreamUnitTests {
         assertEquals(2560, ytFlagship.width)
         assertEquals(1440, ytFlagship.height)
         assertEquals(20000, ytFlagship.targetBitrateKbps)
-        assertEquals(60, ytFlagship.hpfCutoffHz)
+        assertEquals(50, ytFlagship.hpfCutoffHz)
         assertEquals(0, ytFlagship.maxBFrames)
         assertEquals(0, ytFlagship.qpMaxCap)
         assertFalse(ytFlagship.useVbr)
@@ -434,10 +435,15 @@ class SolStreamUnitTests {
     }
 
     @Test
-    fun globalSocFriendlyMapper_mapsCrypticChipCodesToCleanProcessorNames() {
+    fun globalSocAndGpuFriendlyMapper_mapsCrypticChipAndAngleStringsCleanly() {
         assertEquals("Samsung Exynos 2400e", CodecCapabilityProbe.formatFriendlySocName("Samsung s5e9945", "s5e9945"))
-        assertEquals("Snapdragon 8 Gen 3", CodecCapabilityProbe.formatFriendlySocName("Qualcomm SM8650", "qcom"))
+        assertEquals("Snapdragon 8 Gen 3", CodecCapabilityProbe.formatFriendlySocName("Qualcomm SM8650", null))
+        assertEquals("Snapdragon 6 Gen 1", CodecCapabilityProbe.formatFriendlySocName("Qualcomm SM6450", "qcom"))
         assertEquals("MediaTek Dimensity 8300", CodecCapabilityProbe.formatFriendlySocName("MediaTek MT6897", "mt6897"))
+
+        val angleRaw = "ANGLE ((Samsung Xclipse 940) on Vulkan 1.3.304)"
+        assertEquals("Samsung Xclipse 940 (Vulkan)", CodecCapabilityProbe.formatFriendlyGpuName(angleRaw, shortBadge = false))
+        assertEquals("Xclipse 940", CodecCapabilityProbe.formatFriendlyGpuName(angleRaw, shortBadge = true))
     }
 
     @Test
@@ -479,9 +485,9 @@ class SolStreamUnitTests {
             dsp.applySettings(luxe)
 
             val fundHz = when (gender) {
-                "MALE" -> 125.0
+                "MALE" -> 115.0
                 "FEMALE" -> 210.0
-                else -> 165.0
+                else -> 155.0
             }
             var lastRms = 0f
             repeat(8) {
@@ -517,7 +523,6 @@ class SolStreamUnitTests {
             )
 
             val dsp180 = MicDspProcessor(48000)
-            dsp100.applyHardwareAcousticMode(hwMode)
             dsp180.applyHardwareAcousticMode(hwMode)
             dsp180.applySettings(
                 MicDspProcessor.applyPresetToSettings(
@@ -542,5 +547,87 @@ class SolStreamUnitTests {
             }
             assertTrue("Mode ${hwMode.name}: 180% Post-DSP Mic Boost ($rms180) must be louder than 100% ($rms100)", rms180 > rms100 * 1.35f)
         }
+    }
+
+    @Test
+    fun privacyBlurRectangles_resolveValidScissorBoundsAcrossAll8ZonesIn16x9And9x16() {
+        val resolutions = listOf(2560 to 1440, 1080 to 1920)
+        for ((dstW, dstH) in resolutions) {
+            for (zone in SolStreamService.PRIVACY_BLUR_ZONES) {
+                val rect = SolVideoPipeline.resolvePrivacyBlurRect(dstW, dstH, zone)
+                assertTrue("Zone $zone x (${rect.x}) must be >= 0", rect.x >= 0)
+                assertTrue("Zone $zone y (${rect.y}) must be >= 0", rect.y >= 0)
+                assertTrue("Zone $zone w (${rect.w}) must be >= 32", rect.w >= 32)
+                assertTrue("Zone $zone h (${rect.h}) must be >= 32", rect.h >= 32)
+                assertTrue("Zone $zone x+w (${rect.x + rect.w}) must fit inside $dstW", rect.x + rect.w <= dstW)
+                assertTrue("Zone $zone y+h (${rect.y + rect.h}) must fit inside $dstH", rect.y + rect.h <= dstH)
+            }
+            val kbRect = SolVideoPipeline.resolvePrivacyBlurRect(dstW, dstH, "KEYBOARD")
+            assertEquals(0, kbRect.x)
+            assertEquals(0, kbRect.y)
+            assertEquals(dstW, kbRect.w)
+            assertTrue(kbRect.h > dstH / 2)
+        }
+    }
+
+    @Test
+    fun micDspSubOctaveAndVelvetEngine_enrichesBaritoneChestWithZeroIdleRumble() {
+        val dspLuxe = MicDspProcessor(48000)
+        dspLuxe.applyHardwareAcousticMode(HardwareAcousticMode.PHONE_STUDIO)
+        dspLuxe.applySettings(
+            StreamSettings(
+                voiceGenderProfile = "MALE",
+                voicePreset = "SOL_LUXE",
+                hpfCutoffHz = 50,
+                voiceEqEnabled = true,
+                velvetWarmthEnabled = true,
+                compressorEnabled = false,
+                whisperLiftEnabled = false,
+                slowAgcEnabled = false,
+                micGainPercent = 100
+            )
+        )
+
+        // 1. Verify zero sub-octave rumble during silence
+        val silentFrame = FloatArray(480) { 0f }
+        repeat(5) {
+            dspLuxe.processMonoFrameInPlace(silentFrame, silentFrame.size)
+        }
+        val maxSilentOut = silentFrame.maxOf { abs(it) }
+        assertTrue("Envelope-gated f0/2 sub-octave synth must output 0.0 during silence, was $maxSilentOut", maxSilentOut < 1e-6f)
+
+        // 2. Compare 105 Hz male baritone fundamental enrichment against dry CLEAN mode
+        val dspDry = MicDspProcessor(48000)
+        dspDry.applyHardwareAcousticMode(HardwareAcousticMode.PHONE_STUDIO)
+        dspDry.applySettings(
+            StreamSettings(
+                voiceGenderProfile = "MALE",
+                voicePreset = "CLEAN",
+                hpfCutoffHz = 50,
+                voiceEqEnabled = false,
+                velvetWarmthEnabled = false,
+                compressorEnabled = false,
+                whisperLiftEnabled = false,
+                slowAgcEnabled = false,
+                micGainPercent = 100
+            )
+        )
+
+        var rmsLuxe = 0f
+        var rmsDry = 0f
+        repeat(10) { frameIdx ->
+            val fLuxe = FloatArray(480) { i ->
+                val sampleIdx = frameIdx * 480 + i
+                val t = sampleIdx.toDouble() / 48000.0
+                (0.12 * sin(2.0 * PI * 102.0 * t) + 0.04 * sin(2.0 * PI * 220.0 * t)).toFloat()
+            }
+            val fDry = fLuxe.clone()
+            dspLuxe.processMonoFrameInPlace(fLuxe, fLuxe.size)
+            dspDry.processMonoFrameInPlace(fDry, fDry.size)
+
+            rmsLuxe = sqrt(fLuxe.fold(0f) { acc, v -> acc + v * v } / fLuxe.size)
+            rmsDry = sqrt(fDry.fold(0f) { acc, v -> acc + v * v } / fDry.size)
+        }
+        assertTrue("SolLuxe 2.0 92Hz proximity + f0/2 sub-octave ($rmsLuxe) must enrich baritone warmth (>1.35x dry $rmsDry)", rmsLuxe > rmsDry * 1.35f)
     }
 }
