@@ -171,7 +171,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var btnKeyframeAndBFrames: Button
     private lateinit var btnQpAndLatency: Button
 
-    // Card 4: 15-Stage SolLuxe™ 2.0 Audio, SeekBar Sliders, 250% Game Soundstage & 10s Calibrator
+    // Card 4: 12-Stage SolLuxe™ 2.0 Audio, SeekBar Sliders, 250% Game Soundstage & 10s Calibrator
     private lateinit var btnMicDevice: Button
     private lateinit var btnMicSource: Button
     private lateinit var btnAudioBitrate: Button
@@ -351,7 +351,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * Checklist #17: Auto-saves any typed Ingest URL, Stream Keys, or Live Banner Text when the user
+     * Auto-saves any typed Ingest URL, Stream Keys, or Live Banner Text when the user
      * switches to Chrome/YouTube Studio or back to CODM so unsaved edits are never wiped in onResume()!
      */
     override fun onPause() {
@@ -379,14 +379,14 @@ class MainActivity : AppCompatActivity() {
                 @Suppress("DEPRECATION")
                 packageManager.getPackageInfo(packageName, 0)
             }
-            info.versionName?.removeSuffix("-debug") ?: "1.2.0"
+            info.versionName?.removeSuffix("-debug") ?: "1.2.1"
         } catch (_: Exception) {
-            "1.2.0"
+            "1.2.1"
         }
     }
 
     private fun buildDashboardUi(): View {
-        // Checklist #3: Outer vertical root pins the Top Header Bar above the ScrollView so scrolling
+        // Outer vertical root pins the Top Header Bar above the ScrollView so scrolling
         // cards never collide with the phone's top status bar clock or battery icon!
         val outerRoot = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -502,7 +502,7 @@ class MainActivity : AppCompatActivity() {
         container.addView(tvLiveBanner)
         container.addView(btnReapproveCapture)
 
-        // === CHECKLIST #6: 3-TILE HERO SUMMARY BAR ([ 1440p (2K) ] [ 60 FPS ] [ 20 Mbps ]) ===
+        // === 3-TILE HERO SUMMARY BAR ([ 1440p (2K) ] [ 60 FPS ] [ 20 Mbps ]) ===
         val heroRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             val lp = LinearLayout.LayoutParams(
@@ -1073,10 +1073,10 @@ class MainActivity : AppCompatActivity() {
         cardVideo.addView(boxSceneProDrawer)
         container.addView(cardVideo)
 
-        // === CARD 4: SOLLUXE™ 2.0 10-STAGE VOICE STUDIO, 12-MODE MATRIX & 250% GAME SOUNDSTAGE ===
-        val cardAudio = sectionCard("4. SolLuxe™ 2.0 Voice Studio & 250% Game Soundstage")
+        // === CARD 4: SOLLUXE™ 2.0 12-STAGE VOICE STUDIO, 12-MODE MATRIX & 250% GAME SOUNDSTAGE ===
+        val cardAudio = sectionCard("4. SolLuxe™ 2.0 12-Stage Voice Studio & 250% Game Soundstage")
         cardAudio.addView(
-            bodyText("Auto-adapts across Phone Studio Mic, Wired/USB-C Close Mic & Bluetooth! Includes 60/75/95Hz Gender HPF, Cardioid Proximity Warmth, 2f Tube Harmonics, AI Tone Balancer & Post-AGC Boost.")
+            bodyText("Auto-adapts across Phone Studio Mic, Wired/USB-C Close Mic & Bluetooth! Includes 50/65/85Hz Gender HPF, +5.8dB Deep Proximity Chest, f0/2 Sub-Octave Synth, 920Hz Velvet Dip & Post-AGC Boost.")
         )
 
         btnMicDevice = actionButton("", "#1C2836") { cycleMicInputDevice() }
@@ -1086,14 +1086,14 @@ class MainActivity : AppCompatActivity() {
         cardAudio.addView(btnMicDevice)
         cardAudio.addView(buttonRow(btnMicSource, btnAudioBitrate))
 
-        cardAudio.addView(labelText("Voice Profile (Pick 1 — Auto-Sets 60/75/95Hz HPF, Proximity Chest Warmth, Narrow Q=2.2 Cut & De-Esser):"))
-        btnGenderNeutral = actionButton("Neutral (75Hz)", "#1C2836") {
+        cardAudio.addView(labelText("Voice Profile (Pick 1 — Auto-Sets 50/65/85Hz HPF, Deep Proximity, f0/2 Sub-Octave, 920Hz Velvet Dip & De-Esser):"))
+        btnGenderNeutral = actionButton("Neutral (65Hz)", "#1C2836") {
             updateSetting(MicDspProcessor.applyGenderProfileToSettings(settings, "NEUTRAL"))
         }
-        btnGenderMale = actionButton("Male Voice (60Hz)", "#1C2836") {
+        btnGenderMale = actionButton("Male Voice (50Hz)", "#1C2836") {
             updateSetting(MicDspProcessor.applyGenderProfileToSettings(settings, "MALE"))
         }
-        btnGenderFemale = actionButton("Female Voice (95Hz)", "#1C2836") {
+        btnGenderFemale = actionButton("Female Voice (85Hz)", "#1C2836") {
             updateSetting(MicDspProcessor.applyGenderProfileToSettings(settings, "FEMALE"))
         }
         cardAudio.addView(buttonRow(btnGenderNeutral, btnGenderMale, btnGenderFemale))
@@ -1108,8 +1108,8 @@ class MainActivity : AppCompatActivity() {
         cardAudio.addView(btnVoicePreset)
         cardAudio.addView(buttonRow(btnNoiseSuppressMode, btnNoiseSuppressLevel))
 
-        // Checklist #29: Glowing Cyan SeekBar Volume Sliders + -10% / +10% Fine Step Buttons
-        cardAudio.addView(labelText("Post-DSP Mic Boost (50%–250% • Placed at Stage 10 After Slow AGC):"))
+        // Glowing Cyan SeekBar Volume Sliders + -10% / +10% Fine Step Buttons
+        cardAudio.addView(labelText("Post-DSP Mic Boost (50%–250% • Placed at Stage 12 After Slow AGC):"))
         btnMicGain = actionButton("", "#00695C") { cycleMicGain() }
         val micSliderRow = buildVolumeSeekBarRow(
             minPct = 50,
@@ -1153,7 +1153,7 @@ class MainActivity : AppCompatActivity() {
         btnMicDelay = actionButton("", "#1C2836") { cycleMicSyncDelay() }
         cardAudio.addView(buttonRow(btnDucking, btnMicDelay))
 
-        cardAudio.addView(labelText("Stackable Stereo Game Soundstage (Stream-Only • Auto Bass-Ducking on Speech):"))
+        cardAudio.addView(labelText("Stackable Stereo Game Soundstage (Stream-Only • Phase-Safe 62Hz Voice Ducking):"))
         btnGameWide = actionButton("", "#1C2836") {
             updateSetting(settings.copy(gameCinemaWideEnabled = !settings.gameCinemaWideEnabled))
         }
@@ -1169,7 +1169,7 @@ class MainActivity : AppCompatActivity() {
         cardAudio.addView(buttonRow(btnGameWide, btnGameSubPunch))
         cardAudio.addView(buttonRow(btnGameFootsteps, btnGameBlastTamer))
 
-        // Collapsible Drawer: Individual 10-Stage Voice Filter Switches
+        // Collapsible Drawer: Individual 12-Stage Voice Filter Switches
         boxVoiceStageDrawer = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             visibility = View.GONE
@@ -1182,7 +1182,7 @@ class MainActivity : AppCompatActivity() {
             layoutParams = lp
         }
         btnToggleVoiceStageDrawer = actionButton(
-            "▼ Expand: Individual Voice Filter Switches (Mix & Match All 10 Stages)",
+            "▼ Expand: Individual Voice Filter Switches (Mix & Match All 12 Stages)",
             "#162234"
         ) {
             val show = boxVoiceStageDrawer.visibility != View.VISIBLE
@@ -1190,7 +1190,7 @@ class MainActivity : AppCompatActivity() {
             btnToggleVoiceStageDrawer.text = if (show) {
                 "▲ Hide: Individual Voice Filter Switches"
             } else {
-                "▼ Expand: Individual Voice Filter Switches (Mix & Match All 10 Stages)"
+                "▼ Expand: Individual Voice Filter Switches (Mix & Match All 12 Stages)"
             }
         }
 
@@ -1235,7 +1235,7 @@ class MainActivity : AppCompatActivity() {
         cardAudio.addView(boxVoiceStageDrawer)
 
         tvMicTestStatus = bodyText(
-            "10s Studio Voice Test (Loads 100% of your active Profile, 2f Tube Warmth, EQ & Mic Boost % so you hear your exact live stream voice!):"
+            "10s Studio Voice Test (Loads 100% of your active Profile, f0/2 Sub-Octave, 920Hz Velvet Dip & Mic Boost % so you hear your exact live stream voice!):"
         )
         btnRecordMicTest = actionButton("Record 10s Test", "#00695C") { runTenSecMicCalibration() }
         btnPlayMicTest = actionButton("Play Test", "#1565C0") { playMicTestSample() }
@@ -1415,9 +1415,9 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * Checklist #8: Platform-Aware & Voice-Aware Tier Presets.
+     * Platform-Aware & Voice-Aware Tier Presets (#8):
      * Applies optimal defaults across all 5 tiers, respects active Platform in Card 2 (YouTube vs Twitch 6M vs Kick 8M),
-     * sets the gender-matched HPF (60/75/95 Hz), and resets advanced silicon controls cleanly.
+     * sets the gender-matched HPF (50/65/85 Hz), and resets advanced silicon controls cleanly.
      */
     private fun applyTierDefaultsToSettings(
         base: StreamSettings,
@@ -1428,7 +1428,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun refreshHardwareAndMicsAsync() {
-        // Checklist #33: Never run hardware MediaCodec probing while a live broadcast is starting or active!
+        // Never run hardware MediaCodec probing while a live broadcast is starting or active!
         if (SolStreamService.isBroadcastLive || CodecCapabilityProbe.isBroadcastStartingOrLive) {
             micOptions = CodecCapabilityProbe.listAvailableMicInputs(this)
             refreshAllUi()
@@ -1687,6 +1687,9 @@ class MainActivity : AppCompatActivity() {
         }
         btnOverlayPosition.text = ".PNG Overlay Layout: $posFriendly"
         btnPickShortsPoster.text = "9:16 Poster (${if (hasPost) "Custom Saved" else "Pick Image"})"
+        if (!etBannerText.hasFocus() && etBannerText.text?.toString() != settings.liveBannerText) {
+            etBannerText.setText(settings.liveBannerText)
+        }
         btnBannerToggle.text = "Live Text Banner: ${onOff(settings.liveBannerEnabled)}"
         btnBannerPos.text = "Banner Pos: ${settings.liveBannerPosition}"
         btnShortsBackdrop.text = "9:16 Shorts Canvas: ${settings.shortsBackdropMode} (40% Cooler GPU Blur)"
@@ -1730,7 +1733,7 @@ class MainActivity : AppCompatActivity() {
         btnGenderFemale.background = roundedDrawable(if (gProf == "FEMALE") "#00838F" else "#1C2836", if (gProf == "FEMALE") "#00E5FF" else "#37474F")
 
         btnVoicePreset.text = "Voice Type: ${MicDspProcessor.presetDisplayName(settings.voicePreset)}"
-        // GPT Audit Fix #11: Verify both isLibraryLoaded and isNeuralModelReady on the Denoiser badge
+        // Verify both isLibraryLoaded and isNeuralModelReady on the Denoiser badge
         val nsModeDesc = when (settings.noiseSuppressMode) {
             "RNNOISE" -> when {
                 SolNativeRnnoise.isLibraryLoaded && SolNativeRnnoise.isNeuralModelReady -> "Native C 48kHz RNNoise"
@@ -1745,12 +1748,12 @@ class MainActivity : AppCompatActivity() {
             0 -> "OFF (0%)"
             1 -> "Lv1 Gentle (65%)"
             2 -> "Lv2 Natural (88%)"
-            else -> "Lv3 Max (100%)"
+            else -> "Lv3 Max (98%)"
         }
         btnNoiseSuppressMode.text = "Denoiser (Pick 1): $nsModeDesc"
         btnNoiseSuppressLevel.text = "Strength: $nsLvlDesc"
 
-        btnMicGain.text = "Mic Boost: ${settings.micGainPercent}% (Post-DSP Stage 10)"
+        btnMicGain.text = "Mic Boost: ${settings.micGainPercent}% (Post-DSP Stage 12)"
         btnGameGain.text = "Game Mix: ${settings.gameGainPercent}% (Up to 250%)"
         suppressSeekBarCallback = true
         seekMicGain.progress = ((settings.micGainPercent.coerceIn(50, 250) - 50) / 5)
@@ -1762,21 +1765,21 @@ class MainActivity : AppCompatActivity() {
 
         btnGameWide.text = "Cinema 3D Wide: ${onOff(settings.gameCinemaWideEnabled)}"
         btnGameWide.background = roundedDrawable(if (settings.gameCinemaWideEnabled) "#0D47A1" else "#1C2836", "#37474F")
-        btnGameSubPunch.text = "Theater Sub-Punch (Auto Voice Duck): ${onOff(settings.gameSubPunchEnabled)}"
+        btnGameSubPunch.text = "Theater Sub-Punch (62Hz Voice Duck): ${onOff(settings.gameSubPunchEnabled)}"
         btnGameSubPunch.background = roundedDrawable(if (settings.gameSubPunchEnabled) "#0D47A1" else "#1C2836", "#37474F")
-        btnGameFootsteps.text = "Footstep Focus (+Sonar Lift): ${onOff(settings.gameFootstepFocusEnabled)}"
+        btnGameFootsteps.text = "Footstep Focus (250Hz+2.45kHz+Sonar): ${onOff(settings.gameFootstepFocusEnabled)}"
         btnGameFootsteps.background = roundedDrawable(if (settings.gameFootstepFocusEnabled) "#0D47A1" else "#1C2836", "#37474F")
-        btnGameBlastTamer.text = "Blast Tamer: ${onOff(settings.gameBlastTamerEnabled)}"
+        btnGameBlastTamer.text = "Blast Tamer (35ms Smooth): ${onOff(settings.gameBlastTamerEnabled)}"
         btnGameBlastTamer.background = roundedDrawable(if (settings.gameBlastTamerEnabled) "#0D47A1" else "#1C2836", "#37474F")
 
-        // Individual 10-Stage Voice Filter Switches
+        // Individual 12-Stage Voice Filter Switches
         btnStageHpf.text = if (settings.hpfCutoffHz == 0) "1. HPF Rumble: OFF" else "1. HPF Rumble: ${settings.hpfCutoffHz} Hz"
         btnStageTransient.text = "2. Spark/Hammer & Grip Blanker: ${onOff(settings.transientTamerEnabled)}"
         btnStageGate.text = "3. 0-ms Instant Breath Gate: ${onOff(settings.noiseGateEnabled)}"
-        btnStageEq.text = "4. ${settings.voiceGenderProfile} Proximity 3-Band EQ: ${onOff(settings.voiceEqEnabled)}"
-        btnStageVelvet.text = "5. Velvet 2f Tube Warmth & Silk Air: ${onOff(settings.velvetWarmthEnabled)}"
+        btnStageEq.text = "4. ${settings.voiceGenderProfile} Proximity & 920Hz Velvet EQ: ${onOff(settings.voiceEqEnabled)}"
+        btnStageVelvet.text = "5. f0/2 Sub-Octave, 2f Tube & Silk Air: ${onOff(settings.velvetWarmthEnabled)}"
         btnStageDeEss.text = "6. Post-Comp Split-Band De-Esser: ${onOff(settings.deEsserEnabled)}"
-        btnStageComp.text = "7. 12ms-Punch 3:1 Compressor: ${onOff(settings.compressorEnabled)}"
+        btnStageComp.text = "7. High-Pass Sidechain 3:1 Leveler: ${onOff(settings.compressorEnabled)}"
         btnStageWhisper.text = "8. Whisper Callout Lift: ${onOff(settings.whisperLiftEnabled)}"
         btnStageSlowAgc.text = "9. Speech-Gated Slow AGC: ${onOff(settings.slowAgcEnabled)}"
         btnStageSpeakerAec.text = "10. Speaker Echo Canceler: ${onOff(settings.speakerAecEnabled)}"
@@ -1854,11 +1857,13 @@ class MainActivity : AppCompatActivity() {
 
     // === PLATFORM, SIMULCAST & VIDEO PILL HANDLERS ===
     /**
-     * Checklist #16: Selecting Twitch auto-configures 1080p60 • H.264 • 6 Mbps • 160k AAC;
-     * selecting Kick auto-configures 1080p60 • H.264 • 8 Mbps • 160k AAC.
+     * Selecting Twitch auto-configures 1080p60 • H.264 • 6 Mbps • 160k AAC;
+     * selecting Kick auto-configures 1080p60 • H.264 • 8 Mbps • 160k AAC;
+     * switching back to YouTube restores the active Device Tier's YouTube resolution/bitrate/codec if it was clamped!
      */
     private fun selectPlatformPreset(platformKey: String) {
         val p = platformKey.uppercase(Locale.US)
+        val prevPlat = settings.platformPreset.uppercase(Locale.US)
         val newUrl = when (p) {
             "YOUTUBE" -> KeystoreVault.DEFAULT_YOUTUBE_RTMPS
             "TWITCH" -> KeystoreVault.DEFAULT_TWITCH_RTMPS
@@ -1890,11 +1895,19 @@ class MainActivity : AppCompatActivity() {
                 hdr10Enabled = false
             )
             "YOUTUBE" -> {
-                val hevcOk = scanSummary.hevcHardware != null
-                settings.copy(
-                    platformPreset = "YOUTUBE",
-                    codec = if (hevcOk && !settings.simulcastTwitchEnabled && !settings.simulcastKickEnabled) "HEVC" else settings.codec
-                )
+                if (prevPlat in setOf("TWITCH", "KICK") && settings.targetBitrateKbps <= 8000) {
+                    KeystoreVault.applyPlatformAndVoiceAwareTierPreset(
+                        settings.copy(platformPreset = "YOUTUBE"),
+                        DeviceTier.fromId(settings.deviceTier),
+                        scanSummary
+                    )
+                } else {
+                    val hevcOk = scanSummary.hevcHardware != null
+                    settings.copy(
+                        platformPreset = "YOUTUBE",
+                        codec = if (hevcOk && !settings.simulcastTwitchEnabled && !settings.simulcastKickEnabled) "HEVC" else settings.codec
+                    )
+                }
             }
             else -> settings.copy(platformPreset = "CUSTOM")
         }
@@ -2208,7 +2221,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * Checklist #4: Smart Cross-Phone Preset Clamping.
+     * Smart Cross-Phone Preset Clamping (#4):
      * Validates imported JSON presets against the receiving phone's hardware scan and adapts
      * unsupported resolutions/codecs cleanly.
      */
@@ -2235,7 +2248,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * Checklist #37: Updated In-App Plain-English Guide & Glossary covering every v1.2.0 feature.
+     * Updated In-App Plain-English Guide & Glossary covering every v1.2.1 feature.
      */
     private fun showPlainEnglishGlossaryDialog() {
         val guide = """
@@ -2243,7 +2256,7 @@ class MainActivity : AppCompatActivity() {
 
             [1. TOP HERO BAR & SMART DEVICE TIERS (Card 0)]
             • 3-Tile Hero Bar: Tap Resolution, Frame Rate, or Bitrate at the very top anytime for 1-tap switching.
-            • Lite / Balanced / High / Flagship / Ultra: Sets the optimal resolution, bitrate, and SolLuxe™ 2.0 studio voice chain for your phone while respecting your selected Platform (YouTube vs Twitch 6M vs Kick 8M).
+            • Lite / Balanced / High / Flagship / Ultra: Sets the optimal resolution, bitrate, and 12-Stage SolLuxe™ 2.0 studio voice chain for your phone while respecting your selected Platform (YouTube vs Twitch 6M vs Kick 8M).
 
             [2. PLATFORM PRESETS, SHORTS KEY & 5-METRIC SPEED TEST (Card 2)]
             • YouTube / Twitch / Kick / Custom Pills:
@@ -2252,7 +2265,7 @@ class MainActivity : AppCompatActivity() {
               - Kick: Auto-sets 1080p60 H.264 @ 8 Mbps + 160k AAC.
             • 9:16 Shorts Tip: In YouTube Studio, keep 'Turn on manual settings' OFF so your single Default Stream Key works automatically for both 16:9 Landscape and 9:16 Vertical Shorts!
             • Simulcast Modes: Choose Single-Encode Cool Mode (0% extra heat) or Split-Encode Dual HW Quality (sends 1440p HEVC to YouTube + 1080p H.264 to Twitch/Kick simultaneously on Flagship/Ultra phones).
-            • Instant Wi-Fi <-> 5G Failover: Keep both Wi-Fi and Mobile Data ON—if your router drops mid-match, SolRelay Omega™ switches to 5G in 0.3 seconds without ending your stream!
+            • Instant Wi-Fi <-> 5G Failover + 8.5s Handshake Watchdog: Keep both Wi-Fi and Mobile Data ON—if your router drops mid-match, SolRelay Omega™ switches to a fresh socket in 0.3 seconds without ending your stream!
 
             [3. SOLCORE ULTRA™ VIDEO, STRETCH FRAMING, CORNER LOGOS & PRIVACY BLUR (Card 3)]
             • Framing (FIT / STRETCH (16:9) / SMART / FILL):
@@ -2262,13 +2275,13 @@ class MainActivity : AppCompatActivity() {
             • Dual-Layer Privacy Blur Shield:
               - Auto-Blur Keyboard: Automatically hazes out the bottom half of the stream the instant your keyboard pops up (hiding your keyboard photo & typing) while keeping your Minimap Blur active!
               - 8 Screen Zones: Blur Top-Right (Small Room Code / Med Minimap / Large HUD), Center Box (Password/Popup), Keyboard, or any corner.
-            • Thermal Bitrate Rule: Never lowers your bitrate for heat while streaming at 60 FPS! Only steps bitrate down (-40%) if Severe warmth steps a 60 FPS stream to 30 FPS.
+            • Smart Thermal Bitrate Rules: Never lowers your bitrate for heat while streaming at 60 FPS! Steps 60 FPS down to 30 FPS (-40% bitrate) on Severe warmth, and protects native 30 FPS streams with a safe 8M/12M floor.
 
-            [4. SOLLUXE™ 2.0 10-STAGE VOICE STUDIO & 12-MODE HARDWARE MATRIX (Card 4)]
-            • Automatic 4-Hardware x 3-Gender Matrix: Automatically detects whether you are using your 48kHz Phone Studio Mic (with Bluetooth Neckband/AirPods in Stereo Game Mode), a Wired 3.5mm / USB-C Close-Talk Mic, or a Bluetooth Mic, and tunes proximity chest warmth, 335 Hz grip mud cut, and De-Esser automatically!
-            • Male (60Hz HPF) / Neutral (75Hz HPF) / Female (95Hz HPF): 1 tap sets all 6 internal filter frequencies.
-            • Stage 10 True Post-DSP Mic Boost (50%–250%): Placed after Slow AGC & Compressor so your volume boost is never fought or turned down!
-            • AI Dynamic Bass-Priority Ducking: When Theater Sub-Punch is ON, automatically dips the game's 65 Hz sub-bass by 50% during the exact milliseconds you speak so explosions never muddy your voice.
+            [4. SOLLUXE™ 2.0 12-STAGE VOICE STUDIO & 12-MODE HARDWARE MATRIX (Card 4)]
+            • Automatic 4-Hardware x 3-Gender Matrix: Automatically detects whether you are using your 48kHz Phone Studio Mic (with Bluetooth Neckband/AirPods in Stereo Game Mode), a Wired 3.5mm / USB-C Close-Talk Mic, or a Bluetooth Mic!
+            • Male (50Hz HPF) / Neutral (65Hz HPF) / Female (85Hz HPF): 1 tap sets all 12 internal stages including +5.8 dB @ 92 Hz Deep Cardioid Proximity, Envelope-Gated f0/2 Sub-Octave Synthesizer (55–75 Hz), 330 Hz Grip Mud Cut, 920 Hz Sweet Velvet Anti-Nasal Dip, and 6.6 kHz Silk Air.
+            • High-Pass Sidechain 3:1 Compressor + Stage 12 Post-DSP Mic Boost (50%–250%): Deep sub-bass never pumps the compressor, and Slow AGC never fights your manual volume boost!
+            • Phase-Safe 62 Hz Theater Sub-Punch & Dual-Band Footstep Focus (250 Hz + 2,450 Hz): Boosts 62 Hz grenade thump (+3.0 dB) when silent and ducks to 0.0 dB when you speak.
 
             [5. SAVED CLIPS & AI AUTO-CLUTCH HIGHLIGHTS (Card 5)]
             • Tap '★ Clip' in the in-game Floating Pill (or let 🤖 AI Auto-Clutch detect intense gunfight + callout peaks automatically), then tap '★ Saved Clips & AI Highlights' in Card 5 to copy all timestamps in 1 click!
@@ -2357,7 +2370,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * Checklist #17: Smart Clipboard Paste Guard.
+     * Smart Clipboard Paste Guard (#17):
      * Strips invisible trailing spaces/newlines, and if the user accidentally copied an rtmp:// or
      * rtmps:// Server URL and tapped "Paste Key", routes it into the Ingest Server URL box automatically!
      */
@@ -2559,7 +2572,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * Checklist #9: Reserves isBroadcastStartingOrLive = true immediately and waits up to 5.0 seconds
+     * Reserves isBroadcastStartingOrLive = true immediately and waits up to 5.0 seconds
      * (5000 ms) if an initial startup hardware scan is still running on a slow phone (0.05s if already done).
      */
     private fun requestScreenCaptureAndGoLive() {
@@ -2657,16 +2670,19 @@ class MainActivity : AppCompatActivity() {
             .setItems(apps) { _, which ->
                 benchmarkTargetAppName = apps[which]
                 DiagnosticsLogger.log("BENCH_TARGET", "Selected $benchmarkTargetAppName for passive thermal/RAM comparison.")
-                startService(Intent(this, SolStreamService::class.java).apply {
-                    action = SolStreamService.ACTION_START_GLIP_BENCH
-                })
+                ContextCompat.startForegroundService(
+                    this,
+                    Intent(this, SolStreamService::class.java).apply {
+                        action = SolStreamService.ACTION_START_GLIP_BENCH
+                    }
+                )
                 refreshAllUi()
             }
             .setNegativeButton("Cancel", null)
             .show()
     }
 
-    // === CHECKLIST #19: 5-METRIC PRO NETWORK ANALYZER (DOWNLOAD + UPLOAD + PING + JITTER + BUFFERBLOAT + PLATFORM ADVISOR) ===
+    // === 5-METRIC PRO NETWORK ANALYZER (DOWNLOAD + UPLOAD + PING + JITTER + BUFFERBLOAT + PLATFORM ADVISOR) ===
     private fun parseIngestHostPort(rawUrl: String): Triple<Boolean, String, Int> {
         val clean = KeystoreVault.normalizeIngestUrl(rawUrl)
         return try {
@@ -2902,7 +2918,7 @@ class MainActivity : AppCompatActivity() {
         }, "SolNetProbe").start()
     }
 
-    // === CHECKLIST #34: DEDICATED PLAIN-ENGLISH SAVED CLIPS & AI HIGHLIGHTS VIEWER ===
+    // === DEDICATED PLAIN-ENGLISH SAVED CLIPS & AI HIGHLIGHTS VIEWER ===
     private fun showSavedClipsDialog() {
         val summary = DiagnosticsLogger.buildSavedClipsPlainEnglishSummary(this)
         val clipCount = DiagnosticsLogger.getClipHighlightCount()
@@ -3003,8 +3019,8 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * Checklist #35: Numerical Semantic Version Parser ([1, 2, 0] vs [1, 1, 10])
-     * so future releases like v1.2.0 or v1.1.10 never fail alphabetical string comparison.
+     * Numerical Semantic Version Parser ([1, 2, 1] vs [1, 2, 0])
+     * so future releases never fail alphabetical string comparison.
      */
     private fun isRemoteVersionNewer(remoteRaw: String, localRaw: String): Boolean {
         val rParts = remoteRaw.trim().removePrefix("v").substringBefore('-').split('.').map { it.toIntOrNull() ?: 0 }
@@ -3087,7 +3103,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * Checklist #14: All-Brand Phone Setup, Earphones & Cool-Stream Guide.
+     * All-Brand Phone Setup, Earphones & Cool-Stream Guide (#14):
      * Auto-detects Build.MANUFACTURER so the user's own phone brand appears right at the top!
      */
     private fun showAllBrandSetupGuide() {
