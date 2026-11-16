@@ -110,7 +110,7 @@ object DiagnosticsLogger {
 
     @Volatile var sessionStartMs: Long = 0L
     @Volatile var activePipelineDesc: String = "Idle (Not Streaming)"
-    @Volatile var activeAudioDspDesc: String = "SolLuxe™ 2.0 32-Bit Float + Native C RNNoise"
+    @Volatile var activeAudioDspDesc: String = "SolLuxe™ 2.0 13-Stage Float + Native C RNNoise"
     @Volatile var activeSimulcastDesc: String = "Primary Only"
     @Volatile var startTempC: Float = 0f
     @Volatile var peakTempC: Float = 0f
@@ -154,7 +154,6 @@ object DiagnosticsLogger {
         synchronized(this) {
             if (crashHandlerInstalled) return
             val appCtx = context.applicationContext
-            // Preload persisted clips if present from the previous stream session
             loadPersistedClipsIfEmpty(appCtx)
             val previousHandler = Thread.getDefaultUncaughtExceptionHandler()
             Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
@@ -201,10 +200,6 @@ object DiagnosticsLogger {
         }
     }
 
-    /**
-     * Snapshots the live active microphone status right BEFORE cleanupResources() stops the audio
-     * engine so the final Session Report header always shows the true active mic status instead of "MIC STOPPED".
-     */
     @Synchronized
     fun lockFinalMicStatusBeforeStop() {
         val current = micStatusLabel.trim()
@@ -234,10 +229,6 @@ object DiagnosticsLogger {
         return streamStamp
     }
 
-    /**
-     * Zero-bloat AI Auto-Clutch Highlight Detector (#34): records intense gunfire + excited voice
-     * callout peaks automatically with a 45-second cooldown to prevent duplicate spam.
-     */
     @Synchronized
     fun markAiClutchHighlight(
         elapsedStreamSec: Long,
@@ -485,10 +476,6 @@ object DiagnosticsLogger {
         }
     }
 
-    /**
-     * Best-effort non-root SoC thermal zone probe: checks standard kernel CPU/SoC/GPU thermal zones
-     * if permitted by the device's SELinux policy, returning -1f cleanly when restricted.
-     */
     private fun readOptionalSocTempC(): Float {
         return try {
             for (idx in 0..5) {
@@ -536,10 +523,6 @@ object DiagnosticsLogger {
         }
     }
 
-    /**
-     * Uses CodecCapabilityProbe's 10.5-second rate-limited thermal headroom poller so Android 11-17
-     * never throttles or returns NaN from frequent background calls.
-     */
     fun readThermalHeadroom(context: Context): Float {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return -1f
         val hr = CodecCapabilityProbe.readLiveHardwareHealth(context).thermalHeadroomRatio
@@ -600,8 +583,8 @@ object DiagnosticsLogger {
         }
 
         val sb = StringBuilder()
-        sb.appendLine("=== SOLSTREAM STUDIO ULTRA v1.2.0 (SolApex™ HyperStream Engine) — AUTOMATIC SESSION REPORT ===")
-        sb.appendLine("Engine Architecture: SolApex™ HyperStream (Video: SolCore Ultra | Audio: SolLuxe 2.0 | Broadcast: SolRelay Omega | Silicon: SolCodec)")
+        sb.appendLine("=== SOLSTREAM STUDIO ULTRA v1.3.0 (SolApex™ HyperStream Engine) — AUTOMATIC SESSION REPORT ===")
+        sb.appendLine("Engine Architecture: SolApex™ HyperStream (Video: SolCore Ultra | Audio: SolLuxe 2.0 13-Stage | Broadcast: SolRelay Omega | Silicon: SolCodec)")
         sb.appendLine("Privacy Guarantee: Stream keys, notifications, and voice audio are NEVER included.")
         sb.appendLine(
             "Device: ${scan.friendlyHardwareLine()} | RAM: ${scan.totalRamGb}GB | Display: ${scan.maxDisplayHz}Hz | GL: ${scan.maxGlEsVersion}"
