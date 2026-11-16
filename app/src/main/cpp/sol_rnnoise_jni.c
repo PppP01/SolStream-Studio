@@ -11,6 +11,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#if defined(__x86_64__) || defined(__i386__)
+#include <xmmintrin.h>
+#endif
+
 #if SOL_USE_XIPH_RNNOISE
 #include "rnnoise.h"
 #endif
@@ -38,6 +42,31 @@ static inline float sol_clampf(float v, float lo, float hi) {
     return v;
 }
 
+/*
+ * Enables hardware Flush-to-Zero (FZ) on ARM64 / ARMv7 / x86_64 audio worker threads
+ * so internal Xiph RNNoise recurrent GRU weights never trigger subnormal float traps
+ * when the microphone is muted or silent during a marathon broadcast.
+ */
+static inline void sol_enable_hardware_ftz(void) {
+#if defined(__aarch64__)
+    uint64_t fpcr = 0;
+    __asm__ __volatile__("mrs %0, fpcr" : "=r"(fpcr));
+    if ((fpcr & (1ULL << 24)) == 0) {
+        fpcr |= (1ULL << 24);
+        __asm__ __volatile__("msr fpcr, %0" : : "r"(fpcr));
+    }
+#elif defined(__arm__) && defined(__VFP_FP__) && !defined(__SOFTFP__)
+    uint32_t fpscr = 0;
+    __asm__ __volatile__("vmrs %0, fpscr" : "=r"(fpscr));
+    if ((fpscr & (1U << 24)) == 0) {
+        fpscr |= (1U << 24);
+        __asm__ __volatile__("vmsr fpscr, %0" : : "r"(fpscr));
+    }
+#elif defined(__x86_64__) || defined(__i386__)
+    _MM_SET_FLUSH_ZERO_MODE(_MM_FLUSH_ZERO_ON);
+#endif
+}
+
 JNIEXPORT jboolean JNICALL
 Java_com_solgaming_solstreamstudio_SolNativeRnnoise_nativeIsNeuralModelActive(
     JNIEnv *env,
@@ -59,6 +88,7 @@ Java_com_solgaming_solstreamstudio_SolNativeRnnoise_nativeCreate(
 ) {
     (void)env;
     (void)clazz;
+    sol_enable_hardware_ftz();
     SolDenoiserCtx *ctx = (SolDenoiserCtx *)calloc(1, sizeof(SolDenoiserCtx));
     if (ctx == NULL) {
         return (jlong)0;
@@ -114,6 +144,8 @@ Java_com_solgaming_solstreamstudio_SolNativeRnnoise_nativeProcessFrame480(
         return -1.0f;
     }
 
+    sol_enable_hardware_ftz();
+
     SolDenoiserCtx *ctx = (SolDenoiserCtx *)(intptr_t)handle;
     float wet = sol_clampf((float)wetStrength, 0.0f, 1.0f);
     float dry = 1.0f - wet;
@@ -133,11 +165,12 @@ Java_com_solgaming_solstreamstudio_SolNativeRnnoise_nativeProcessFrame480(
     float scaledOut[SOL_FRAME_LEN];
     const float toInt16Scale = 32767.0f;
     const float invInt16Scale = 1.0f / 32767.0f;
+    const float antiDenormalOffset = 1e-15f;
 
     for (int i = 0; i < SOL_FRAME_LEN; i++) {
         float cleanIn = sol_clampf(samples[i], -1.0f, 1.0f);
         samples[i] = cleanIn;
-        scaledIn[i] = cleanIn * toInt16Scale;
+        scaledIn[i] = (cleanIn * toInt16Scale) + antiDenormalOffset;
     }
 
     vadProb = rnnoise_process_frame(ctx->rnnState, scaledOut, scaledIn);
