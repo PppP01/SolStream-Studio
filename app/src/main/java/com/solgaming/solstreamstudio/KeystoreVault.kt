@@ -27,6 +27,7 @@ import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
 import javax.crypto.SecretKeyFactory
 import javax.crypto.spec.GCMParameterSpec
+import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
 
@@ -135,13 +136,6 @@ object KeystoreVault {
 
     @Volatile private var cachedSecurityLabel: String? = null
 
-    /**
-     * Single shared coordinator for gender-matched High-Pass Filter cutoffs across
-     * Card 0 (Tier Presets), Card 4 (Voice Studio), and the in-game Floating Pill.
-     * - MALE: 50 Hz (preserves 55-95 Hz deep baritone chest + f0/2 sub-octave warmth)
-     * - NEUTRAL: 65 Hz
-     * - FEMALE: 85 Hz
-     */
     fun resolveDefaultHpfForProfile(genderProfile: String): Int {
         return when (genderProfile.uppercase(Locale.US)) {
             "MALE" -> 50
@@ -150,24 +144,15 @@ object KeystoreVault {
         }
     }
 
-    /**
-     * Strips invisible spaces, newlines, tabs, and zero-width characters copied from mobile browsers.
-     */
     fun sanitizeStreamKeyInput(rawKey: String): String {
         return rawKey.replace(invisibleWhitespaceRegex, "").trim().trimStart('/')
     }
 
-    /**
-     * Detects if a user accidentally copied an RTMP/RTMPS Server URL when tapping "Paste Key".
-     */
     fun isLikelyRtmpUrl(rawText: String): Boolean {
         val clean = rawText.trim().lowercase(Locale.US)
         return clean.startsWith("rtmp://") || clean.startsWith("rtmps://")
     }
 
-    /**
-     * Builds the Card 2 Key Vault Status Badge without exposing the full secret key.
-     */
     fun getMaskedKeyStatusBadge(rawKey: String): String {
         val clean = sanitizeStreamKeyInput(rawKey)
         if (clean.isEmpty()) return "⚠️ Empty"
@@ -227,7 +212,6 @@ object KeystoreVault {
         }
     }
 
-    // === PRIMARY & SHORTS STREAM KEY VAULT (RETURNS TRUE ONLY WHEN ENCRYPTION + STORAGE SUCCEED) ===
     fun saveEndpointAndKey(context: Context, rtmpsUrl: String, plainStreamKey: String): Boolean {
         val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         val normUrl = normalizeIngestUrl(rtmpsUrl)
@@ -280,7 +264,6 @@ object KeystoreVault {
         return decryptSecret(blob)
     }
 
-    // === MULTI-PLATFORM SIMULCAST VAULT (TWITCH, KICK & CUSTOM RTMP) ===
     fun saveTwitchUrlAndKey(context: Context, url: String, key: String): Boolean {
         val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         val edit = prefs.edit().putString(KEY_TWITCH_URL, normalizeIngestUrl(url.ifBlank { DEFAULT_TWITCH_RTMPS }))
@@ -329,7 +312,6 @@ object KeystoreVault {
         return decryptSecret(blob)
     }
 
-    // === ENDPOINT BUILDERS ===
     fun buildFullStreamEndpoint(context: Context): String? {
         val settings = loadSettings(context)
         return buildActivePrimaryEndpoint(context, settings)
@@ -351,10 +333,6 @@ object KeystoreVault {
         return joinUrlAndStreamKey(baseUrl, activeKey)
     }
 
-    /**
-     * Builds the secondary 9:16 companion endpoint ONLY when Slot #2 has a distinct non-blank
-     * stream key (prevents primary + companion encoders from colliding on the same YouTube key).
-     */
     fun buildCompanionVerticalEndpoint(context: Context): String? {
         val shortsKey = sanitizeStreamKeyInput(getShortsStreamKey(context))
         val primaryKey = sanitizeStreamKeyInput(getStreamKey(context))
@@ -383,7 +361,6 @@ object KeystoreVault {
         return out
     }
 
-    // === PLATFORM-AWARE & VOICE-AWARE TIER PRESET COORDINATOR (CARD 0 <-> CARD 2 <-> CARD 3 <-> CARD 4) ===
     fun applyPlatformAndVoiceAwareTierPreset(
         current: StreamSettings,
         tier: DeviceTier,
@@ -499,10 +476,6 @@ object KeystoreVault {
         )
     }
 
-    /**
-     * Smart Cross-Phone Preset Clamping (#4): validates an imported JSON preset against the
-     * receiving phone's hardware scan and adapts unsupported codecs/resolutions/bitrates cleanly.
-     */
     fun clampImportedSettingsToHardware(
         imported: StreamSettings,
         scan: DeviceScanSummary
@@ -570,7 +543,6 @@ object KeystoreVault {
         ) to changed
     }
 
-    // === HARDWARE KEYSTORE AES-256-GCM ===
     fun getKeySecurityDescription(): String {
         cachedSecurityLabel?.let { return it }
         val desc = try {
@@ -647,9 +619,8 @@ object KeystoreVault {
                 )
                 return "$iv:$ct"
             } catch (e: Exception) {
-                // Non-destructive key recovery (#8): only delete master key on permanent keystore invalidation
                 val isPermanent = (e is KeyPermanentlyInvalidatedException) || (e is UnrecoverableKeyException)
-                if (attempt == 0 && isPermanent) {
+                if (attempt == 0) {
                     try {
                         val ks = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
                         ks.deleteEntry(MASTER_KEY_ALIAS)
@@ -657,7 +628,7 @@ object KeystoreVault {
                     } catch (_: Exception) {
                     }
                 } else {
-                    break
+                    return null
                 }
             }
         }
@@ -694,7 +665,6 @@ object KeystoreVault {
         }
     }
 
-    // === SETTINGS PERSISTENCE & SECRET-FREE PRESET SHARE/IMPORT ===
     fun saveSettings(context: Context, s: StreamSettings) {
         val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         prefs.edit().putString(KEY_SETTINGS_JSON, exportPresetJson(s)).apply()
@@ -704,7 +674,6 @@ object KeystoreVault {
         val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         val raw = prefs.getString(KEY_SETTINGS_JSON, null) ?: return StreamSettings()
         val imported = importPresetJson(raw, StreamSettings()) ?: StreamSettings()
-        // Snap legacy zoom values (like 104% in older builds) to the nearest valid 10-step ladder (108%)
         val snappedZoom = snapZoomToValidStep(imported.smartZoomPercent)
         return if (snappedZoom != imported.smartZoomPercent) {
             imported.copy(smartZoomPercent = snappedZoom)
