@@ -97,7 +97,7 @@ class SolVideoPipeline(private val context: Context) {
         }
 
     // Live-adjustable visual & filter states (0-ms hot-swap inside OpenGL render loop)
-    @Volatile var liveFramingMode = "FIT"         // "FIT", "STRETCH", "SMART", "FILL"
+    @Volatile var liveFramingMode = "FIT"          // "FIT", "STRETCH", "SMART", "FILL"
     @Volatile var liveSmartZoomPercent = 108      // 100..250% (Landscape & 9:16 Shorts Center Zoom)
     @Volatile var liveLandscapeFlip = 0
     @Volatile var liveUpscalerMode = "BICUBIC"    // "BILINEAR", "BICUBIC", "LANCZOS"
@@ -108,7 +108,7 @@ class SolVideoPipeline(private val context: Context) {
     @Volatile var liveGpuSharpen = false
     @Volatile var liveShortsBackdropMode = "BLUR"
     @Volatile var liveOverlayImageEnabled = false
-    @Volatile var liveOverlayPosition = "FULL"    // "FULL", "TOP_LEFT", "TOP_RIGHT", "BOTTOM_LEFT", "BOTTOM_RIGHT"
+    @Volatile var liveOverlayPosition = "FULL"     // "FULL", "TOP_LEFT", "TOP_RIGHT", "BOTTOM_LEFT", "BOTTOM_RIGHT"
     @Volatile var liveBannerEnabled = false
     @Volatile var liveBannerText = ""
     @Volatile var liveBannerPosition = "TOP"
@@ -577,7 +577,7 @@ class SolVideoPipeline(private val context: Context) {
                 companionInputSurface = compSurf,
                 companionWidth = compAlignedW,
                 companionHeight = compAlignedH,
-                preferGlEs30 = preferEs30,
+                preferGlEs30 = preferGlEs30,
                 use10BitEgl = finalConfigured.actualIsHdr10,
                 initialCapWidth = capWidth,
                 initialCapHeight = capHeight,
@@ -883,16 +883,19 @@ class SolVideoPipeline(private val context: Context) {
                     setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, keyframeSec)
                     setInteger(MediaFormat.KEY_BITRATE_MODE, requestedMode)
 
-                    // Always stamp explicit BT.709 HD color standard on SDR (or BT.2020 HLG on HDR10)
-                    // across all attempts so YouTube never defaults to washed-out SD BT.601 colors (#25)!
-                    if (tryHdrThisAttempt) {
-                        setInteger(MediaFormat.KEY_COLOR_STANDARD, MediaFormat.COLOR_STANDARD_BT2020)
-                        setInteger(MediaFormat.KEY_COLOR_RANGE, MediaFormat.COLOR_RANGE_LIMITED)
-                        setInteger(MediaFormat.KEY_COLOR_TRANSFER, MediaFormat.COLOR_TRANSFER_HLG)
-                    } else {
-                        setInteger(MediaFormat.KEY_COLOR_STANDARD, MediaFormat.COLOR_STANDARD_BT709)
-                        setInteger(MediaFormat.KEY_COLOR_RANGE, MediaFormat.COLOR_RANGE_LIMITED)
-                        setInteger(MediaFormat.KEY_COLOR_TRANSFER, MediaFormat.COLOR_TRANSFER_SDR_VIDEO)
+                    // Attempt #3 Bare-Metal Encoder Fallback:
+                    // On Attempt #3, omit optional color tags so budget MediaTek (OMX.MTK.*) and Unisoc
+                    // chips that reject BT.709 configuration keys still initialize successfully!
+                    if (attempt <= 2) {
+                        if (tryHdrThisAttempt) {
+                            setInteger(MediaFormat.KEY_COLOR_STANDARD, MediaFormat.COLOR_STANDARD_BT2020)
+                            setInteger(MediaFormat.KEY_COLOR_RANGE, MediaFormat.COLOR_RANGE_LIMITED)
+                            setInteger(MediaFormat.KEY_COLOR_TRANSFER, MediaFormat.COLOR_TRANSFER_HLG)
+                        } else {
+                            setInteger(MediaFormat.KEY_COLOR_STANDARD, MediaFormat.COLOR_STANDARD_BT709)
+                            setInteger(MediaFormat.KEY_COLOR_RANGE, MediaFormat.COLOR_RANGE_LIMITED)
+                            setInteger(MediaFormat.KEY_COLOR_TRANSFER, MediaFormat.COLOR_TRANSFER_SDR_VIDEO)
+                        }
                     }
 
                     if (attempt <= 2) {
@@ -918,7 +921,6 @@ class SolVideoPipeline(private val context: Context) {
                                 setInteger(MediaFormat.KEY_VIDEO_QP_P_MAX, qpCap)
                                 setInteger(MediaFormat.KEY_VIDEO_QP_B_MAX, qpCap)
                             }
-                            // Safe Samsung Exynos / Qualcomm vendor QP floor hints
                             val encLower = report.encoderName.lowercase(Locale.US)
                             if (encLower.contains("exynos") || encLower.contains("sec")) {
                                 setInteger("vendor.sec-ext-enc-qp-range.I-minQP", qpMin)
@@ -976,7 +978,6 @@ class SolVideoPipeline(private val context: Context) {
                 }
                 val isActualVbr = actualMode == MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR
 
-                // Strictly require explicit HLG or ST2084 transfer or 10-bit profile in outputFormat before reporting HDR10 active
                 val verifiedHdrOutput = if (tryHdrThisAttempt && outFmt != null) {
                     try {
                         val hasHdrTransfer = outFmt.containsKey(MediaFormat.KEY_COLOR_TRANSFER) && (
@@ -2784,7 +2785,7 @@ class SolVideoPipeline(private val context: Context) {
             }
         """
 
-        private const val OES_VS_ES20 = """
+        private val OES_VS_ES20 = """
             precision highp float;
             uniform mat4 uMVPMatrix;
             uniform mat4 uTexMatrix;
@@ -2830,7 +2831,7 @@ class SolVideoPipeline(private val context: Context) {
             }
         """
 
-        private const val RGBA_VS = """
+        private val RGBA_VS = """
             uniform mat4 uMVPMatrix;
             attribute vec4 aPosition;
             attribute vec4 aTexCoord;
@@ -2841,7 +2842,7 @@ class SolVideoPipeline(private val context: Context) {
             }
         """
 
-        private const val RGBA_FS = """
+        private val RGBA_FS = """
             precision mediump float;
             varying vec2 vTexCoord;
             uniform sampler2D sRgbaTex;
