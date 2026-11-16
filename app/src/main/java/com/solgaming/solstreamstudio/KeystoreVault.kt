@@ -27,13 +27,12 @@ import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
 import javax.crypto.SecretKeyFactory
 import javax.crypto.spec.GCMParameterSpec
-import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
 
 data class StreamSettings(
     // === Core Tier & Platform ===
-    val deviceTier: String = "FLAGSHIP",          // "LITE", "BALANCED", "HIGH", "FLAGSHIP", "ULTRA"
+    val deviceTier: String = "FLAGSHIP",         // "LITE", "BALANCED", "HIGH", "FLAGSHIP", "ULTRA"
     val platformPreset: String = "YOUTUBE",       // "YOUTUBE", "TWITCH", "KICK", "CUSTOM"
     val useShortsKeySlot: Boolean = false,        // Auto-uses Slot #2 Variable Key when 9:16 Shorts is active
     val simulcastTwitchEnabled: Boolean = false,  // Multi-destination packet fan-out
@@ -89,7 +88,7 @@ data class StreamSettings(
     val noiseGateEnabled: Boolean = true,         // Stage 4: 0-ms Instant Vocal Gate & Breath Expander
     val voiceEqEnabled: Boolean = true,           // Stage 6/8: Deep Proximity, Grip Mud Cut, 920Hz Velvet Dip & Presence
     val deEsserEnabled: Boolean = true,           // Stage 12: Post-Compressor Split-Band Sibilance Tamer
-    val velvetWarmthEnabled: Boolean = true,      // Stage 7/9: Cubic Analog Sub-Warmth + Aphex Silk Air Exciter & Shelf
+    val velvetWarmthEnabled: Boolean = true,      // Stage 7/9: Pure Analog Sub-Warmth + Aphex Silk Air Exciter & Shelf
     val compressorEnabled: Boolean = true,        // Stage 11: High-Pass Sidechain 12ms-Punch 3:1 Leveler
     val whisperLiftEnabled: Boolean = true,       // Stage 11: Upward Low-Level Callout Booster
     val slowAgcEnabled: Boolean = true,           // Stage 11: Speech-Gated Slow Broadcast Loudness Ride
@@ -136,6 +135,13 @@ object KeystoreVault {
 
     @Volatile private var cachedSecurityLabel: String? = null
 
+    /**
+     * Single shared coordinator for gender-matched High-Pass Filter cutoffs across
+     * Card 0 (Tier Presets), Card 4 (Voice Studio), and the in-game Floating Pill.
+     * - MALE: 50 Hz (preserves 55-95 Hz deep baritone chest + cubic sub-warmth)
+     * - NEUTRAL: 65 Hz
+     * - FEMALE: 85 Hz
+     */
     fun resolveDefaultHpfForProfile(genderProfile: String): Int {
         return when (genderProfile.uppercase(Locale.US)) {
             "MALE" -> 50
@@ -144,15 +150,24 @@ object KeystoreVault {
         }
     }
 
+    /**
+     * Strips invisible spaces, newlines, tabs, and zero-width characters copied from mobile browsers.
+     */
     fun sanitizeStreamKeyInput(rawKey: String): String {
         return rawKey.replace(invisibleWhitespaceRegex, "").trim().trimStart('/')
     }
 
+    /**
+     * Detects if a user accidentally copied an RTMP/RTMPS Server URL when tapping "Paste Key".
+     */
     fun isLikelyRtmpUrl(rawText: String): Boolean {
         val clean = rawText.trim().lowercase(Locale.US)
         return clean.startsWith("rtmp://") || clean.startsWith("rtmps://")
     }
 
+    /**
+     * Builds the Card 2 Key Vault Status Badge without exposing the full secret key.
+     */
     fun getMaskedKeyStatusBadge(rawKey: String): String {
         val clean = sanitizeStreamKeyInput(rawKey)
         if (clean.isEmpty()) return "⚠️ Empty"
@@ -212,6 +227,7 @@ object KeystoreVault {
         }
     }
 
+    // === PRIMARY & SHORTS STREAM KEY VAULT (RETURNS TRUE ONLY WHEN ENCRYPTION + STORAGE SUCCEED) ===
     fun saveEndpointAndKey(context: Context, rtmpsUrl: String, plainStreamKey: String): Boolean {
         val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         val normUrl = normalizeIngestUrl(rtmpsUrl)
@@ -264,6 +280,7 @@ object KeystoreVault {
         return decryptSecret(blob)
     }
 
+    // === MULTI-PLATFORM SIMULCAST VAULT (TWITCH, KICK & CUSTOM RTMP) ===
     fun saveTwitchUrlAndKey(context: Context, url: String, key: String): Boolean {
         val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         val edit = prefs.edit().putString(KEY_TWITCH_URL, normalizeIngestUrl(url.ifBlank { DEFAULT_TWITCH_RTMPS }))
@@ -312,6 +329,7 @@ object KeystoreVault {
         return decryptSecret(blob)
     }
 
+    // === ENDPOINT BUILDERS ===
     fun buildFullStreamEndpoint(context: Context): String? {
         val settings = loadSettings(context)
         return buildActivePrimaryEndpoint(context, settings)
@@ -333,6 +351,10 @@ object KeystoreVault {
         return joinUrlAndStreamKey(baseUrl, activeKey)
     }
 
+    /**
+     * Builds the secondary 9:16 companion endpoint ONLY when Slot #2 has a distinct non-blank
+     * stream key (prevents primary + companion encoders from colliding on the same YouTube key).
+     */
     fun buildCompanionVerticalEndpoint(context: Context): String? {
         val shortsKey = sanitizeStreamKeyInput(getShortsStreamKey(context))
         val primaryKey = sanitizeStreamKeyInput(getStreamKey(context))
@@ -361,6 +383,7 @@ object KeystoreVault {
         return out
     }
 
+    // === PLATFORM-AWARE & VOICE-AWARE TIER PRESET COORDINATOR (CARD 0 <-> CARD 2 <-> CARD 3 <-> CARD 4) ===
     fun applyPlatformAndVoiceAwareTierPreset(
         current: StreamSettings,
         tier: DeviceTier,
@@ -476,6 +499,10 @@ object KeystoreVault {
         )
     }
 
+    /**
+     * Smart Cross-Phone Preset Clamping (#4): validates an imported JSON preset against the
+     * receiving phone's hardware scan and adapts unsupported codecs/resolutions/bitrates cleanly.
+     */
     fun clampImportedSettingsToHardware(
         imported: StreamSettings,
         scan: DeviceScanSummary
@@ -543,6 +570,7 @@ object KeystoreVault {
         ) to changed
     }
 
+    // === HARDWARE KEYSTORE AES-256-GCM ===
     fun getKeySecurityDescription(): String {
         cachedSecurityLabel?.let { return it }
         val desc = try {
@@ -607,6 +635,17 @@ object KeystoreVault {
         return kg.generateKey()
     }
 
+    private fun isPermanentKeyInvalidation(e: Throwable): Boolean {
+        var curr: Throwable? = e
+        while (curr != null) {
+            if (curr is KeyPermanentlyInvalidatedException || curr is UnrecoverableKeyException) {
+                return true
+            }
+            curr = curr.cause
+        }
+        return false
+    }
+
     private fun encryptSecret(context: Context, plain: String): String? {
         for (attempt in 0..1) {
             try {
@@ -619,8 +658,8 @@ object KeystoreVault {
                 )
                 return "$iv:$ct"
             } catch (e: Exception) {
-                val isPermanent = (e is KeyPermanentlyInvalidatedException) || (e is UnrecoverableKeyException)
-                if (attempt == 0) {
+                // Non-Destructive Keystore Recovery Fix (#8): only delete/regenerate master key on permanent invalidation
+                if (attempt == 0 && isPermanentKeyInvalidation(e)) {
                     try {
                         val ks = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
                         ks.deleteEntry(MASTER_KEY_ALIAS)
@@ -646,25 +685,19 @@ object KeystoreVault {
             val cipher = Cipher.getInstance("AES/GCM/NoPadding")
             cipher.init(Cipher.DECRYPT_MODE, key, GCMParameterSpec(128, iv))
             String(cipher.doFinal(ct), StandardCharsets.UTF_8)
-        } catch (_: KeyPermanentlyInvalidatedException) {
-            try {
-                val ks = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
-                ks.deleteEntry(MASTER_KEY_ALIAS)
-                cachedSecurityLabel = null
-            } catch (_: Exception) {}
-            ""
-        } catch (_: UnrecoverableKeyException) {
-            try {
-                val ks = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
-                ks.deleteEntry(MASTER_KEY_ALIAS)
-                cachedSecurityLabel = null
-            } catch (_: Exception) {}
-            ""
-        } catch (_: Exception) {
+        } catch (e: Throwable) {
+            if (isPermanentKeyInvalidation(e)) {
+                try {
+                    val ks = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
+                    ks.deleteEntry(MASTER_KEY_ALIAS)
+                    cachedSecurityLabel = null
+                } catch (_: Exception) {}
+            }
             ""
         }
     }
 
+    // === SETTINGS PERSISTENCE & SECRET-FREE PRESET SHARE/IMPORT ===
     fun saveSettings(context: Context, s: StreamSettings) {
         val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         prefs.edit().putString(KEY_SETTINGS_JSON, exportPresetJson(s)).apply()
@@ -673,27 +706,7 @@ object KeystoreVault {
     fun loadSettings(context: Context): StreamSettings {
         val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         val raw = prefs.getString(KEY_SETTINGS_JSON, null) ?: return StreamSettings()
-        val imported = importPresetJson(raw, StreamSettings()) ?: StreamSettings()
-        val snappedZoom = snapZoomToValidStep(imported.smartZoomPercent)
-        return if (snappedZoom != imported.smartZoomPercent) {
-            imported.copy(smartZoomPercent = snappedZoom)
-        } else {
-            imported
-        }
-    }
-
-    private fun snapZoomToValidStep(zoom: Int): Int {
-        val validSteps = intArrayOf(100, 108, 115, 125, 135, 150, 175, 200, 225, 250)
-        var closest = validSteps[0]
-        var minDiff = abs(zoom - closest)
-        for (step in validSteps) {
-            val diff = abs(zoom - step)
-            if (diff < minDiff) {
-                minDiff = diff
-                closest = step
-            }
-        }
-        return closest
+        return importPresetJson(raw, StreamSettings()) ?: StreamSettings()
     }
 
     fun exportPresetJson(s: StreamSettings): String {
@@ -717,7 +730,20 @@ object KeystoreVault {
             put("useVbr", s.useVbr)
             put("adaptiveBitrate", s.adaptiveBitrate)
             put("framingMode", s.framingMode)
-            put("smartZoomPercent", s.smartZoomPercent)
+            // Fix: Snap legacy orphan zoom values (like 104%) to the nearest valid step (108%)
+            val clampedZoom = when (s.smartZoomPercent) {
+                in 100..106 -> 100
+                in 107..111 -> 108
+                in 112..120 -> 115
+                in 121..130 -> 125
+                in 131..142 -> 135
+                in 143..162 -> 150
+                in 163..187 -> 175
+                in 188..212 -> 200
+                in 213..237 -> 225
+                else -> if (s.smartZoomPercent > 237) 250 else s.smartZoomPercent
+            }.coerceIn(100, 250)
+            put("smartZoomPercent", clampedZoom)
 
             put("glEngineMode", s.glEngineMode)
             put("upscalerMode", s.upscalerMode)
@@ -779,6 +805,20 @@ object KeystoreVault {
             val j = JSONObject(rawJson.trim())
             val gender = j.optString("voiceGenderProfile", fallback.voiceGenderProfile)
             val defaultHpf = resolveDefaultHpfForProfile(gender)
+            val rawZoom = j.optInt("smartZoomPercent", fallback.smartZoomPercent)
+            val clampedZoom = when (rawZoom) {
+                in 100..106 -> 100
+                in 107..111 -> 108
+                in 112..120 -> 115
+                in 121..130 -> 125
+                in 131..142 -> 135
+                in 143..162 -> 150
+                in 163..187 -> 175
+                in 188..212 -> 200
+                in 213..237 -> 225
+                else -> if (rawZoom > 237) 250 else rawZoom
+            }.coerceIn(100, 250)
+
             StreamSettings(
                 deviceTier = j.optString("deviceTier", fallback.deviceTier),
                 platformPreset = j.optString("platformPreset", fallback.platformPreset),
@@ -798,7 +838,7 @@ object KeystoreVault {
                 useVbr = j.optBoolean("useVbr", fallback.useVbr),
                 adaptiveBitrate = j.optBoolean("adaptiveBitrate", fallback.adaptiveBitrate),
                 framingMode = j.optString("framingMode", fallback.framingMode),
-                smartZoomPercent = j.optInt("smartZoomPercent", fallback.smartZoomPercent).coerceIn(100, 250),
+                smartZoomPercent = clampedZoom,
 
                 glEngineMode = j.optString("glEngineMode", fallback.glEngineMode),
                 upscalerMode = j.optString("upscalerMode", fallback.upscalerMode),
