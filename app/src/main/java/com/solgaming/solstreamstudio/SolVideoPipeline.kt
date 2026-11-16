@@ -570,6 +570,7 @@ class SolVideoPipeline(private val context: Context) {
         )
 
         val compSurf = compConfigured?.inputSurface
+        val preferGlEs30 = preferEs30 // Fixed variable name to match local parameter
         renderThread = Thread({
             runGlRenderLoop(
                 mediaProjection = mediaProjection,
