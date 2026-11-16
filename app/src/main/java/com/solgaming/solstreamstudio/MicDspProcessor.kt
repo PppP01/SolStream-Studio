@@ -21,9 +21,9 @@ import kotlin.math.sqrt
 
 /**
  * 4-Hardware Acoustic Adaptation Modes (#28):
- * Automatically adapts proximity chest warmth, f0/2 sub-octave synthesis, hand-grip mud cut,
- * 920 Hz sweet velvet dip, breath-plosive HPF, and Bluetooth >5.2 kHz hiss roll-off across
- * all 3 gender profiles (12 combinations total).
+ * Automatically adapts proximity chest warmth, analog triode sub-warmth, hand-grip mud scoop,
+ * 920 Hz sweet velvet dip, hard-breath plosive guard, Aphex Silk Air exciter, and Bluetooth
+ * >5.2 kHz hiss roll-off across all 3 gender profiles (12 combinations total).
  */
 enum class HardwareAcousticMode(val title: String) {
     PHONE_STUDIO("48kHz Phone Studio Mic (Hand-Grip Tuned)"),
@@ -43,16 +43,16 @@ class MicDspProcessor(private val sampleRate: Int = 48000) {
     // Stackable independent stage switches (100% mix-and-match freedom; studio defaults ON)
     @Volatile var hpfCutoffHz: Int = 65                  // 0=Off, 50(Male), 55, 60, 65(Neutral), 70, 75, 85(Female), 95, 105, 120 Hz
     @Volatile var transientTamerEnabled: Boolean = true  // Stage 2: Spark/Hammer & Grip Blanker
-    @Volatile var gateEnabled: Boolean = true            // Stage 4: 0-ms Instant Vocal Gate & Breath Expander
-    @Volatile var eqEnabled: Boolean = true              // Stage 5/7/8: Deep Proximity, Grip Mud Cut, 920Hz Velvet Dip & Presence
-    @Volatile var velvetWarmthEnabled: Boolean = true    // Stage 6/8: True f0/2 Sub-Octave Synth + 2f Tube + Silk Air Shelf
-    @Volatile var aiToneBalancerEnabled: Boolean = true  // Stage 9: AI Dynamic Vocal Tone Balancer
-    @Volatile var compressorEnabled: Boolean = true      // Stage 10: High-Pass Sidechain 12ms-Punch 3:1 Broadcast Leveler
-    @Volatile var whisperLiftEnabled: Boolean = true     // Stage 10: Quiet Callout Booster
-    @Volatile var slowAgcEnabled: Boolean = true         // Stage 10: Speech-Gated Slow Broadcast Loudness Ride
-    @Volatile var deEsserEnabled: Boolean = true         // Stage 11: Post-Compressor Split-Band Sibilance Tamer
+    @Volatile var gateEnabled: Boolean = true            // Stage 4 & 5: 0-ms Instant Vocal Gate + Hard-Breath Plosive Guard
+    @Volatile var eqEnabled: Boolean = true              // Stage 6 & 8: Deep Proximity, Deeper 315-365Hz Mud Scoop, 920Hz Velvet Dip & Presence
+    @Volatile var velvetWarmthEnabled: Boolean = true    // Stage 7 & 9: Cubic Analog Sub-Warmth + Aphex Silk Air Exciter & Shelf
+    @Volatile var aiToneBalancerEnabled: Boolean = true  // Stage 10: AI Dynamic Vocal Tone Balancer
+    @Volatile var compressorEnabled: Boolean = true      // Stage 11: High-Pass Sidechain 12ms-Punch 3:1 Broadcast Leveler
+    @Volatile var whisperLiftEnabled: Boolean = true     // Stage 11: Quiet Callout Booster
+    @Volatile var slowAgcEnabled: Boolean = true         // Stage 11: Speech-Gated Slow Broadcast Loudness Ride
+    @Volatile var deEsserEnabled: Boolean = true         // Stage 12: Post-Compressor Split-Band Sibilance Tamer
 
-    // Stage 12: True Post-DSP Makeup Gain (50%..250%) — placed AFTER Slow AGC & Compressor!
+    // Stage 13: True Post-DSP Makeup Gain (50%..250%) — placed AFTER Slow AGC & Compressor!
     @Volatile var micGainLinear: Float = 1.30f
     @Volatile var streamMicMuted: Boolean = false
     @Volatile var platformHwNsAttached: Boolean = false
@@ -71,6 +71,7 @@ class MicDspProcessor(private val sampleRate: Int = 48000) {
     @Volatile var lastGainReductionDb: Float = 0f
     @Volatile var clipCount: Int = 0
     @Volatile var activeDenoiserSummary: String = "C RNNoise (Natural 88%)"
+    @Volatile var cpuEcoBypassActive: Boolean = false
 
     // 64-bit Double internal biquad states for zero low-frequency rounding noise over 6+ hour streams
     private class Biquad64 {
@@ -96,16 +97,18 @@ class MicDspProcessor(private val sampleRate: Int = 48000) {
     }
 
     private val hpfFilter = Biquad64()
-    private val vocalBodyDetector = Biquad64()      // 220 Hz vocal-cord fundamental detector for Spark/Hammer rejection
-    private val eqLowWarmth = Biquad64()            // Stage 5 Band 1: Deep Cardioid Proximity Chest Restoration (92/128/172 Hz)
-    private val subWarmthBandFilter = Biquad64()    // Stage 6a: Isolated Vocal Fundamental Extractor (105/140/185 Hz)
-    private val subOctaveLowPassFilter = Biquad64() // Stage 6b: 2nd-Order Butterworth Low-Pass for Pure f0/2 Sinusoidal Sub-Octave
-    private val eqMudCut = Biquad64()               // Stage 7a Band 2: Surgical Narrow Q=2.2 Hand-Grip Boxiness Cut (330/350/375 Hz)
-    private val eqVelvetDip = Biquad64()            // Stage 7b Band 3: NEW 920/980/1060 Hz "Sweet Velvet" Anti-Nasal Dip
-    private val eqPresence = Biquad64()             // Stage 8a Band 4: Silky Articulation Presence (2.85/3.15/3.45 kHz)
-    private val eqVelvetAir = Biquad64()            // Stage 8b: Intimate Silk Air High-Shelf (6.6/6.8/7.2 kHz)
-    private val aiPresenceTamer = Biquad64()        // Stage 9: AI Dynamic Shout Tamer (3.1-3.5 kHz detector)
-    private val sibilanceBand = Biquad64()          // Stage 11: Post-Compressor Split-Band De-Esser detector (5.8/6.3/6.8 kHz)
+    private val vocalBodyDetector = Biquad64()      // Independent 240 Hz vowel-cord harmonic detector (VAD, Spark & Breath Guard)
+    private val breathRumbleFilter = Biquad64()     // Stage 5: <115 Hz Hard-Breath & Wind-Plosive turbulence isolator
+    private val eqLowWarmth = Biquad64()            // Stage 6 Band 1: Tight Cardioid Proximity Chest Contour (95/130/175 Hz)
+    private val subWarmthBandFilter = Biquad64()    // Stage 7a: Isolated Vocal Fundamental Extractor (92/128/170 Hz)
+    private val subOctaveLowPassFilter = Biquad64() // Stage 7b: 2nd-Order Butterworth Smoothing Filter for Cubic Analog Sub-Warmth
+    private val eqMudCut = Biquad64()               // Stage 8a Band 2: Deeper Q=1.65 Room & Hand-Grip Boxiness Scoop (315/340/365 Hz)
+    private val eqVelvetDip = Biquad64()            // Stage 8b Band 3: 920/980/1050 Hz "Sweet Velvet" Anti-Nasal Dip
+    private val eqPresence = Biquad64()             // Stage 8c Band 4: Silky Intimate Articulation Presence (2.85/3.15/3.45 kHz)
+    private val airExciterSourceBand = Biquad64()   // Stage 9a: 2.2-3.6 kHz Vocal Harmonic Extractor for Aphex Silk Air Synthesis
+    private val eqVelvetAir = Biquad64()            // Stage 9b: Intimate Silk Air High-Shelf (6.6/6.8/7.2 kHz)
+    private val aiPresenceTamer = Biquad64()        // Stage 10: AI Dynamic Shout Tamer (2.95-3.45 kHz detector)
+    private val sibilanceBand = Biquad64()          // Stage 12: Post-Compressor Split-Band De-Esser detector (5.8/6.3/6.8 kHz)
 
     private val nativeLock = Any()
     @Volatile private var nativeRnnHandle: Long = 0L
@@ -126,28 +129,27 @@ class MicDspProcessor(private val sampleRate: Int = 48000) {
     private var vocalBodyEnv = 0.002f
     private var sparkBlankerHoldSamples = 0
 
-    // Stage 4: 0-ms Instant Vocal VAD & Soft 2.2:1 Breath Expander state
+    // Stage 4 & Stage 5: 0-ms Instant Vocal VAD, 2.2:1 Breath Expander & Dynamic Hard-Breath Plosive Guard
     private var gateGain = 1.0f
     private var gateHoldSamples = 0
+    private var breathLowEnv = 0.0005f
+    private var breathSubtractSmooth = 0.0f
 
     // Stage 3 fallback: Stationary light spectral state (strictly bypassed when Native C RNNoise runs!)
     private var noiseFloorEnv = 0.0018f
     private var suppressSmoothGain = 1.0f
     private var lpNoiseState = 0.0f
 
-    // Stage 6: Envelope-Gated True f0/2 Sub-Octave Synthesizer + 2f Tube Warmth states
-    private var subPrevSample = 0.0f
-    private var subOctaveFlipSign = 1.0f
-    private var subSamplesSinceLastCross = 200
-    private var subFundamentalEnv = 0.0f
-    private var subOctaveDrive = 0.16f
-    private var tube2fDrive = 0.08f
+    // Stage 7 & Stage 9: Pure Analog Cubic Sub-Warmth + Upper-Harmonic "Aphex Silk Air" Exciter states
+    private var subCubicDrive = 0.14f
+    private var tube2fDrive = 0.09f
+    private var airExciterDrive = 0.18f
     private var velvetDcState = 0.0f
-    private var exciterLpState = 0.0f
+    private var airExciterHpState = 0.0f
     private var velvetAirMixSmooth = 0.0f
     private var allowUpperAirExciter = true
 
-    // Stage 9, 10, 11 states: AI Tone Balancer, High-Pass Sidechain 3-Zone Dynamics & Post-Comp De-Esser
+    // Stage 10, 11, 12 states: AI Tone Balancer, High-Pass Sidechain 3-Zone Dynamics & Post-Comp De-Esser
     private var aiLowEnv = 0.0f
     private var aiHighEnv = 0.0f
     private var aiWarmthBoostSmooth = 0.0f
@@ -157,10 +159,15 @@ class MicDspProcessor(private val sampleRate: Int = 48000) {
     private var compGainSmooth = 1.0f
     private var slowAgcGain = 1.0f
     private var deEssEnv = 0.0f
-    private var deEssThreshold = 0.092f
+    private var deEssThreshold = 0.088f
+
+    // Low-end CPU budget watchdog state (protects 3-4 GB entry phones under heavy thermal throttling)
+    private var slowFrameStrikeCount = 0
+    private var ecoBypassRemainingFrames = 0
 
     init {
-        configureBandPass(vocalBodyDetector, 220.0, 0.90)
+        configureBandPass(vocalBodyDetector, 240.0, 0.85)
+        configureLowPass(breathRumbleFilter, 115.0, 0.7071)
         updateGenderAndHardwareFiltersIfNeeded(voiceGenderProfile, hardwareAcousticMode, velvetWarmthEnabled)
         updateHpfIfNeeded(hpfCutoffHz, voiceGenderProfile, hardwareAcousticMode)
         refreshDenoiserSummary()
@@ -367,8 +374,11 @@ class MicDspProcessor(private val sampleRate: Int = 48000) {
 
     /**
      * SolLuxe™ 2.0 12-Mode (4-Hardware x 3-Gender) Acoustic Matrix:
-     * Implements our exact physics-calculated frequencies, Q-factors, f0/2 sub-octave drives,
-     * 920/980/1060 Hz "Sweet Velvet" dips, and 6.6/6.8/7.2 kHz Silk Air shelves.
+     * Tuned for a clean, intimate, luxury podcast/studio vocal sound across Male, Neutral, and Female voices:
+     * - Tight Cardioid Proximity Chest Contour (95 / 130 / 175 Hz) without 200 Hz bloat
+     * - Deeper Q=1.65 Room & Hand-Grip Boxiness Scoop (-3.5 / -3.2 / -3.0 dB @ 315 / 340 / 365 Hz)
+     * - 920 / 980 / 1050 Hz "Sweet Velvet" Anti-Nasal Dip
+     * - Upper-Harmonic "Aphex Silk Air" Exciter (2.5-3.2 kHz harmonic source -> 5.0-10.0 kHz shimmer)
      */
     private fun updateGenderAndHardwareFiltersIfNeeded(
         gender: String,
@@ -385,142 +395,156 @@ class MicDspProcessor(private val sampleRate: Int = 48000) {
         configuredHwMode = hwMode
         configuredVelvetToneMode = velvetToneActive
 
-        // In STUDIO mode (velvetToneActive == false), give a slightly forward radio caster presence (+0.6 dB);
-        // in SOL_LUXE & VELVET (velvetToneActive == true), use the silky +1.0..+1.4 dB tilt so deep chest dominates.
-        val studioPresenceAdd = if (velvetToneActive) 0.0 else 0.6
+        val studioPresenceAdd = if (velvetToneActive) 0.0 else 0.5
 
         when (hwMode) {
             HardwareAcousticMode.PHONE_STUDIO -> {
                 allowUpperAirExciter = true
-                deEssThreshold = 0.090f
+                deEssThreshold = 0.086f
                 when (gender) {
                     "MALE" -> {
-                        subOctaveDrive = 0.16f
-                        tube2fDrive = 0.08f
-                        configurePeakingEq(eqLowWarmth, 92.0, 0.78, 5.8)
-                        configureBandPass(subWarmthBandFilter, 105.0, 1.15)
-                        configureLowPass(subOctaveLowPassFilter, 90.0, 0.7071)
-                        configurePeakingEq(eqMudCut, 330.0, 2.20, -2.8)
-                        configurePeakingEq(eqVelvetDip, 920.0, 1.35, -2.2)
-                        configurePeakingEq(eqPresence, 2850.0, 1.10, 1.0 + studioPresenceAdd)
-                        configureHighShelf(eqVelvetAir, 6600.0, 2.2)
+                        subCubicDrive = 0.14f
+                        tube2fDrive = 0.09f
+                        airExciterDrive = 0.20f
+                        configurePeakingEq(eqLowWarmth, 95.0, 0.82, 4.4)
+                        configureBandPass(subWarmthBandFilter, 92.0, 1.35)
+                        configureLowPass(subOctaveLowPassFilter, 115.0, 0.7071)
+                        configurePeakingEq(eqMudCut, 315.0, 1.65, -3.5)
+                        configurePeakingEq(eqVelvetDip, 920.0, 1.40, -2.2)
+                        configurePeakingEq(eqPresence, 2850.0, 1.05, 1.4 + studioPresenceAdd)
+                        configureBandPass(airExciterSourceBand, 2650.0, 0.90)
+                        configureHighShelf(eqVelvetAir, 6500.0, 2.5)
                         configureBandPass(aiPresenceTamer, 2950.0, 1.20)
-                        configureBandPass(sibilanceBand, 5800.0, 1.70)
+                        configureBandPass(sibilanceBand, 5800.0, 1.65)
                     }
                     "FEMALE" -> {
-                        subOctaveDrive = 0.09f
+                        subCubicDrive = 0.10f
                         tube2fDrive = 0.08f
-                        configurePeakingEq(eqLowWarmth, 172.0, 0.88, 3.4)
-                        configureBandPass(subWarmthBandFilter, 185.0, 1.15)
-                        configureLowPass(subOctaveLowPassFilter, 135.0, 0.7071)
-                        configurePeakingEq(eqMudCut, 375.0, 2.10, -2.5)
-                        configurePeakingEq(eqVelvetDip, 1060.0, 1.35, -1.8)
-                        configurePeakingEq(eqPresence, 3450.0, 1.10, 1.4 + studioPresenceAdd)
-                        configureHighShelf(eqVelvetAir, 7200.0, 2.4)
+                        airExciterDrive = 0.22f
+                        configurePeakingEq(eqLowWarmth, 175.0, 0.90, 2.8)
+                        configureBandPass(subWarmthBandFilter, 170.0, 1.35)
+                        configureLowPass(subOctaveLowPassFilter, 185.0, 0.7071)
+                        configurePeakingEq(eqMudCut, 365.0, 1.65, -3.0)
+                        configurePeakingEq(eqVelvetDip, 1050.0, 1.40, -1.8)
+                        configurePeakingEq(eqPresence, 3400.0, 1.05, 1.6 + studioPresenceAdd)
+                        configureBandPass(airExciterSourceBand, 3100.0, 0.90)
+                        configureHighShelf(eqVelvetAir, 7000.0, 2.6)
                         configureBandPass(aiPresenceTamer, 3450.0, 1.20)
-                        configureBandPass(sibilanceBand, 6800.0, 1.70)
+                        configureBandPass(sibilanceBand, 6700.0, 1.65)
                     }
                     else -> {
-                        subOctaveDrive = 0.12f
-                        tube2fDrive = 0.08f
-                        configurePeakingEq(eqLowWarmth, 128.0, 0.82, 4.2)
-                        configureBandPass(subWarmthBandFilter, 140.0, 1.15)
-                        configureLowPass(subOctaveLowPassFilter, 110.0, 0.7071)
-                        configurePeakingEq(eqMudCut, 350.0, 2.15, -2.6)
-                        configurePeakingEq(eqVelvetDip, 980.0, 1.35, -2.0)
-                        configurePeakingEq(eqPresence, 3150.0, 1.10, 1.2 + studioPresenceAdd)
-                        configureHighShelf(eqVelvetAir, 6800.0, 2.2)
+                        subCubicDrive = 0.12f
+                        tube2fDrive = 0.085f
+                        airExciterDrive = 0.20f
+                        configurePeakingEq(eqLowWarmth, 130.0, 0.85, 3.5)
+                        configureBandPass(subWarmthBandFilter, 128.0, 1.35)
+                        configureLowPass(subOctaveLowPassFilter, 145.0, 0.7071)
+                        configurePeakingEq(eqMudCut, 340.0, 1.65, -3.2)
+                        configurePeakingEq(eqVelvetDip, 980.0, 1.40, -2.0)
+                        configurePeakingEq(eqPresence, 3150.0, 1.05, 1.5 + studioPresenceAdd)
+                        configureBandPass(airExciterSourceBand, 2850.0, 0.90)
+                        configureHighShelf(eqVelvetAir, 6700.0, 2.5)
                         configureBandPass(aiPresenceTamer, 3200.0, 1.20)
-                        configureBandPass(sibilanceBand, 6300.0, 1.70)
+                        configureBandPass(sibilanceBand, 6250.0, 1.65)
                     }
                 }
             }
 
             HardwareAcousticMode.WIRED_USB_CLOSE -> {
                 allowUpperAirExciter = true
-                deEssThreshold = 0.090f
+                deEssThreshold = 0.086f
                 when (gender) {
                     "MALE" -> {
-                        subOctaveDrive = 0.11f
+                        subCubicDrive = 0.09f
                         tube2fDrive = 0.06f
-                        configurePeakingEq(eqLowWarmth, 96.0, 0.85, 2.6)
-                        configureBandPass(subWarmthBandFilter, 105.0, 1.15)
-                        configureLowPass(subOctaveLowPassFilter, 90.0, 0.7071)
-                        configurePeakingEq(eqMudCut, 330.0, 2.20, -1.4)
-                        configurePeakingEq(eqVelvetDip, 920.0, 1.40, -1.4)
-                        configurePeakingEq(eqPresence, 2900.0, 1.10, 1.0 + studioPresenceAdd)
-                        configureHighShelf(eqVelvetAir, 6800.0, 1.8)
+                        airExciterDrive = 0.16f
+                        configurePeakingEq(eqLowWarmth, 98.0, 0.88, 2.0)
+                        configureBandPass(subWarmthBandFilter, 95.0, 1.35)
+                        configureLowPass(subOctaveLowPassFilter, 115.0, 0.7071)
+                        configurePeakingEq(eqMudCut, 315.0, 1.75, -2.2)
+                        configurePeakingEq(eqVelvetDip, 920.0, 1.45, -1.6)
+                        configurePeakingEq(eqPresence, 2900.0, 1.05, 1.3 + studioPresenceAdd)
+                        configureBandPass(airExciterSourceBand, 2700.0, 0.90)
+                        configureHighShelf(eqVelvetAir, 6700.0, 2.0)
                         configureBandPass(aiPresenceTamer, 2950.0, 1.20)
-                        configureBandPass(sibilanceBand, 5800.0, 1.70)
+                        configureBandPass(sibilanceBand, 5800.0, 1.65)
                     }
                     "FEMALE" -> {
-                        subOctaveDrive = 0.06f
-                        tube2fDrive = 0.06f
-                        configurePeakingEq(eqLowWarmth, 175.0, 0.90, 1.6)
-                        configureBandPass(subWarmthBandFilter, 185.0, 1.15)
-                        configureLowPass(subOctaveLowPassFilter, 135.0, 0.7071)
-                        configurePeakingEq(eqMudCut, 375.0, 2.10, -1.0)
-                        configurePeakingEq(eqVelvetDip, 1060.0, 1.40, -1.0)
-                        configurePeakingEq(eqPresence, 3500.0, 1.10, 1.2 + studioPresenceAdd)
-                        configureHighShelf(eqVelvetAir, 7400.0, 2.0)
+                        subCubicDrive = 0.07f
+                        tube2fDrive = 0.055f
+                        airExciterDrive = 0.18f
+                        configurePeakingEq(eqLowWarmth, 178.0, 0.92, 1.2)
+                        configureBandPass(subWarmthBandFilter, 172.0, 1.35)
+                        configureLowPass(subOctaveLowPassFilter, 185.0, 0.7071)
+                        configurePeakingEq(eqMudCut, 365.0, 1.75, -1.8)
+                        configurePeakingEq(eqVelvetDip, 1050.0, 1.45, -1.2)
+                        configurePeakingEq(eqPresence, 3450.0, 1.05, 1.4 + studioPresenceAdd)
+                        configureBandPass(airExciterSourceBand, 3150.0, 0.90)
+                        configureHighShelf(eqVelvetAir, 7200.0, 2.2)
                         configureBandPass(aiPresenceTamer, 3500.0, 1.20)
-                        configureBandPass(sibilanceBand, 6800.0, 1.70)
+                        configureBandPass(sibilanceBand, 6700.0, 1.65)
                     }
                     else -> {
-                        subOctaveDrive = 0.08f
+                        subCubicDrive = 0.08f
                         tube2fDrive = 0.06f
-                        configurePeakingEq(eqLowWarmth, 132.0, 0.88, 2.0)
-                        configureBandPass(subWarmthBandFilter, 140.0, 1.15)
-                        configureLowPass(subOctaveLowPassFilter, 110.0, 0.7071)
-                        configurePeakingEq(eqMudCut, 350.0, 2.15, -1.2)
-                        configurePeakingEq(eqVelvetDip, 980.0, 1.40, -1.2)
-                        configurePeakingEq(eqPresence, 3200.0, 1.10, 1.2 + studioPresenceAdd)
-                        configureHighShelf(eqVelvetAir, 7000.0, 1.8)
+                        airExciterDrive = 0.17f
+                        configurePeakingEq(eqLowWarmth, 134.0, 0.90, 1.5)
+                        configureBandPass(subWarmthBandFilter, 130.0, 1.35)
+                        configureLowPass(subOctaveLowPassFilter, 145.0, 0.7071)
+                        configurePeakingEq(eqMudCut, 340.0, 1.75, -2.0)
+                        configurePeakingEq(eqVelvetDip, 980.0, 1.45, -1.4)
+                        configurePeakingEq(eqPresence, 3150.0, 1.05, 1.4 + studioPresenceAdd)
+                        configureBandPass(airExciterSourceBand, 2900.0, 0.90)
+                        configureHighShelf(eqVelvetAir, 6900.0, 2.1)
                         configureBandPass(aiPresenceTamer, 3200.0, 1.20)
-                        configureBandPass(sibilanceBand, 6300.0, 1.70)
+                        configureBandPass(sibilanceBand, 6250.0, 1.65)
                     }
                 }
             }
 
             HardwareAcousticMode.BLUETOOTH_SCO -> {
                 allowUpperAirExciter = false
-                deEssThreshold = 0.086f
+                deEssThreshold = 0.084f
+                airExciterDrive = 0.0f
                 when (gender) {
                     "MALE" -> {
-                        subOctaveDrive = 0.18f
+                        subCubicDrive = 0.15f
                         tube2fDrive = 0.10f
-                        configurePeakingEq(eqLowWarmth, 102.0, 0.82, 4.2)
-                        configureBandPass(subWarmthBandFilter, 108.0, 1.15)
-                        configureLowPass(subOctaveLowPassFilter, 90.0, 0.7071)
-                        configurePeakingEq(eqMudCut, 325.0, 2.10, -3.0)
-                        configurePeakingEq(eqVelvetDip, 900.0, 1.30, -2.6)
+                        configurePeakingEq(eqLowWarmth, 102.0, 0.84, 3.8)
+                        configureBandPass(subWarmthBandFilter, 100.0, 1.35)
+                        configureLowPass(subOctaveLowPassFilter, 118.0, 0.7071)
+                        configurePeakingEq(eqMudCut, 320.0, 1.70, -3.4)
+                        configurePeakingEq(eqVelvetDip, 900.0, 1.35, -2.6)
                         configurePeakingEq(eqPresence, 2450.0, 1.00, 2.4)
+                        configureBandPass(airExciterSourceBand, 2300.0, 0.90)
                         configureHighShelf(eqVelvetAir, 5200.0, 0.0)
                         configureBandPass(aiPresenceTamer, 2500.0, 1.20)
                         configureBandPass(sibilanceBand, 4800.0, 1.65)
                     }
                     "FEMALE" -> {
-                        subOctaveDrive = 0.10f
+                        subCubicDrive = 0.10f
                         tube2fDrive = 0.08f
-                        configurePeakingEq(eqLowWarmth, 180.0, 0.90, 2.6)
-                        configureBandPass(subWarmthBandFilter, 188.0, 1.15)
-                        configureLowPass(subOctaveLowPassFilter, 135.0, 0.7071)
-                        configurePeakingEq(eqMudCut, 365.0, 2.10, -2.6)
-                        configurePeakingEq(eqVelvetDip, 1040.0, 1.30, -2.0)
+                        configurePeakingEq(eqLowWarmth, 180.0, 0.90, 2.4)
+                        configureBandPass(subWarmthBandFilter, 176.0, 1.35)
+                        configureLowPass(subOctaveLowPassFilter, 185.0, 0.7071)
+                        configurePeakingEq(eqMudCut, 365.0, 1.70, -3.0)
+                        configurePeakingEq(eqVelvetDip, 1040.0, 1.35, -2.0)
                         configurePeakingEq(eqPresence, 2750.0, 1.00, 2.4)
+                        configureBandPass(airExciterSourceBand, 2500.0, 0.90)
                         configureHighShelf(eqVelvetAir, 5400.0, 0.0)
                         configureBandPass(aiPresenceTamer, 2750.0, 1.20)
                         configureBandPass(sibilanceBand, 5200.0, 1.65)
                     }
                     else -> {
-                        subOctaveDrive = 0.14f
-                        tube2fDrive = 0.08f
-                        configurePeakingEq(eqLowWarmth, 138.0, 0.85, 3.2)
-                        configureBandPass(subWarmthBandFilter, 144.0, 1.15)
-                        configureLowPass(subOctaveLowPassFilter, 110.0, 0.7071)
-                        configurePeakingEq(eqMudCut, 345.0, 2.10, -2.8)
-                        configurePeakingEq(eqVelvetDip, 960.0, 1.30, -2.2)
+                        subCubicDrive = 0.12f
+                        tube2fDrive = 0.09f
+                        configurePeakingEq(eqLowWarmth, 138.0, 0.86, 3.0)
+                        configureBandPass(subWarmthBandFilter, 134.0, 1.35)
+                        configureLowPass(subOctaveLowPassFilter, 148.0, 0.7071)
+                        configurePeakingEq(eqMudCut, 345.0, 1.70, -3.2)
+                        configurePeakingEq(eqVelvetDip, 960.0, 1.35, -2.2)
                         configurePeakingEq(eqPresence, 2600.0, 1.00, 2.4)
+                        configureBandPass(airExciterSourceBand, 2400.0, 0.90)
                         configureHighShelf(eqVelvetAir, 5300.0, 0.0)
                         configureBandPass(aiPresenceTamer, 2600.0, 1.20)
                         configureBandPass(sibilanceBand, 5000.0, 1.65)
@@ -530,42 +554,46 @@ class MicDspProcessor(private val sampleRate: Int = 48000) {
 
             HardwareAcousticMode.SPEAKER_AEC -> {
                 allowUpperAirExciter = true
-                deEssThreshold = 0.090f
-                subOctaveDrive = 0.10f
+                deEssThreshold = 0.088f
+                subCubicDrive = 0.09f
                 tube2fDrive = 0.06f
+                airExciterDrive = 0.14f
                 when (gender) {
                     "MALE" -> {
-                        configurePeakingEq(eqLowWarmth, 105.0, 0.85, 3.2)
-                        configureBandPass(subWarmthBandFilter, 108.0, 1.15)
-                        configureLowPass(subOctaveLowPassFilter, 90.0, 0.7071)
-                        configurePeakingEq(eqMudCut, 330.0, 2.15, -2.8)
-                        configurePeakingEq(eqVelvetDip, 920.0, 1.35, -2.2)
-                        configurePeakingEq(eqPresence, 2850.0, 1.10, 1.2)
+                        configurePeakingEq(eqLowWarmth, 105.0, 0.86, 2.8)
+                        configureBandPass(subWarmthBandFilter, 102.0, 1.35)
+                        configureLowPass(subOctaveLowPassFilter, 118.0, 0.7071)
+                        configurePeakingEq(eqMudCut, 320.0, 1.70, -3.2)
+                        configurePeakingEq(eqVelvetDip, 920.0, 1.40, -2.2)
+                        configurePeakingEq(eqPresence, 2850.0, 1.05, 1.3)
+                        configureBandPass(airExciterSourceBand, 2650.0, 0.90)
                         configureHighShelf(eqVelvetAir, 6600.0, 1.6)
                         configureBandPass(aiPresenceTamer, 2950.0, 1.20)
-                        configureBandPass(sibilanceBand, 5800.0, 1.70)
+                        configureBandPass(sibilanceBand, 5800.0, 1.65)
                     }
                     "FEMALE" -> {
-                        configurePeakingEq(eqLowWarmth, 180.0, 0.90, 2.0)
-                        configureBandPass(subWarmthBandFilter, 188.0, 1.15)
-                        configureLowPass(subOctaveLowPassFilter, 135.0, 0.7071)
-                        configurePeakingEq(eqMudCut, 375.0, 2.15, -2.8)
-                        configurePeakingEq(eqVelvetDip, 1060.0, 1.35, -2.2)
-                        configurePeakingEq(eqPresence, 3450.0, 1.10, 1.2)
-                        configureHighShelf(eqVelvetAir, 6600.0, 1.6)
+                        configurePeakingEq(eqLowWarmth, 180.0, 0.90, 1.8)
+                        configureBandPass(subWarmthBandFilter, 176.0, 1.35)
+                        configureLowPass(subOctaveLowPassFilter, 185.0, 0.7071)
+                        configurePeakingEq(eqMudCut, 365.0, 1.70, -2.8)
+                        configurePeakingEq(eqVelvetDip, 1050.0, 1.40, -2.0)
+                        configurePeakingEq(eqPresence, 3400.0, 1.05, 1.3)
+                        configureBandPass(airExciterSourceBand, 3100.0, 0.90)
+                        configureHighShelf(eqVelvetAir, 6800.0, 1.6)
                         configureBandPass(aiPresenceTamer, 3450.0, 1.20)
-                        configureBandPass(sibilanceBand, 6800.0, 1.70)
+                        configureBandPass(sibilanceBand, 6700.0, 1.65)
                     }
                     else -> {
-                        configurePeakingEq(eqLowWarmth, 140.0, 0.88, 2.4)
-                        configureBandPass(subWarmthBandFilter, 144.0, 1.15)
-                        configureLowPass(subOctaveLowPassFilter, 110.0, 0.7071)
-                        configurePeakingEq(eqMudCut, 350.0, 2.15, -2.8)
-                        configurePeakingEq(eqVelvetDip, 980.0, 1.35, -2.2)
-                        configurePeakingEq(eqPresence, 3150.0, 1.10, 1.2)
-                        configureHighShelf(eqVelvetAir, 6600.0, 1.6)
+                        configurePeakingEq(eqLowWarmth, 140.0, 0.88, 2.2)
+                        configureBandPass(subWarmthBandFilter, 136.0, 1.35)
+                        configureLowPass(subOctaveLowPassFilter, 148.0, 0.7071)
+                        configurePeakingEq(eqMudCut, 340.0, 1.70, -3.0)
+                        configurePeakingEq(eqVelvetDip, 980.0, 1.40, -2.0)
+                        configurePeakingEq(eqPresence, 3150.0, 1.05, 1.3)
+                        configureBandPass(airExciterSourceBand, 2850.0, 0.90)
+                        configureHighShelf(eqVelvetAir, 6700.0, 1.6)
                         configureBandPass(aiPresenceTamer, 3200.0, 1.20)
-                        configureBandPass(sibilanceBand, 6300.0, 1.70)
+                        configureBandPass(sibilanceBand, 6250.0, 1.65)
                     }
                 }
             }
@@ -574,6 +602,7 @@ class MicDspProcessor(private val sampleRate: Int = 48000) {
 
     fun processMonoFrameInPlace(buffer: FloatArray, count: Int) {
         if (count <= 0) return
+        val frameStartNs = System.nanoTime()
 
         val targetMute = if (streamMicMuted) 0.0f else 1.0f
         val preset = voicePreset
@@ -588,28 +617,30 @@ class MicDspProcessor(private val sampleRate: Int = 48000) {
         updateHpfIfNeeded(hpfHz, gender, hwMode)
         updateGenderAndHardwareFiltersIfNeeded(gender, hwMode, useVelvet)
 
-        // === PASS 1 (Unity 1.0x Gain): Smooth Mute + Stage 1 (64-Bit HPF) + Stage 2 (Spark/Hammer & Grip Blanker) ===
+        // === PASS 1 (Unity 1.0x Gain): Smooth Mute + Stage 1 (64-Bit HPF) + Stage 2 (Independent Vocal Body + Spark Blanker) ===
         var impulseSamplesInFrame = 0
         val closeMicMode = (hwMode == HardwareAcousticMode.WIRED_USB_CLOSE)
 
         for (i in 0 until count) {
             muteSmoothGain += 0.015f * (targetMute - muteSmoothGain)
             val rawIn = buffer[i]
-            // Unity 1.0x input (postDspGain is applied at Stage 12 so RNNoise & Slow AGC never fight Mic Boost!)
+            // Unity 1.0x input (postDspGain is applied at Stage 13 so RNNoise & Slow AGC never fight Mic Boost!)
             var s = (if (rawIn.isFinite()) rawIn else 0f) * muteSmoothGain
 
             if (!rawMode && hpfHz > 0) {
                 s = hpfFilter.process(s)
             }
 
+            // Stage 2a: Unconditional 240 Hz vocal-cord harmonic tracker (runs even when transientTamerEnabled == false!)
+            val vocalFund = abs(vocalBodyDetector.process(s))
+            vocalBodyEnv += (if (vocalFund > vocalBodyEnv) 0.10f else 0.004f) * (vocalFund - vocalBodyEnv)
+
+            // Stage 2b: Spark / Hammer & Hand-Grip Impulse Blanker
             if (useTransient) {
                 val absS = abs(s)
                 val slew = abs(s - prevRawSample)
                 prevRawSample = s
 
-                // Track 220 Hz vocal-cord fundamental vs extreme electric spark/hammer slew.
-                val vocalFund = abs(vocalBodyDetector.process(s))
-                vocalBodyEnv += (if (vocalFund > vocalBodyEnv) 0.10f else 0.004f) * (vocalFund - vocalBodyEnv)
                 slewFastEnv += (if (slew > slewFastEnv) 0.45f else 0.03f) * (slew - slewFastEnv)
                 transientFastEnv += (if (absS > transientFastEnv) 0.35f else 0.015f) * (absS - transientFastEnv)
 
@@ -735,15 +766,15 @@ class MicDspProcessor(private val sampleRate: Int = 48000) {
 
         val zcrRatio = zeroCrossings.toFloat() / count.toFloat()
         val snrRatio = preDspRms / max(noiseFloorEnv, 0.00015f)
-        val hasVocalHarmonics = vocalBodyEnv > (preDspRms * 0.16f) && zcrRatio < 0.45f
+        val hasVocalHarmonics = vocalBodyEnv > (preDspRms * 0.14f) && zcrRatio < 0.45f
         val energySpeech = (preDspRms > (0.0055f + speakerBleed * 0.004f)) &&
-            (snrRatio > (2.2f + speakerBleed * 0.8f)) &&
+            (snrRatio > (2.1f + speakerBleed * 0.8f)) &&
             hasVocalHarmonics
 
         val confirmedSpeech = (muteSmoothGain > 0.05f) && !frameHadImpulse && (
             (neuralVadProb >= vadProbFloor && preDspRms > rmsSpeechFloor) ||
                 (neuralVadProb < 0f && energySpeech) ||
-                (snrRatio > (3.2f + speakerBleed) && preDspRms > 0.0080f && hasVocalHarmonics)
+                (snrRatio > (3.0f + speakerBleed) && preDspRms > 0.0075f && hasVocalHarmonics)
             )
         lastVadProbability = if (neuralVadProb >= 0f) neuralVadProb else if (confirmedSpeech) 0.85f else 0.05f
 
@@ -773,7 +804,7 @@ class MicDspProcessor(private val sampleRate: Int = 48000) {
             1.0f
         }
 
-        // Stage 10 Zone 2: Speech-Gated Slow Broadcast AGC (operates on pre-boost unity signal so it NEVER fights Mic Boost!)
+        // Stage 11 Zone 2: Speech-Gated Slow Broadcast AGC (operates on pre-boost unity signal so it NEVER fights Mic Boost!)
         val useSlowAgc = slowAgcEnabled
         if (useSlowAgc) {
             if (confirmedSpeech && preDspRms in 0.012f..0.200f) {
@@ -787,25 +818,33 @@ class MicDspProcessor(private val sampleRate: Int = 48000) {
         }
         val currentAgcGain = slowAgcGain
 
+        // Low-End CPU Budget Auto-Bypass check
+        val ecoBypassNow = ecoBypassRemainingFrames > 0
+        if (ecoBypassRemainingFrames > 0) {
+            ecoBypassRemainingFrames--
+        }
+        cpuEcoBypassActive = ecoBypassNow
+
         val useGate = gateEnabled
-        val useEq = eqEnabled
-        val useAiTone = aiToneBalancerEnabled && (preset in setOf("SOL_LUXE", "VELVET", "STUDIO"))
+        val useEq = eqEnabled && !ecoBypassNow
+        val useVelvetChain = useVelvet && !ecoBypassNow
+        val useAiTone = aiToneBalancerEnabled && !ecoBypassNow && (preset in setOf("SOL_LUXE", "VELVET", "STUDIO"))
         val useWhisper = whisperLiftEnabled
         val useComp = compressorEnabled
-        val useDeEss = deEsserEnabled
+        val useDeEss = deEsserEnabled && !ecoBypassNow
 
         val idleGateFloor = if (speakerBleed > 0.25f) 0.12f else 0.28f
         val targetGate = if (!useGate || activeSpeech) 1.0f else if (frameHadImpulse) 0.10f else idleGateFloor
-        val targetAirMix = if (useVelvet && activeSpeech) 1.0f else 0.0f
+        val targetAirMix = if (useVelvetChain && activeSpeech) 1.0f else 0.0f
 
-        // Stage 9: AI Dynamic Vocal Tone Balancer target calculation
-        val targetAiWarmthBoost = if (useAiTone && activeSpeech && preDspRms < 0.065f) {
-            ((0.065f - preDspRms) / 0.065f).coerceIn(0.0f, 0.22f)
+        // Stage 10: AI Dynamic Vocal Tone Balancer (gentle whisper warmth + shout harshness trim, no bass double-stacking)
+        val targetAiWarmthBoost = if (useAiTone && activeSpeech && preDspRms < 0.050f) {
+            ((0.050f - preDspRms) / 0.050f).coerceIn(0.0f, 0.09f)
         } else {
             0.0f
         }
         val targetAiBiteTrim = if (useAiTone && activeSpeech && preDspRms > 0.105f) {
-            ((preDspRms - 0.105f) / 0.180f).coerceIn(0.0f, 0.32f)
+            ((preDspRms - 0.105f) / 0.175f).coerceIn(0.0f, 0.30f)
         } else {
             0.0f
         }
@@ -814,12 +853,13 @@ class MicDspProcessor(private val sampleRate: Int = 48000) {
         var minCompGainInFrame = 1.0f
         var finalPeak = 0.0f
         var finalSumSq = 0.0f
-        val curSubDrive = subOctaveDrive
+        val curSubCubicDrive = subCubicDrive
         val curTube2fDrive = tube2fDrive
+        val curAirExciterDrive = airExciterDrive
         val enableUpperExciter = allowUpperAirExciter
         val currentSibThreshold = deEssThreshold
 
-        // === PASS 3: Full 12-Stage Non-Clashing Vocal Processing Loop ===
+        // === PASS 3: Full 13-Stage Non-Clashing Vocal Processing Loop ===
         for (i in 0 until count) {
             var s = buffer[i]
 
@@ -837,67 +877,83 @@ class MicDspProcessor(private val sampleRate: Int = 48000) {
                 s *= gateGain
             }
 
-            // Stage 5 Band 1: Deep Cardioid Proximity Chest Restoration (92 / 128 / 172 Hz)
+            // Stage 5: Dynamic Hard-Breath & Blowing-Air Plosive Guard (placed BEFORE Stage 6 Proximity Boost!)
+            // Detects <115 Hz air turbulence (breathLowEnv) that lacks 240 Hz vocal-cord vibration (vocalBodyEnv)
+            // and strips out up to 82% of the low-frequency wind wave so hard exhales never boom!
+            val lowWindWave = breathRumbleFilter.process(s)
+            val absWind = abs(lowWindWave)
+            breathLowEnv += (if (absWind > breathLowEnv) 0.12f else 0.006f) * (absWind - breathLowEnv)
+            val isBreathPlosive = (breathLowEnv > 0.0055f) && (breathLowEnv > (vocalBodyEnv * 2.10f + 0.0020f))
+            val targetBreathSub = if (isBreathPlosive) {
+                val excessRatio = ((breathLowEnv - vocalBodyEnv * 2.10f) / max(breathLowEnv, 0.001f)).coerceIn(0.0f, 1.0f)
+                (0.55f + 0.30f * excessRatio).coerceIn(0.0f, 0.84f)
+            } else {
+                0.0f
+            }
+            breathSubtractSmooth += (if (targetBreathSub > breathSubtractSmooth) 0.18f else 0.025f) * (targetBreathSub - breathSubtractSmooth)
+            if (breathSubtractSmooth > 0.001f) {
+                s -= lowWindWave * breathSubtractSmooth
+            }
+
+            // Stage 6 Band 1: Tight Cardioid Proximity Chest Contour (95 / 130 / 175 Hz)
             if (useEq) {
                 s = eqLowWarmth.process(s)
             }
 
-            // Stage 6: Envelope-Gated True f0/2 Sub-Octave Synthesizer + 2f Tube Warmth
-            // Extracts isolated vocal fundamental (105 / 140 / 185 Hz) BEFORE Stage 7's mud/velvet cuts
-            val subChestBand = if (useVelvet || useAiTone || useComp) subWarmthBandFilter.process(s) else 0.0f
+            // Stage 7: Pure Analog Cubic Soft-Sine + Asymmetric Triode 2f Sub-Warmth Synthesizer
+            // (Zero square-wave flip-flop edges -> zero 180-350 Hz odd-harmonic buzz!)
+            val subChestBand = if (useVelvetChain || useAiTone || useComp) subWarmthBandFilter.process(s) else 0.0f
 
-            if (useVelvet) {
-                val subClamped = subChestBand.coerceIn(-0.85f, 0.85f)
-                val absSub = abs(subClamped)
-                subFundamentalEnv += (if (absSub > subFundamentalEnv) 0.08f else 0.008f) * (absSub - subFundamentalEnv)
+            if (useVelvetChain) {
+                val u = (subChestBand * 1.35f).coerceIn(-0.95f, 0.95f)
+                val absU = abs(u)
 
-                // Period-Doubling Zero-Crossing Flip-Flop Divider (f0 / 2 -> 55-75 Hz for Male):
-                // Minimum 160-sample (<300 Hz) period guard + hysteresis prevents any false high-frequency flips
-                if (subSamplesSinceLastCross < 4000) subSamplesSinceLastCross++
-                if (subPrevSample <= 0.0f && subClamped > 0.0006f && subSamplesSinceLastCross >= 160) {
-                    subOctaveFlipSign = -subOctaveFlipSign
-                    subSamplesSinceLastCross = 0
-                }
-                subPrevSample = subClamped
+                // Continuous Cubic Soft-Sine Shaper: y = u - (u^3)/3
+                val cubicSubWarmth = u - ((u * u * u) * 0.3333333f)
+                val smoothSubWarmth = subOctaveLowPassFilter.process(cubicSubWarmth)
 
-                val rawSubWave = subOctaveFlipSign * subFundamentalEnv
-                val cleanSubOctave = subOctaveLowPassFilter.process(rawSubWave)
-
-                // 2f Even-Order Tube Harmonics (DC-blocked)
-                val sq = subClamped * absSub + (0.45f * subClamped * subClamped)
-                velvetDcState += 0.003f * (sq - velvetDcState)
-                val clean2fTube = sq - velvetDcState
+                // Asymmetric Triode 2f Even-Order Harmonic Exciter (DC-blocked)
+                val triodeRaw = (u * absU + 0.35f * u * u) / (1.0f + absU)
+                velvetDcState += 0.003f * (triodeRaw - velvetDcState)
+                val clean2fTube = triodeRaw - velvetDcState
 
                 velvetAirMixSmooth += 0.015f * (targetAirMix - velvetAirMixSmooth)
-                val subAndTubeAddition = ((curSubDrive * cleanSubOctave) + (curTube2fDrive * clean2fTube)) * velvetAirMixSmooth
+                val subAndTubeAddition = ((curSubCubicDrive * smoothSubWarmth) + (curTube2fDrive * clean2fTube)) * velvetAirMixSmooth
                 s += subAndTubeAddition
             }
 
-            // Stage 7 Band 2 (Surgical Narrow Q=2.2 Grip Mud Cut @ 330/350/375 Hz)
-            // + Stage 7 Band 3 (NEW 920/980/1060 Hz "Sweet Velvet" Anti-Nasal Dip)
-            // + Stage 8a Band 4 (Silky Articulation Presence @ 2.85/3.15/3.45 kHz)
+            // Stage 8a Band 2 (Deeper Q=1.65 Room & Hand-Grip Boxiness Scoop @ 315/340/365 Hz)
+            // + Stage 8b Band 3 (920/980/1050 Hz "Sweet Velvet" Anti-Nasal Dip)
+            // + Stage 8c Band 4 (Silky Intimate Articulation Presence @ 2.85/3.15/3.45 kHz)
             if (useEq) {
                 s = eqMudCut.process(s)
                 s = eqVelvetDip.process(s)
                 s = eqPresence.process(s)
             }
 
-            // Stage 8b: Intimate Silk Air High-Shelf (6.6 / 6.8 / 7.2 kHz)
-            if (useVelvet) {
+            // Stage 9: Upper-Harmonic "Aphex Silk Air" Exciter + Intimate Silk Air High-Shelf (6.5 / 6.7 / 7.0 kHz)
+            // Synthesizes 5.0-10.0 kHz silky air overtones directly from the 2.2-3.8 kHz vocal core so even
+            // 16 kHz CODM hardware match locks retain full 48 kHz studio breathiness and sparkle!
+            if (useVelvetChain) {
                 val clamped = s.coerceIn(-1.2f, 1.2f)
-                val airExciter = if (enableUpperExciter) {
-                    exciterLpState += 0.38f * (clamped - exciterLpState)
-                    val highPresence = clamped - exciterLpState
-                    highPresence * (0.06f + 0.08f * abs(highPresence))
+                val airHarmonicShimmer = if (enableUpperExciter && curAirExciterDrive > 0.001f) {
+                    val vMid = airExciterSourceBand.process(clamped)
+                    val absMid = abs(vMid)
+                    // Normalized asymmetric rectifier generates clean 2nd & 3rd upper harmonics (5.0-10.0 kHz)
+                    val rectHarmonic = (vMid * absMid + 0.50f * vMid * vMid) / (0.045f + absMid)
+                    // 1st-order high-pass @ ~5.2 kHz isolates only the silky upper air shimmer
+                    airExciterHpState += 0.48f * (rectHarmonic - airExciterHpState)
+                    val pureHighShimmer = rectHarmonic - airExciterHpState
+                    pureHighShimmer * curAirExciterDrive
                 } else {
                     0.0f
                 }
-                val warmed = clamped + (airExciter * velvetAirMixSmooth)
-                val aired = eqVelvetAir.process(warmed)
-                s = warmed + velvetAirMixSmooth * (aired - warmed)
+                val shimmered = clamped + (airHarmonicShimmer * velvetAirMixSmooth)
+                val aired = eqVelvetAir.process(shimmered)
+                s = shimmered + velvetAirMixSmooth * (aired - shimmered)
             }
 
-            // Stage 9: AI Dynamic Vocal Tone Balancer (Warmth reinforcement on whispers; bite taming on shouts)
+            // Stage 10: AI Dynamic Vocal Tone Balancer (Warmth balance on quiet speech; bite taming on loud shouts)
             if (useAiTone) {
                 aiWarmthBoostSmooth += 0.008f * (targetAiWarmthBoost - aiWarmthBoostSmooth)
                 aiBiteTrimSmooth += 0.012f * (targetAiBiteTrim - aiBiteTrimSmooth)
@@ -907,7 +963,7 @@ class MicDspProcessor(private val sampleRate: Int = 48000) {
                 s += (subChestBand * aiWarmthBoostSmooth) - (presenceBand * aiBiteTrimSmooth)
             }
 
-            // Stage 10: High-Pass Sidechain 3-Zone Dynamics (Whisper Lift -> Slow AGC -> 12ms-Punch 3:1 Compressor)
+            // Stage 11: High-Pass Sidechain 3-Zone Dynamics (Whisper Lift -> Slow AGC -> 12ms-Punch 3:1 Compressor)
             // Weights detector by subtracting 55% of subChestBand so deep 55-105 Hz bass never pumps the compressor!
             val sidechainSample = abs(s - (0.55f * subChestBand))
             compEnv += (if (sidechainSample > compEnv) 0.0018f else 0.00045f) * (sidechainSample - compEnv)
@@ -934,18 +990,18 @@ class MicDspProcessor(private val sampleRate: Int = 48000) {
             compGainSmooth += 0.06f * (targetCompBlockGain - compGainSmooth)
             s *= compGainSmooth
 
-            // Stage 11: Post-Compressor Split-Band De-Esser (catches any sibilance boosted by Silk Air or Compression!)
+            // Stage 12: Post-Compressor Split-Band De-Esser (catches any sibilance boosted by Silk Air or Compression!)
             if (useDeEss) {
                 val sibSignal = sibilanceBand.process(s)
                 val absSib = abs(sibSignal)
-                deEssEnv += (if (absSib > deEssEnv) 0.14f else 0.008f) * (absSib - deEssEnv)
+                deEssEnv += (if (absSib > deEssEnv) 0.15f else 0.008f) * (absSib - deEssEnv)
                 if (deEssEnv > currentSibThreshold) {
-                    val keepRatio = (currentSibThreshold / deEssEnv).coerceIn(0.38f, 1.0f)
+                    val keepRatio = (currentSibThreshold / deEssEnv).coerceIn(0.35f, 1.0f)
                     s -= sibSignal * (1.0f - keepRatio)
                 }
             }
 
-            // Stage 12: True Post-DSP Mic Boost (50%..250%) + Soft Output Safety Ceiling
+            // Stage 13: True Post-DSP Mic Boost (50%..250%) + Soft Output Safety Ceiling
             s *= postDspGain
 
             if (abs(s) > 0.92f) {
@@ -969,6 +1025,18 @@ class MicDspProcessor(private val sampleRate: Int = 48000) {
         } else {
             0f
         }
+
+        // Low-End CPU Budget Watchdog (>4.5 ms per 10 ms frame for 6 frames triggers 3s eco EQ bypass)
+        val elapsedNs = System.nanoTime() - frameStartNs
+        if (elapsedNs > 4_500_000L) {
+            slowFrameStrikeCount++
+            if (slowFrameStrikeCount >= 6) {
+                ecoBypassRemainingFrames = 300
+                slowFrameStrikeCount = 0
+            }
+        } else if (slowFrameStrikeCount > 0) {
+            slowFrameStrikeCount--
+        }
     }
 
     companion object {
@@ -982,8 +1050,8 @@ class MicDspProcessor(private val sampleRate: Int = 48000) {
             "CLEAN" -> "CLEAN (Natural)"
             "NEURAL" -> "NEURAL (C RNNoise)"
             "STUDIO" -> "RADIO STUDIO"
-            "VELVET" -> "VELVET (Sub-Octave+Air)"
-            "SOL_LUXE" -> "SOL LUXE (Sub-Octave+Velvet)"
+            "VELVET" -> "VELVET (Silk Air+Warmth)"
+            "SOL_LUXE" -> "SOL LUXE (13-Stage Silk Studio)"
             else -> preset
         }
 
