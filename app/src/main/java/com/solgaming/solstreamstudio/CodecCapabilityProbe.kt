@@ -60,7 +60,7 @@ enum class DeviceTier(
     LITE(
         id = "LITE",
         title = "Lite",
-        badgeSummary = "Budget / Mobile-Data Safe • 720p30/1080p30 + Full 12-Stage SolLuxe™ 2.0 Voice",
+        badgeSummary = "Budget / Mobile-Data Safe • 720p30/1080p30 + Full 13-Stage SolLuxe™ 2.0 Voice",
         defaultWidth = 1920,
         defaultHeight = 1080,
         defaultFps = 30,
@@ -70,7 +70,7 @@ enum class DeviceTier(
     BALANCED(
         id = "BALANCED",
         title = "Balanced",
-        badgeSummary = "Mid-Range Smooth • 1080p60 + Full 12-Stage SolLuxe™ 2.0 Voice Studio",
+        badgeSummary = "Mid-Range Smooth • 1080p60 + Full 13-Stage SolLuxe™ 2.0 Voice Studio",
         defaultWidth = 1920,
         defaultHeight = 1080,
         defaultFps = 60,
@@ -115,7 +115,7 @@ enum class DeviceTier(
 }
 
 data class HardwareEncoderReport(
-    val codecKey: String,                 // "HEVC", "H264", "AV1"
+    val codecKey: String,                   // "HEVC", "H264", "AV1"
     val mimeType: String,
     val encoderName: String,
     val supports4k60: Boolean = false,
@@ -584,13 +584,13 @@ object CodecCapabilityProbe {
                 val battPct = (level * 100) / scale
 
                 // Detect Samsung Game Booster 'Pause USB PD charging when gaming' (Bypass Charging):
-                // When active, plugged != 0, while status is NOT_CHARGING or DISCHARGING (or current is <= ~0 mA while <98% full).
+                // When active, plugged != 0, while status is NOT_CHARGING or DISCHARGING (or current is <= ~45,000 µA while <99% full).
                 var pausePdByCurrent = false
-                if (isPlugged && battPct in 15..97) {
+                if (isPlugged && battPct in 15..98) {
                     try {
                         val bm = appCtx.getSystemService(Context.BATTERY_SERVICE) as? BatteryManager
                         val curNow = bm?.getIntProperty(BatteryManager.BATTERY_PROPERTY_CURRENT_NOW) ?: Int.MIN_VALUE
-                        if (curNow != Int.MIN_VALUE && curNow != 0 && abs(curNow) in 1..40) {
+                        if (curNow != Int.MIN_VALUE && abs(curNow) <= 45_000) {
                             pausePdByCurrent = true
                         }
                     } catch (_: Exception) {
@@ -604,7 +604,7 @@ object CodecCapabilityProbe {
                     )
 
                 powerLabel = when {
-                    isBypassPaused -> "Bypass / Pause PD Active"
+                    isBypassPaused -> "⚡ AC / Bypass PD (Est.)"
                     (plugged and BatteryManager.BATTERY_PLUGGED_AC) != 0 -> "AC Fast Power"
                     (plugged and BatteryManager.BATTERY_PLUGGED_USB) != 0 -> "USB Power"
                     (plugged and BatteryManager.BATTERY_PLUGGED_WIRELESS) != 0 -> "Wireless Power"
@@ -1029,7 +1029,7 @@ object CodecCapabilityProbe {
     }
 
     private fun checkHardwareAacPresent(): Boolean {
-        return try {
+        return runCatching {
             val infos = MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos
             infos.any { info ->
                 info.isEncoder &&
@@ -1037,9 +1037,7 @@ object CodecCapabilityProbe {
                     !info.isSoftwareOnly &&
                     info.supportedTypes.any { it.equals(MediaFormat.MIMETYPE_AUDIO_AAC, ignoreCase = true) }
             }
-        } catch (_: Exception) {
-            false
-        }
+        }.getOrDefault(false)
     }
 
     private fun loadPersistedCache(context: Context): DeviceScanSummary? {
