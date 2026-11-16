@@ -53,8 +53,8 @@ android {
         applicationId = "com.solgaming.solstreamstudio"
         minSdk = 29
         targetSdk = 36
-        versionCode = 9
-        versionName = "1.2.1"
+        versionCode = 10
+        versionName = "1.3.0"
 
         ndk {
             abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64")
@@ -105,6 +105,10 @@ android {
         release {
             isMinifyEnabled = true
             isShrinkResources = true
+            ndk {
+                // Packages lightweight symbol table into Play Store .aab for native crash reports
+                debugSymbolLevel = "SYMBOL_TABLE"
+            }
             if (hasReleaseKeystore) {
                 signingConfig = signingConfigs.getByName("release")
             } else {
