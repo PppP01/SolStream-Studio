@@ -75,7 +75,7 @@ data class StreamSettings(
     val minimapShieldEnabled: Boolean = false,    // Stream-sniper / Privacy zone blur
     val minimapShieldCorner: String = "TOP_RIGHT",// "TOP_RIGHT", "TOP_RIGHT_SMALL", "TOP_RIGHT_LARGE", "TOP_LEFT", "BOTTOM_LEFT", "BOTTOM_RIGHT", "CENTER_BOX", "KEYBOARD"
 
-    // === 12-Stage Isolated 32-Bit Float / 64-Bit Double SolLuxe™ 2.0 Voice + Stereo Game Soundstage ===
+    // === 13-Stage Isolated 32-Bit Float / 64-Bit Double SolLuxe™ 2.0 Voice + Stereo Game Soundstage ===
     val micDeviceId: Int = -1,
     val micAudioSource: Int = 0,                  // 0 = AUTO, 1 = MIC, 6 = VOICE_RECOGNITION, 7 = VOICE_COMM
     val audioBitrateKbps: Int = 256,              // 64, 96, 128, 160, 192, 256, 320 kbps
@@ -86,14 +86,14 @@ data class StreamSettings(
     val hpfCutoffHz: Int = 65,                    // 0, 50(Male), 55, 60, 65(Neutral), 70, 75, 85(Female), 95, 105, 120 Hz
     val transientTamerEnabled: Boolean = true,    // Stage 2: Spark/Hammer & Grip Blanker
     val noiseGateEnabled: Boolean = true,         // Stage 4: 0-ms Instant Vocal Gate & Breath Expander
-    val voiceEqEnabled: Boolean = true,           // Stage 5/7/8: Deep Proximity, Grip Mud Cut, 920Hz Velvet Dip & Presence
-    val deEsserEnabled: Boolean = true,           // Stage 11: Post-Compressor Split-Band Sibilance Tamer
-    val velvetWarmthEnabled: Boolean = true,      // Stage 6/8: True f0/2 Sub-Octave Synth + 2f Tube + Silk Air Shelf
-    val compressorEnabled: Boolean = true,        // Stage 10: High-Pass Sidechain 12ms-Punch 3:1 Leveler
-    val whisperLiftEnabled: Boolean = true,       // Stage 10: Upward Low-Level Callout Booster
-    val slowAgcEnabled: Boolean = true,           // Stage 10: Speech-Gated Slow Broadcast Loudness Ride
+    val voiceEqEnabled: Boolean = true,           // Stage 6/8: Deep Proximity, Grip Mud Cut, 920Hz Velvet Dip & Presence
+    val deEsserEnabled: Boolean = true,           // Stage 12: Post-Compressor Split-Band Sibilance Tamer
+    val velvetWarmthEnabled: Boolean = true,      // Stage 7/9: Cubic Analog Sub-Warmth + Aphex Silk Air Exciter & Shelf
+    val compressorEnabled: Boolean = true,        // Stage 11: High-Pass Sidechain 12ms-Punch 3:1 Leveler
+    val whisperLiftEnabled: Boolean = true,       // Stage 11: Upward Low-Level Callout Booster
+    val slowAgcEnabled: Boolean = true,           // Stage 11: Speech-Gated Slow Broadcast Loudness Ride
     val speakerAecEnabled: Boolean = false,       // Stage 0: Default OFF (Forced disabled on earphones; ON for speaker players)
-    val micGainPercent: Int = 130,                // Stage 12: True Post-DSP Mic Boost (50..250%)
+    val micGainPercent: Int = 130,                // Stage 13: True Post-DSP Mic Boost (50..250%)
     val gameGainPercent: Int = 100,               // 0..250% (Protected by 4x Cubic Look-Ahead Limiter)
     val gameCinemaWideEnabled: Boolean = false,   // Stackable Game Bus: Loudness-normalized Mid-Side 3D widener
     val gameSubPunchEnabled: Boolean = false,     // Stackable Game Bus: +3.0 dB @ 62 Hz theater sub-punch (Phase-safe voice duck)
@@ -102,7 +102,7 @@ data class StreamSettings(
     val vadDuckingPercent: Int = 0,               // 0, 10, 15, 20, 25, 30, 35, 40, 50, 60, 70%
     val micSyncDelayMs: Int = 0,                  // 0, 15, 30, 45, 60, 80, 100, 120, 150, 180, 200 ms
 
-    // === Survival, Privacy & v1.2.1 Extensions ===
+    // === Survival, Privacy & v1.3.0 Extensions ===
     val brbMuteMicToo: Boolean = true,
     val wifiLowLatencyLock: Boolean = true,
     val overlayPosition: String = "FULL",         // "FULL", "TOP_LEFT", "TOP_RIGHT", "BOTTOM_LEFT", "BOTTOM_RIGHT"
@@ -217,7 +217,7 @@ object KeystoreVault {
         }
         val swapped = primaryFullEndpoint
             .replace("a.rtmps.youtube.com", "b.rtmps.youtube.com", ignoreCase = true)
-            .replace("a.rtmp.youtube.com", "b.rtmp.youtube.com", ignoreCase = true)
+            .replace("a.rtmp.youtube.com", "b.rtmps.youtube.com", ignoreCase = true)
         return if (swapped.contains("backup=1")) {
             swapped
         } else if (swapped.contains("?")) {
@@ -646,14 +646,18 @@ object KeystoreVault {
                     Base64.NO_WRAP
                 )
                 return "$iv:$ct"
-            } catch (_: Exception) {
-                if (attempt == 0) {
+            } catch (e: Exception) {
+                // Non-destructive key recovery (#8): only delete master key on permanent keystore invalidation
+                val isPermanent = (e is KeyPermanentlyInvalidatedException) || (e is UnrecoverableKeyException)
+                if (attempt == 0 && isPermanent) {
                     try {
                         val ks = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
                         ks.deleteEntry(MASTER_KEY_ALIAS)
                         cachedSecurityLabel = null
                     } catch (_: Exception) {
                     }
+                } else {
+                    break
                 }
             }
         }
@@ -699,7 +703,28 @@ object KeystoreVault {
     fun loadSettings(context: Context): StreamSettings {
         val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         val raw = prefs.getString(KEY_SETTINGS_JSON, null) ?: return StreamSettings()
-        return importPresetJson(raw, StreamSettings()) ?: StreamSettings()
+        val imported = importPresetJson(raw, StreamSettings()) ?: StreamSettings()
+        // Snap legacy zoom values (like 104% in older builds) to the nearest valid 10-step ladder (108%)
+        val snappedZoom = snapZoomToValidStep(imported.smartZoomPercent)
+        return if (snappedZoom != imported.smartZoomPercent) {
+            imported.copy(smartZoomPercent = snappedZoom)
+        } else {
+            imported
+        }
+    }
+
+    private fun snapZoomToValidStep(zoom: Int): Int {
+        val validSteps = intArrayOf(100, 108, 115, 125, 135, 150, 175, 200, 225, 250)
+        var closest = validSteps[0]
+        var minDiff = abs(zoom - closest)
+        for (step in validSteps) {
+            val diff = abs(zoom - step)
+            if (diff < minDiff) {
+                minDiff = diff
+                closest = step
+            }
+        }
+        return closest
     }
 
     fun exportPresetJson(s: StreamSettings): String {
