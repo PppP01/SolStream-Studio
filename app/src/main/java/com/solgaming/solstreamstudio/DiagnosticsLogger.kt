@@ -110,7 +110,7 @@ object DiagnosticsLogger {
 
     @Volatile var sessionStartMs: Long = 0L
     @Volatile var activePipelineDesc: String = "Idle (Not Streaming)"
-    @Volatile var activeAudioDspDesc: String = "SolLuxe™ 2.0 13-Stage Float + Native C RNNoise"
+    @Volatile var activeAudioDspDesc: String = "SolLuxe™ 2.0 32-Bit Float + Native C RNNoise"
     @Volatile var activeSimulcastDesc: String = "Primary Only"
     @Volatile var startTempC: Float = 0f
     @Volatile var peakTempC: Float = 0f
@@ -200,6 +200,10 @@ object DiagnosticsLogger {
         }
     }
 
+    /**
+     * Snapshots the live active microphone status right BEFORE cleanupResources() stops the audio
+     * engine so the final Session Report header always shows the true active mic status instead of "MIC STOPPED".
+     */
     @Synchronized
     fun lockFinalMicStatusBeforeStop() {
         val current = micStatusLabel.trim()
@@ -584,7 +588,7 @@ object DiagnosticsLogger {
 
         val sb = StringBuilder()
         sb.appendLine("=== SOLSTREAM STUDIO ULTRA v1.3.0 (SolApex™ HyperStream Engine) — AUTOMATIC SESSION REPORT ===")
-        sb.appendLine("Engine Architecture: SolApex™ HyperStream (Video: SolCore Ultra | Audio: SolLuxe 2.0 13-Stage | Broadcast: SolRelay Omega | Silicon: SolCodec)")
+        sb.appendLine("Engine Architecture: SolApex™ HyperStream (Video: SolCore Ultra | Audio: SolLuxe 2.0 | Broadcast: SolRelay Omega | Silicon: SolCodec)")
         sb.appendLine("Privacy Guarantee: Stream keys, notifications, and voice audio are NEVER included.")
         sb.appendLine(
             "Device: ${scan.friendlyHardwareLine()} | RAM: ${scan.totalRamGb}GB | Display: ${scan.maxDisplayHz}Hz | GL: ${scan.maxGlEsVersion}"
