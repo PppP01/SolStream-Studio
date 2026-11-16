@@ -34,7 +34,6 @@ import android.os.Handler
 import android.os.Looper
 import android.os.PerformanceHintManager
 import android.os.Process
-import android.os.SystemClock
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
@@ -121,6 +120,8 @@ class SolDualAudioEngine(private val context: Context) {
     private var activeHwNsEnabled: Boolean = false
     private var activeSpeakerAecEnabled: Boolean = false
     @Volatile private var pendingMicRouteRefresh = false
+    @Volatile private var deferredReleaseOnWorkerExit = false
+    private val cleanupLock = Any()
 
     private var micRecord: AudioRecord? = null
     private var gameRecord: AudioRecord? = null
@@ -131,12 +132,11 @@ class SolDualAudioEngine(private val context: Context) {
     private var drainThread: Thread? = null
     private var audioDeviceCallback: AudioDeviceCallback? = null
 
-    // State deduplication for [MIC_OK] logging & 48 kHz HAL sample-rate protection
+    // State deduplication for [MIC_OK] logging (no 60-second reopen loop on 16 kHz HAL match locks)
     private var lastLoggedMicSessionId: Int = -1
     private var lastLoggedMicRoute: String = ""
     private var lastLoggedMicSilenced: Boolean? = null
-    private var lastLoggedMicSampleRate: Int = -1
-    private var lastHalRateRelockElapsedMs: Long = 0L
+    private var didClearPreferredDeviceForHalRate: Boolean = false
 
     private var tpdfSeed: Int = 0x6D2B79F5
 
@@ -204,13 +204,12 @@ class SolDualAudioEngine(private val context: Context) {
 
     // Phase-safe 62 Hz Sub-Bass Band-Pass (+0.42f [+3.0 dB] when silent, ducks to 0.0f when speaking!)
     private val gameSubBandExtractor = StereoBiquad64().apply { configureBandPass(62.0, 0.75) }
-    // Dual-Band Footstep Focus: 250 Hz indoor boot thump (+1.6 dB) + 2,450 Hz outdoor gravel/metal crunch (+2.4 dB) + Sonar Lift
-    private val gameFootstepLowThumpFilter = StereoBiquad64().apply { configurePeaking(250.0, 1.30, 1.6) }
-    private val gameFootstepFilter = StereoBiquad64().apply { configurePeaking(2450.0, 1.00, 2.4) }
-    private val gameFootstepBandExtractor = StereoBiquad64().apply { configureBandPass(2450.0, 1.20) }
+    // Dual-Band Footstep Focus: 250 Hz indoor boot thump (+1.6 dB) + single-pass zero-phase 2,450 Hz tactical crunch + Sonar Lift
+    private val gameFootstepLowThumpFilter = StereoBiquad64().apply { configurePeaking(250.0, 1.35, 1.6) }
+    private val gameFootstepBandExtractor = StereoBiquad64().apply { configureBandPass(2450.0, 1.05) }
 
     private var sideLowPassState = 0.0f
-    private var gameBlastEnv = 0.0f
+    private var rawGameBlastEnv = 0.0f
     private var gameBlastGain = 1.0f
     private var subPunchVoiceGainSmooth = 0.0f
     private var sonarFootstepExtraLiftSmooth = 0.0f
@@ -262,11 +261,11 @@ class SolDualAudioEngine(private val context: Context) {
     ): Boolean {
         if (isRunning) return false
 
+        deferredReleaseOnWorkerExit = false
         lastLoggedMicSessionId = -1
         lastLoggedMicRoute = ""
         lastLoggedMicSilenced = null
-        lastLoggedMicSampleRate = -1
-        lastHalRateRelockElapsedMs = 0L
+        didClearPreferredDeviceForHalRate = false
 
         activeMicDeviceId = settings.micDeviceId
         activeMicAudioSource = settings.micAudioSource
@@ -384,6 +383,12 @@ class SolDualAudioEngine(private val context: Context) {
         }
     }
 
+    /**
+     * Universal 2-Pass AAC-LC Encoder Configurator:
+     * Attempt 1 configures with explicit KEY_MAX_INPUT_SIZE = 32768 and requested bitrate;
+     * Attempt 2 falls back to a bare-metal AAC-LC format (without KEY_MAX_INPUT_SIZE and clamped
+     * to <= 192 kbps) so older Android 10/11 MediaTek/Unisoc audio codecs never fail initialization.
+     */
     private fun createAndConfigureAacEncoder(bitrateBps: Int): MediaCodec? {
         val hwAacName = try {
             MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos.firstOrNull { info ->
@@ -402,29 +407,34 @@ class SolDualAudioEngine(private val context: Context) {
         }
 
         for (name in candidates) {
-            var codec: MediaCodec? = null
-            try {
-                codec = if (name.isNotBlank()) {
-                    MediaCodec.createByCodecName(name)
-                } else {
-                    MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_AUDIO_AAC)
+            for (attempt in 1..2) {
+                var codec: MediaCodec? = null
+                try {
+                    codec = if (name.isNotBlank()) {
+                        MediaCodec.createByCodecName(name)
+                    } else {
+                        MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_AUDIO_AAC)
+                    }
+                    val effectiveBps = if (attempt == 1) bitrateBps else min(bitrateBps, 192_000)
+                    val aacFormat = MediaFormat.createAudioFormat(
+                        MediaFormat.MIMETYPE_AUDIO_AAC,
+                        SAMPLE_RATE,
+                        2
+                    ).apply {
+                        setInteger(MediaFormat.KEY_AAC_PROFILE, MediaCodecInfo.CodecProfileLevel.AACObjectLC)
+                        setInteger(MediaFormat.KEY_BIT_RATE, effectiveBps)
+                        if (attempt == 1) {
+                            setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, 32768)
+                        }
+                    }
+                    codec.configure(aacFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+                    codec.start()
+                    val tag = if (name.isNotBlank()) "Hardware ($name)" else "System Default"
+                    DiagnosticsLogger.log("AUDIO_ENC", "Configured 48 kHz Stereo AAC-LC encoder at ${effectiveBps / 1000} kbps ($tag).")
+                    return codec
+                } catch (_: Exception) {
+                    try { codec?.release() } catch (_: Exception) {}
                 }
-                val aacFormat = MediaFormat.createAudioFormat(
-                    MediaFormat.MIMETYPE_AUDIO_AAC,
-                    SAMPLE_RATE,
-                    2
-                ).apply {
-                    setInteger(MediaFormat.KEY_AAC_PROFILE, MediaCodecInfo.CodecProfileLevel.AACObjectLC)
-                    setInteger(MediaFormat.KEY_BIT_RATE, bitrateBps)
-                    setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, 32768)
-                }
-                codec.configure(aacFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
-                codec.start()
-                val tag = if (name.isNotBlank()) "Hardware ($name)" else "System Default"
-                DiagnosticsLogger.log("AUDIO_ENC", "Configured 48 kHz Stereo AAC-LC encoder at ${bitrateBps / 1000} kbps ($tag).")
-                return codec
-            } catch (_: Exception) {
-                try { codec?.release() } catch (_: Exception) {}
             }
         }
         DiagnosticsLogger.log("AUDIO_ERR", "AAC audio encoder failed to initialize.")
@@ -438,8 +448,7 @@ class SolDualAudioEngine(private val context: Context) {
         pendingMicRouteRefresh = false
         unregisterDynamicAudioRouteWatcher()
 
-        // ChatGPT Audit Fix #2: Stop micRecord & gameRecord FIRST to immediately unblock any
-        // blocking AudioRecord.read() call inside mixerThread before joining or releasing resources!
+        // Stop micRecord & gameRecord FIRST to immediately unblock any blocking AudioRecord.read() call
         try { micRecord?.stop() } catch (_: Exception) {}
         try { gameRecord?.stop() } catch (_: Exception) {}
 
@@ -454,21 +463,36 @@ class SolDualAudioEngine(private val context: Context) {
             try { mixerRef?.join(600) } catch (_: Exception) {}
             try { drainRef?.join(600) } catch (_: Exception) {}
         }
+
+        val workersTerminated = (mixerRef?.isAlive != true) && (drainRef?.isAlive != true)
         mixerThread = null
         drainThread = null
 
-        releaseMicSafely()
-        releaseGameSafely()
-        micDsp.release()
-
-        val codecRef = aacCodec
-        aacCodec = null
-        if (codecRef != null) {
-            try { codecRef.stop() } catch (_: Exception) {}
-            try { codecRef.release() } catch (_: Exception) {}
+        if (workersTerminated) {
+            performFinalResourceRelease()
+        } else {
+            deferredReleaseOnWorkerExit = true
+            DiagnosticsLogger.log(
+                "AUDIO_STOP_WAIT",
+                "Audio worker still winding down after 2.1s; deferring final codec/DSP release until thread exit."
+            )
         }
         micStatusText = "MIC STOPPED"
         DiagnosticsLogger.micStatusLabel = micStatusText
+    }
+
+    private fun performFinalResourceRelease() {
+        synchronized(cleanupLock) {
+            releaseMicSafely()
+            releaseGameSafely()
+            micDsp.release()
+            val codecRef = aacCodec
+            aacCodec = null
+            if (codecRef != null) {
+                try { codecRef.stop() } catch (_: Exception) {}
+                try { codecRef.release() } catch (_: Exception) {}
+            }
+        }
     }
 
     private fun releaseMicSafely() {
@@ -538,7 +562,7 @@ class SolDualAudioEngine(private val context: Context) {
         }
     }
 
-    // === DRIFT-LOCKED STEREO GAME CIRCULAR BUFFER + 12-STAGE SOLLUXE 2.0 FLOAT MIXER ===
+    // === DRIFT-LOCKED STEREO GAME CIRCULAR BUFFER + 13-STAGE SOLLUXE 2.0 FLOAT MIXER ===
     private fun runRealtimeFloatMixLoop(
         codec: MediaCodec,
         mediaProjection: MediaProjection?,
@@ -588,10 +612,9 @@ class SolDualAudioEngine(private val context: Context) {
         // Reset all game soundstage & limiter filter states cleanly on start
         gameSubBandExtractor.reset()
         gameFootstepLowThumpFilter.reset()
-        gameFootstepFilter.reset()
         gameFootstepBandExtractor.reset()
         sideLowPassState = 0.0f
-        gameBlastEnv = 0.0f
+        rawGameBlastEnv = 0.0f
         gameBlastGain = 1.0f
         subPunchVoiceGainSmooth = 0.0f
         sonarFootstepExtraLiftSmooth = 0.0f
@@ -637,6 +660,7 @@ class SolDualAudioEngine(private val context: Context) {
 
                 if (pendingMicRouteRefresh && !inPhoneCall && isRunning) {
                     pendingMicRouteRefresh = false
+                    didClearPreferredDeviceForHalRate = false
                     releaseMicSafely()
                     if (!isRunning) break
                     val reopened = buildMicAudioRecord(
@@ -723,12 +747,12 @@ class SolDualAudioEngine(private val context: Context) {
 
                 // Feed speaker-bleed reference level for Stage 0 + Stage 4 Speaker-Bleed Gate Guard
                 micDsp.speakerBleedLevel = if (activeSpeakerAecEnabled && !gameStreamMuted) {
-                    (gameBlastEnv * 1.4f).coerceIn(0f, 1f)
+                    (rawGameBlastEnv * 1.4f).coerceIn(0f, 1f)
                 } else {
                     0f
                 }
 
-                // 2. Run 12-Stage 32-bit Float / 64-bit Double SolLuxe™ 2.0 Voice DSP + C 48kHz RNNoise on Mic ONLY
+                // 2. Run 13-Stage 32-bit Float / 64-bit Double SolLuxe™ 2.0 Voice DSP + C 48kHz RNNoise on Mic ONLY
                 micDsp.processMonoFrameInPlace(micMonoBuf, MONO_SAMPLES_PER_10MS)
 
                 // 3. Apply Bluetooth / Facecam Mic Sync Delay Ring Buffer (0 - 200 ms) with clean zeroing on change
@@ -867,10 +891,10 @@ class SolDualAudioEngine(private val context: Context) {
                 // that extra boost down to 0.0f (100% neutral un-colored game audio) when you speak!
                 val targetSubVoiceGain = if (!subOn || speechNow) 0.0f else 0.42f
 
-                // Sonar Footstep Lift: whenever Footstep Focus is ON and gunfire is quiet (gameBlastEnv < 0.14f),
-                // gently lift 2,450 Hz footsteps by an extra +1.8 dB (+0.23f), dropping to 0.0f during gunshots.
-                val targetSonarLift = if (footOn && gameBlastEnv < 0.14f) {
-                    ((0.14f - gameBlastEnv) / 0.14f).coerceIn(0.0f, 1.0f) * 0.23f
+                // Sonar Footstep Lift: uses un-scaled rawGameBlastEnv (< 0.12f) so quiet footsteps
+                // are lifted accurately regardless of whether the user's Game Mix slider is at 60% or 200%!
+                val targetSonarLift = if (footOn && rawGameBlastEnv < 0.12f) {
+                    ((0.12f - rawGameBlastEnv) / 0.12f).coerceIn(0.0f, 1.0f) * 0.25f
                 } else {
                     0.0f
                 }
@@ -881,8 +905,15 @@ class SolDualAudioEngine(private val context: Context) {
                 // 6. Mix Stereo Game + Processed Mic -> 64-Sample Look-Ahead 4x Cubic True-Peak Limiter (-1.16 dBTP)
                 for (sIdx in 0 until MONO_SAMPLES_PER_10MS) {
                     val m = delayedMono[sIdx]
-                    var gL = gameFrameBuf[sIdx * 2] * effectiveGameGain
-                    var gR = gameFrameBuf[sIdx * 2 + 1] * effectiveGameGain
+                    val rawGL = gameFrameBuf[sIdx * 2]
+                    val rawGR = gameFrameBuf[sIdx * 2 + 1]
+
+                    // Track un-scaled raw game envelope (35 ms smooth release) for slider-independent Sonar/Clutch/Blast detection
+                    val rawPeakG = max(abs(rawGL), abs(rawGR))
+                    rawGameBlastEnv += (if (rawPeakG > rawGameBlastEnv) 0.08f else 0.0006f) * (rawPeakG - rawGameBlastEnv)
+
+                    var gL = rawGL * effectiveGameGain
+                    var gR = rawGR * effectiveGameGain
 
                     val subRate = if (targetSubVoiceGain < subPunchVoiceGainSmooth) 0.015f else 0.0025f
                     subPunchVoiceGainSmooth += subRate * (targetSubVoiceGain - subPunchVoiceGainSmooth)
@@ -894,18 +925,19 @@ class SolDualAudioEngine(private val context: Context) {
                     }
 
                     if (footOn) {
-                        // Dual-Band Footstep Focus: 250 Hz indoor boot thump + 2,450 Hz outdoor gravel/metal crunch
+                        // Dual-Band Footstep Focus:
+                        // 1) 250 Hz indoor wooden/concrete boot thump (+1.6 dB)
+                        // 2) Single-pass zero-phase 2,450 Hz tactical crunch (+2.2 dB base + up to +1.6 dB Sonar Lift)
                         gL = gameFootstepLowThumpFilter.processL(gL)
                         gR = gameFootstepLowThumpFilter.processR(gR)
-                        gL = gameFootstepFilter.processL(gL)
-                        gR = gameFootstepFilter.processR(gR)
 
                         val sonarRate = if (targetSonarLift < sonarFootstepExtraLiftSmooth) 0.025f else 0.003f
                         sonarFootstepExtraLiftSmooth += sonarRate * (targetSonarLift - sonarFootstepExtraLiftSmooth)
+                        val totalCrunchLift = 0.29f + sonarFootstepExtraLiftSmooth
                         val footBandL = gameFootstepBandExtractor.processL(gL)
                         val footBandR = gameFootstepBandExtractor.processR(gR)
-                        gL += footBandL * sonarFootstepExtraLiftSmooth
-                        gR += footBandR * sonarFootstepExtraLiftSmooth
+                        gL += footBandL * totalCrunchLift
+                        gR += footBandR * totalCrunchLift
                     }
 
                     if (wideOn) {
@@ -919,14 +951,11 @@ class SolDualAudioEngine(private val context: Context) {
                         gR = mid - widenedSide
                     }
 
-                    val peakG = max(abs(gL), abs(gR))
-                    // Smooth 35 ms release (0.0006f) on gameBlastEnv so grenade bass never flutters
-                    gameBlastEnv += (if (peakG > gameBlastEnv) 0.08f else 0.0006f) * (peakG - gameBlastEnv)
-
                     if (blastOn) {
-                        val blastThresh = 0.46f
-                        val targetBlast = if (gameBlastEnv > blastThresh) {
-                            (blastThresh / gameBlastEnv).pow(0.60f).coerceIn(0.38f, 1.0f)
+                        val effectiveBlastLevel = max(rawGameBlastEnv, max(abs(gL), abs(gR)) * 0.85f)
+                        val blastThresh = 0.42f
+                        val targetBlast = if (effectiveBlastLevel > blastThresh) {
+                            (blastThresh / effectiveBlastLevel).pow(0.60f).coerceIn(0.38f, 1.0f)
                         } else {
                             1.0f
                         }
@@ -972,7 +1001,7 @@ class SolDualAudioEngine(private val context: Context) {
 
                 // AI Auto-Clutch Highlight Detector (#34): gated strictly to LIVE scene & unmuted game audio
                 if (streamSceneIsLive && !gameStreamMuted && !micDsp.streamMicMuted &&
-                    gameBlastEnv > 0.30f && micDsp.excitedCalloutActive
+                    rawGameBlastEnv > 0.26f && micDsp.excitedCalloutActive
                 ) {
                     consecutiveClutchFrames++
                     if (consecutiveClutchFrames == 35) {
@@ -1039,6 +1068,9 @@ class SolDualAudioEngine(private val context: Context) {
         } finally {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
                 try { adpfSession?.close() } catch (_: Throwable) {}
+            }
+            if (deferredReleaseOnWorkerExit) {
+                performFinalResourceRelease()
             }
         }
     }
@@ -1176,36 +1208,34 @@ class SolDualAudioEngine(private val context: Context) {
                     val isSilenced = cfg.isClientSilenced
                     val sessId = rec.audioSessionId
                     val actualFmt = cfg.format
+                    val clientFmt = cfg.clientFormat
                     val halRate = actualFmt.sampleRate
+                    val clientRate = clientFmt.sampleRate
 
-                    // Report #2B Fix: If Android's audio HAL down-clocked our Built-in Studio Mic below 48 kHz
-                    // (e.g., to 16000 Hz when switching into CODM's voice chat), release any direct device pin
-                    // so VOICE_RECOGNITION uses Android's 48 kHz Default Routing wideband mixer, or refresh once per 60s.
+                    // If Android's audio HAL temporarily shares the physical mic at 16 kHz during a CODM match,
+                    // release any direct device pin once (without tearing down or reopening AudioRecord!)
+                    // while Stage 9's Aphex Silk Air Exciter restores full 48 kHz studio shimmer.
                     val isBuiltInOrWired = routedDev == null || (
                         routedDev.type != AudioDeviceInfo.TYPE_BLUETOOTH_SCO &&
                             routedDev.type != AudioDeviceInfo.TYPE_BLE_HEADSET
                         )
-                    if (!isSilenced && isBuiltInOrWired && halRate in 8000..32000) {
-                        val nowElapsed = SystemClock.elapsedRealtime()
+                    if (!isSilenced && isBuiltInOrWired && halRate in 8000..32000 && !didClearPreferredDeviceForHalRate) {
+                        didClearPreferredDeviceForHalRate = true
                         if (activeMicDeviceId == -1 && routedDev?.type == AudioDeviceInfo.TYPE_BUILTIN_MIC) {
                             try { rec.setPreferredDevice(null) } catch (_: Exception) {}
                         }
-                        if (nowElapsed - lastHalRateRelockElapsedMs >= 60_000L) {
-                            lastHalRateRelockElapsedMs = nowElapsed
-                            pendingMicRouteRefresh = true
-                        }
+                    } else if (halRate >= 44100) {
+                        didClearPreferredDeviceForHalRate = false
                     }
 
                     val stateChanged = forceLog ||
                         sessId != lastLoggedMicSessionId ||
                         routedMicLabel != lastLoggedMicRoute ||
-                        isSilenced != lastLoggedMicSilenced ||
-                        halRate != lastLoggedMicSampleRate
+                        isSilenced != lastLoggedMicSilenced
 
                     lastLoggedMicSessionId = sessId
                     lastLoggedMicRoute = routedMicLabel
                     lastLoggedMicSilenced = isSilenced
-                    lastLoggedMicSampleRate = halRate
 
                     if (isSilenced) {
                         micStatusText = "MIC SILENCED BY OS"
@@ -1217,7 +1247,7 @@ class SolDualAudioEngine(private val context: Context) {
                             DiagnosticsLogger.log(
                                 "MIC_OK",
                                 "Stream microphone active on $routedMicLabel (${activeAcousticModeLabel}).",
-                                "session=$sessId fmt=${halRate}Hz/${actualFmt.channelCount}ch"
+                                "session=$sessId client=${clientRate}Hz hal=${halRate}Hz/${actualFmt.channelCount}ch"
                             )
                         }
                     }
@@ -1309,6 +1339,10 @@ class SolDualAudioEngine(private val context: Context) {
         } catch (e: Exception) {
             if (isRunning) {
                 DiagnosticsLogger.log("AUDIO_DRAIN_WARN", "AAC drain loop exited (${e.javaClass.simpleName}).")
+            }
+        } finally {
+            if (deferredReleaseOnWorkerExit) {
+                performFinalResourceRelease()
             }
         }
     }
@@ -1613,7 +1647,7 @@ class SolDualAudioEngine(private val context: Context) {
                                 routed.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO ||
                                     routed.type == AudioDeviceInfo.TYPE_BLE_HEADSET
                                 )
-                            if (shouldPinDeviceUpfront || ( !isExplicitBluetoothMic && routedToBtCallMic )) {
+                            if (shouldPinDeviceUpfront || (!isExplicitBluetoothMic && routedToBtCallMic)) {
                                 try {
                                     created.setPreferredDevice(targetDevice)
                                 } catch (_: Exception) {
