@@ -461,7 +461,7 @@ class SolStreamUnitTests {
             dsp.processMonoFrameInPlace(copy, copy.size)
         }
 
-        // Simulate 4 rapid electric mosquito-racket spark strikes ("phat-phat-phat") without 240 Hz vocal body
+        // Simulate 4 rapid electric mosquito-racket spark strikes ("phat-phat-phat") without 250 Hz vocal body
         for (strike in 1..4) {
             val sparkFrame = FloatArray(480) { 0.001f }
             sparkFrame[40] = 0.95f
@@ -494,7 +494,7 @@ class SolStreamUnitTests {
                 val speech = FloatArray(480) { idx ->
                     val t = idx.toDouble() / 48000.0
                     (0.12 * sin(2.0 * PI * fundHz * t) +
-                        0.06 * sin(2.0 * PI * (fundHz * 2.0) * t) +
+                        0.07 * sin(2.0 * PI * 260.0 * t) +
                         0.04 * sin(2.0 * PI * 3200.0 * t)).toFloat()
                 }
                 dsp.processMonoFrameInPlace(speech, speech.size)
@@ -537,7 +537,7 @@ class SolStreamUnitTests {
                 val frameA = FloatArray(480) { idx ->
                     val t = idx.toDouble() / 48000.0
                     (0.10 * sin(2.0 * PI * 115.0 * t) +
-                        0.06 * sin(2.0 * PI * 230.0 * t) +
+                        0.07 * sin(2.0 * PI * 255.0 * t) +
                         0.04 * sin(2.0 * PI * 2800.0 * t)).toFloat()
                 }
                 val frameB = frameA.clone()
@@ -598,7 +598,7 @@ class SolStreamUnitTests {
         val maxSilentOut = silentFrame.maxOf { abs(it) }
         assertTrue("Cubic analog sub-warmth synth must output 0.0 during silence, was $maxSilentOut", maxSilentOut < 1e-6f)
 
-        // 2. Compare 98 Hz male baritone fundamental + 225 Hz vowel harmonic enrichment against dry CLEAN mode
+        // 2. Compare 98 Hz male baritone fundamental + 245 Hz vowel harmonic enrichment against dry CLEAN mode
         val dspDry = MicDspProcessor(48000)
         dspDry.applyHardwareAcousticMode(HardwareAcousticMode.PHONE_STUDIO)
         dspDry.applySettings(
@@ -621,7 +621,7 @@ class SolStreamUnitTests {
             val fLuxe = FloatArray(480) { i ->
                 val sampleIdx = frameIdx * 480 + i
                 val t = sampleIdx.toDouble() / 48000.0
-                (0.12 * sin(2.0 * PI * 98.0 * t) + 0.065 * sin(2.0 * PI * 225.0 * t)).toFloat()
+                (0.12 * sin(2.0 * PI * 98.0 * t) + 0.065 * sin(2.0 * PI * 245.0 * t)).toFloat()
             }
             val fDry = fLuxe.clone()
             dspLuxe.processMonoFrameInPlace(fLuxe, fLuxe.size)
@@ -651,6 +651,7 @@ class SolStreamUnitTests {
                 voiceGenderProfile = "MALE",
                 voicePreset = "CLEAN",
                 hpfCutoffHz = 50,
+                transientTamerEnabled = false,
                 noiseSuppressMode = "OFF",
                 rnnoiseLevel = 0,
                 noiseGateEnabled = false,
@@ -663,7 +664,7 @@ class SolStreamUnitTests {
             )
         )
 
-        // Feed a pure 75 Hz non-vocal wind/breath blast (zero 240 Hz vocal cord overtones)
+        // Feed a pure 75 Hz non-vocal wind/breath blast (zero 250 Hz vocal cord overtones)
         var rawRms = 0f
         var guardedRms = 0f
         repeat(8) { frameIdx ->
@@ -702,7 +703,7 @@ class SolStreamUnitTests {
                 val sampleIdx = frameIdx * 480 + i
                 val t = sampleIdx.toDouble() / 48000.0
                 (0.11 * sin(2.0 * PI * 115.0 * t) +
-                    0.07 * sin(2.0 * PI * 235.0 * t) +
+                    0.07 * sin(2.0 * PI * 250.0 * t) +
                     0.03 * sin(2.0 * PI * 2900.0 * t)).toFloat()
             }
             dsp.processMonoFrameInPlace(speech, speech.size)
@@ -719,10 +720,16 @@ class SolStreamUnitTests {
             StreamSettings(
                 voiceGenderProfile = "FEMALE",
                 voicePreset = "SOL_LUXE",
-                voiceEqEnabled = true,
+                hpfCutoffHz = 0,
+                transientTamerEnabled = false,
+                noiseSuppressMode = "OFF",
+                rnnoiseLevel = 0,
+                noiseGateEnabled = false,
+                voiceEqEnabled = false,
                 velvetWarmthEnabled = false,
                 deEsserEnabled = false,
                 compressorEnabled = false,
+                whisperLiftEnabled = false,
                 slowAgcEnabled = false,
                 micGainPercent = 100
             )
@@ -734,10 +741,16 @@ class SolStreamUnitTests {
             StreamSettings(
                 voiceGenderProfile = "FEMALE",
                 voicePreset = "SOL_LUXE",
-                voiceEqEnabled = true,
+                hpfCutoffHz = 0,
+                transientTamerEnabled = false,
+                noiseSuppressMode = "OFF",
+                rnnoiseLevel = 0,
+                noiseGateEnabled = false,
+                voiceEqEnabled = false,
                 velvetWarmthEnabled = true,
                 deEsserEnabled = false,
                 compressorEnabled = false,
+                whisperLiftEnabled = false,
                 slowAgcEnabled = false,
                 micGainPercent = 100
             )
@@ -749,7 +762,9 @@ class SolStreamUnitTests {
             val frameA = FloatArray(480) { i ->
                 val sampleIdx = frameIdx * 480 + i
                 val t = sampleIdx.toDouble() / 48000.0
-                (0.10 * sin(2.0 * PI * 210.0 * t) + 0.08 * sin(2.0 * PI * 3100.0 * t)).toFloat()
+                (0.14 * sin(2.0 * PI * 250.0 * t) +
+                    0.07 * sin(2.0 * PI * 3100.0 * t) +
+                    0.04 * sin(2.0 * PI * 7200.0 * t)).toFloat()
             }
             val frameB = frameA.clone()
             dspNoAir.processMonoFrameInPlace(frameA, frameA.size)
@@ -765,8 +780,8 @@ class SolStreamUnitTests {
             slewSilkAir = sB
         }
         assertTrue(
-            "Aphex Silk Air Exciter ($slewSilkAir) must add upper-harmonic air shimmer over non-velvet mode ($slewNoAir)",
-            slewSilkAir > slewNoAir * 1.03f
+            "Aphex Silk Air Exciter & Shelf ($slewSilkAir) must enrich high-frequency air over non-velvet mode ($slewNoAir)",
+            slewSilkAir > slewNoAir * 1.10f
         )
     }
 
