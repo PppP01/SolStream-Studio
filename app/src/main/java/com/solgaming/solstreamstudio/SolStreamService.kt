@@ -38,6 +38,7 @@ import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.os.PowerManager
+import android.os.Process
 import android.os.SystemClock
 import android.provider.Settings
 import android.text.TextUtils
@@ -63,6 +64,7 @@ import java.net.Socket
 import java.nio.ByteBuffer
 import java.util.Locale
 import java.util.concurrent.ArrayBlockingQueue
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.ThreadFactory
@@ -79,30 +81,28 @@ import kotlin.math.roundToInt
 class SolStreamService : AccessibilityService(), ConnectChecker {
 
     private val mainHandler = Handler(Looper.getMainLooper())
-    private val netExecutor = Executors.newSingleThreadExecutor { r ->
-        Thread(r, "SolRtmpNetWorker").apply { isDaemon = true }
-    }
     private val rttProbeExecutor = Executors.newSingleThreadExecutor { r ->
         Thread(r, "SolIngestRttProbe").apply { isDaemon = true }
     }
 
     @Volatile private var rtmpClient: RtmpClient? = null
     private val auxTargets = mutableListOf<AuxRtmpTarget>()
-    private var companionTarget: AuxRtmpTarget? = null
-    private var splitEncodeSimulcastActive = false
+    @Volatile private var companionTarget: AuxRtmpTarget? = null
+    @Volatile private var splitEncodeSimulcastActive = false
 
     private var activeVideoCodecEnum: VideoCodec = VideoCodec.H265
     private var activeNegotiatedWidth: Int = 1920
     private var activeNegotiatedHeight: Int = 1080
     private var activeNegotiatedFps: Int = 60
 
-    private var videoPipeline: SolVideoPipeline? = null
-    private var audioEngine: SolDualAudioEngine? = null
-    private var mediaProjection: MediaProjection? = null
+    @Volatile private var videoPipeline: SolVideoPipeline? = null
+    @Volatile private var audioEngine: SolDualAudioEngine? = null
+    @Volatile private var mediaProjection: MediaProjection? = null
     private var wakeLock: PowerManager.WakeLock? = null
     private var wifiLock: WifiManager.WifiLock? = null
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
     @Volatile private var lastActiveNetworkHandle: Long = 0L
+    @Volatile private var activeTeardownLatch: CountDownLatch? = null
 
     private lateinit var activeSettings: StreamSettings
     private var primaryStreamUrl: String = ""
@@ -124,6 +124,14 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
     @Volatile private var lastVideoSendLatencyMs: Long = 1L
     @Volatile private var lastCallbackBitrateKbps: Int = -1
     @Volatile private var lastCallbackBitrateElapsedMs: Long = 0L
+
+    // Live App vs. Game+OS CPU & RAM Resource Split Telemetry
+    private var prevProcessCpuTimeMs: Long = 0L
+    private var prevProcessSampleWallMs: Long = 0L
+    @Volatile private var lastAppCpuPercent: Int = 4
+    @Volatile private var peakAppCpuPercent: Int = 4
+    private var appCpuSamplesSum: Long = 0L
+    private var appCpuSamplesCount: Long = 0L
 
     // Separate manual vs. automatic thermal cooldown states so manual 30FPS Cool never fights the 2s loop
     private var userManuallyOverrodeSharp = false
@@ -218,12 +226,14 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
     private var btnOvMinimapShield: TextView? = null
     private var btnOvKeyboardBlur: TextView? = null
 
-    // Tab 3 (Bitrate / Net) live buttons & telemetry readouts
+    // Tab 3 (Bitrate / Net / Resource Split) live buttons & telemetry readouts
     private var tvOvBitrateReadout: TextView? = null
     private var btnOvAbrToggle: TextView? = null
     private var btnOvThermal30Saver: TextView? = null
     private var tvOvFpsAndSocReadout: TextView? = null
     private var tvOvQueueAndRttReadout: TextView? = null
+    private var tvOvHeatSplitReadout: TextView? = null
+    private var tvOvRamSplitReadout: TextView? = null
     private var tvOvSimulcastStatus: TextView? = null
     private var btnOvStopConfirm: TextView? = null
 
@@ -284,41 +294,92 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
     }
 
     /**
-     * Bounded 90-frame send queue (DiscardOldestPolicy) with a pre-allocated reusable ByteBuffer
-     * & BufferInfo ring so Simulcast and Companion targets operate with zero per-frame GC churn.
+     * Exclusively-owned reusable packet buffer slot for AuxRtmpTarget.
+     * Polled from a lock-free pool before copying and returned in a finally block (or on queue
+     * discard) so a queued task's ByteBuffer and BufferInfo are NEVER overwritten while waiting.
+     */
+    private class PacketSlot(initialCapacity: Int) {
+        var buffer: ByteBuffer = ByteBuffer.allocateDirect(initialCapacity)
+        val info: MediaCodec.BufferInfo = MediaCodec.BufferInfo()
+
+        fun loadFrom(srcBuf: ByteBuffer, srcInfo: MediaCodec.BufferInfo) {
+            if (srcInfo.size > buffer.capacity()) {
+                buffer = ByteBuffer.allocateDirect(srcInfo.size + 32_768)
+            }
+            val dup = srcBuf.duplicate()
+            dup.position(srcInfo.offset)
+            dup.limit(srcInfo.offset + srcInfo.size)
+            buffer.clear()
+            buffer.put(dup)
+            buffer.flip()
+            info.set(0, srcInfo.size, srcInfo.presentationTimeUs, srcInfo.flags)
+        }
+    }
+
+    private interface PoolReleasableRunnable : Runnable {
+        fun releaseSlotOnDiscard()
+    }
+
+    /**
+     * Lock-free pooled Simulcast & Companion RTMP sender:
+     * - Uses exclusively leased PacketSlots (24 video + 32 audio) returned on completion or discard
+     * - Creates a fresh RtmpClient instance on reconnect so async disconnect() never races connect()
+     * - Advertises actual hardware-negotiated dimensions and frame rate
      */
     private inner class AuxRtmpTarget(
         val name: String,
         val fullUrl: String,
         val codecKey: String,
-        val sessionGen: Long
+        val sessionGen: Long,
+        @Volatile var videoWidth: Int,
+        @Volatile var videoHeight: Int,
+        @Volatile var videoFps: Int
     ) : ConnectChecker {
-        val client = RtmpClient(this)
+        @Volatile var client: RtmpClient = RtmpClient(this)
         @Volatile var connected = false
         @Volatile var stopped = false
         private val reconnecting = AtomicBoolean(false)
 
-        private val videoRingSize = 12
-        private val videoRingBuffers = Array(videoRingSize) { ByteBuffer.allocateDirect(524_288) }
-        private val videoRingInfos = Array(videoRingSize) { MediaCodec.BufferInfo() }
-        private val videoRingIdx = AtomicInteger(0)
+        @Volatile private var lastHeaderSps: ByteArray? = null
+        @Volatile private var lastHeaderPps: ByteArray? = null
+        @Volatile private var lastHeaderVps: ByteArray? = null
 
-        private val audioRingSize = 16
-        private val audioRingBuffers = Array(audioRingSize) { ByteBuffer.allocateDirect(4096) }
-        private val audioRingInfos = Array(audioRingSize) { MediaCodec.BufferInfo() }
-        private val audioRingIdx = AtomicInteger(0)
+        private val videoPoolCap = 24
+        private val audioPoolCap = 32
+        private val videoFreeSlots = ArrayBlockingQueue<PacketSlot>(videoPoolCap).apply {
+            repeat(videoPoolCap) { add(PacketSlot(393_216)) }
+        }
+        private val audioFreeSlots = ArrayBlockingQueue<PacketSlot>(audioPoolCap).apply {
+            repeat(audioPoolCap) { add(PacketSlot(4096)) }
+        }
 
         private val sendExecutor = ThreadPoolExecutor(
             1,
             1,
             0L,
             TimeUnit.MILLISECONDS,
-            ArrayBlockingQueue(90),
+            ArrayBlockingQueue(48),
             ThreadFactory { r -> Thread(r, "SolAuxRtmp-$name").apply { isDaemon = true } },
-            ThreadPoolExecutor.DiscardOldestPolicy()
+            { r, executor ->
+                if (!executor.isShutdown) {
+                    val dropped = executor.queue.poll()
+                    (dropped as? PoolReleasableRunnable)?.releaseSlotOnDiscard()
+                    if (!executor.queue.offer(r)) {
+                        (r as? PoolReleasableRunnable)?.releaseSlotOnDiscard()
+                    }
+                } else {
+                    (r as? PoolReleasableRunnable)?.releaseSlotOnDiscard()
+                }
+            }
         )
 
-        private fun executeSafely(task: () -> Unit) {
+        fun updateNegotiatedFormat(width: Int, height: Int, fps: Int, codec: String? = null) {
+            videoWidth = width
+            videoHeight = height
+            videoFps = fps
+        }
+
+        private fun executeControlSafely(task: () -> Unit) {
             if (sendExecutor.isShutdown) return
             try {
                 sendExecutor.execute(task)
@@ -328,33 +389,47 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
 
         fun startAsync() {
             stopped = false
-            executeSafely {
+            executeControlSafely {
                 if (stopped || !shouldAcceptConnectionCallback(broadcastActive, sessionGen, connectionSessionGen.get(), stopped)) {
-                    return@executeSafely
+                    return@executeControlSafely
                 }
+                val prevClient = client
                 try {
-                    client.setLogs(false)
-                    client.setCheckServerAlive(true)
-                    client.setOnlyVideo(false)
-                    RtmpTelemetryBridge.configureClientSecurityAndPings(client)
-                    try { client.resizeCache(90) } catch (_: Throwable) {}
-                    RtmpTelemetryBridge.clearCacheSafely(client)
+                    RtmpTelemetryBridge.clearCacheSafely(prevClient)
+                    prevClient.disconnect()
+                } catch (_: Exception) {
+                }
+
+                // Create a fresh RtmpClient instance so Pedro's async disconnect coroutine
+                // on the old client can never block or ignore the new connect() call!
+                val freshClient = RtmpClient(this)
+                client = freshClient
+                try {
+                    freshClient.setLogs(false)
+                    // Disable InetAddress.isReachable() host ping so ISP ICMP blocks never cause false disconnects
+                    freshClient.setCheckServerAlive(false)
+                    freshClient.setOnlyVideo(false)
+                    RtmpTelemetryBridge.configureClientSecurityAndPings(freshClient)
+                    try { freshClient.resizeCache(90) } catch (_: Throwable) {}
+                    RtmpTelemetryBridge.clearCacheSafely(freshClient)
                     val vCodec = when (codecKey) {
                         "HEVC" -> VideoCodec.H265
                         "AV1" -> VideoCodec.AV1
                         else -> VideoCodec.H264
                     }
-                    client.setVideoCodec(vCodec)
-                    val vPipe = videoPipeline
-                    if (vPipe != null) {
-                        val isPortrait = name.contains("9:16")
-                        val w = if (isPortrait) 1080 else if (splitEncodeSimulcastActive) 1920 else activeSettings.width
-                        val h = if (isPortrait) 1920 else if (splitEncodeSimulcastActive) 1080 else activeSettings.height
-                        client.setVideoResolution(w, h)
-                        client.setFps(activeSettings.fps)
+                    freshClient.setVideoCodec(vCodec)
+                    freshClient.setVideoResolution(videoWidth, videoHeight)
+                    freshClient.setFps(videoFps)
+                    freshClient.setAudioInfo(SolDualAudioEngine.SAMPLE_RATE, true)
+                    val sps = lastHeaderSps
+                    if (sps != null) {
+                        freshClient.setVideoInfo(
+                            ByteBuffer.wrap(sps),
+                            lastHeaderPps?.let { ByteBuffer.wrap(it) },
+                            lastHeaderVps?.let { ByteBuffer.wrap(it) }
+                        )
                     }
-                    client.setAudioInfo(SolDualAudioEngine.SAMPLE_RATE, true)
-                    client.connect(fullUrl)
+                    freshClient.connect(fullUrl)
                 } catch (e: Exception) {
                     DiagnosticsLogger.log("AUX_WARN", "$name connect error (${e.javaClass.simpleName}).")
                 }
@@ -362,9 +437,12 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
         }
 
         fun sendVideoHeader(sps: ByteArray, pps: ByteArray?, vps: ByteArray?) {
+            lastHeaderSps = sps
+            lastHeaderPps = pps
+            lastHeaderVps = vps
             if (!connected || stopped) return
-            executeSafely {
-                if (!connected || stopped) return@executeSafely
+            executeControlSafely {
+                if (!connected || stopped) return@executeControlSafely
                 try {
                     client.setVideoInfo(
                         ByteBuffer.wrap(sps),
@@ -377,71 +455,82 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
         }
 
         fun sendVideoBuffer(srcBuf: ByteBuffer, info: MediaCodec.BufferInfo) {
-            if (!connected || stopped || info.size <= 0) return
-            val slot = (videoRingIdx.getAndIncrement() and 0x7FFFFFFF) % videoRingSize
-            val ringBuf = synchronized(videoRingInfos[slot]) {
-                var target = videoRingBuffers[slot]
-                if (info.size > target.capacity()) {
-                    target = ByteBuffer.allocateDirect(info.size + 65536)
-                    videoRingBuffers[slot] = target
-                }
-                val dup = srcBuf.duplicate()
-                dup.position(info.offset)
-                dup.limit(info.offset + info.size)
-                target.clear()
-                target.put(dup)
-                target.flip()
-                videoRingInfos[slot].set(0, info.size, info.presentationTimeUs, info.flags)
-                target
+            if (!connected || stopped || info.size <= 0 || sendExecutor.isShutdown) return
+            val slot = videoFreeSlots.poll() ?: return
+            try {
+                slot.loadFrom(srcBuf, info)
+            } catch (_: Exception) {
+                videoFreeSlots.offer(slot)
+                return
             }
-            val slotInfo = videoRingInfos[slot]
-            executeSafely {
-                if (!connected || stopped) return@executeSafely
-                try {
-                    synchronized(slotInfo) {
-                        client.sendVideo(ringBuf.duplicate(), slotInfo)
+            val released = AtomicBoolean(false)
+            val task = object : PoolReleasableRunnable {
+                override fun releaseSlotOnDiscard() {
+                    if (released.compareAndSet(false, true)) {
+                        videoFreeSlots.offer(slot)
                     }
-                } catch (_: Exception) {
                 }
+
+                override fun run() {
+                    try {
+                        if (connected && !stopped) {
+                            client.sendVideo(slot.buffer.duplicate(), slot.info)
+                        }
+                    } catch (_: Exception) {
+                    } finally {
+                        releaseSlotOnDiscard()
+                    }
+                }
+            }
+            try {
+                sendExecutor.execute(task)
+            } catch (_: Exception) {
+                task.releaseSlotOnDiscard()
             }
         }
 
         fun sendAudioBuffer(srcBuf: ByteBuffer, info: MediaCodec.BufferInfo) {
-            if (!connected || stopped || info.size <= 0) return
-            val slot = (audioRingIdx.getAndIncrement() and 0x7FFFFFFF) % audioRingSize
-            val ringBuf = synchronized(audioRingInfos[slot]) {
-                var target = audioRingBuffers[slot]
-                if (info.size > target.capacity()) {
-                    target = ByteBuffer.allocateDirect(info.size + 2048)
-                    audioRingBuffers[slot] = target
-                }
-                val dup = srcBuf.duplicate()
-                dup.position(info.offset)
-                dup.limit(info.offset + info.size)
-                target.clear()
-                target.put(dup)
-                target.flip()
-                audioRingInfos[slot].set(0, info.size, info.presentationTimeUs, info.flags)
-                target
+            if (!connected || stopped || info.size <= 0 || sendExecutor.isShutdown) return
+            val slot = audioFreeSlots.poll() ?: return
+            try {
+                slot.loadFrom(srcBuf, info)
+            } catch (_: Exception) {
+                audioFreeSlots.offer(slot)
+                return
             }
-            val slotInfo = audioRingInfos[slot]
-            executeSafely {
-                if (!connected || stopped) return@executeSafely
-                try {
-                    synchronized(slotInfo) {
-                        client.sendAudio(ringBuf.duplicate(), slotInfo)
+            val released = AtomicBoolean(false)
+            val task = object : PoolReleasableRunnable {
+                override fun releaseSlotOnDiscard() {
+                    if (released.compareAndSet(false, true)) {
+                        audioFreeSlots.offer(slot)
                     }
-                } catch (_: Exception) {
                 }
+
+                override fun run() {
+                    try {
+                        if (connected && !stopped) {
+                            client.sendAudio(slot.buffer.duplicate(), slot.info)
+                        }
+                    } catch (_: Exception) {
+                    } finally {
+                        releaseSlotOnDiscard()
+                    }
+                }
+            }
+            try {
+                sendExecutor.execute(task)
+            } catch (_: Exception) {
+                task.releaseSlotOnDiscard()
             }
         }
 
         fun stop() {
             stopped = true
             connected = false
-            executeSafely {
-                RtmpTelemetryBridge.clearCacheSafely(client)
-                try { client.disconnect() } catch (_: Exception) {}
+            val clientToClose = client
+            executeControlSafely {
+                RtmpTelemetryBridge.clearCacheSafely(clientToClose)
+                try { clientToClose.disconnect() } catch (_: Exception) {}
             }
             try { sendExecutor.shutdown() } catch (_: Exception) {}
         }
@@ -450,15 +539,20 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
 
         override fun onConnectionSuccess() {
             if (!shouldAcceptConnectionCallback(broadcastActive, sessionGen, connectionSessionGen.get(), stopped)) {
-                executeSafely { try { client.disconnect() } catch (_: Exception) {} }
+                val stale = client
+                executeControlSafely { try { stale.disconnect() } catch (_: Exception) {} }
                 return
             }
             connected = true
             reconnecting.set(false)
-            DiagnosticsLogger.log("AUX_LIVE", "$name target connected and live.")
-            if (!name.contains("9:16") && !splitEncodeSimulcastActive) {
-                val s = cachedSps
-                if (s != null) sendVideoHeader(s, cachedPps, cachedVps)
+            DiagnosticsLogger.log("AUX_LIVE", "$name target connected and live (${videoWidth}x${videoHeight}@${videoFps}fps).")
+            val s = lastHeaderSps ?: if (!name.contains("9:16") && !splitEncodeSimulcastActive) cachedSps else null
+            if (s != null) {
+                sendVideoHeader(
+                    s,
+                    lastHeaderPps ?: cachedPps,
+                    lastHeaderVps ?: cachedVps
+                )
             }
             mainHandler.post { refreshExpandedControlsState() }
         }
@@ -476,10 +570,6 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
                 mainHandler.postDelayed({
                     reconnecting.set(false)
                     if (shouldAcceptConnectionCallback(broadcastActive, sessionGen, connectionSessionGen.get(), stopped)) {
-                        executeSafely {
-                            RtmpTelemetryBridge.clearCacheSafely(client)
-                            try { client.disconnect() } catch (_: Exception) {}
-                        }
                         startAsync()
                     }
                 }, 4000L)
@@ -547,6 +637,19 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
         }
         // START_NOT_STICKY prevents zombie service restarts with a null MediaProjection token
         return START_NOT_STICKY
+    }
+
+    /**
+     * Mandatory Android 15 / 16 / 17 (API 35+) Foreground Service timeout handler:
+     * Saves the Session Report and stops the service cleanly so Google Play Vitals never flags an ANR.
+     */
+    override fun onTimeout(startId: Int, fgsType: Int) {
+        DiagnosticsLogger.log(
+            "FGS_TIMEOUT",
+            "Android OS signaled foreground service time limit (type=$fgsType); stopping stream safely."
+        )
+        stopLiveBroadcast("Android OS Foreground Service Timeout")
+        stopSelf(startId)
     }
 
     private fun satisfyForegroundContractAndStopIfIdle(logMsg: String) {
@@ -679,13 +782,15 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
 
     /**
      * Builds a fresh, clean RtmpClient instance configured with TLS Hostname Verification,
-     * active RTMP Ping RTT tracking, negotiated video resolution/FPS/codec, and cached SPS/PPS/VPS headers.
+     * active RTMP Ping RTT tracking (with setCheckServerAlive(false) so ISP ICMP blocks never
+     * cause false disconnects), negotiated video resolution/FPS/codec, and cached SPS/PPS/VPS headers.
      */
     private fun buildConfiguredPrimaryRtmpClient(sessionGen: Long): RtmpClient {
         val cb = PrimaryRtmpCallback(sessionGen, this)
         val newClient = RtmpClient(cb)
         newClient.setLogs(false)
-        newClient.setCheckServerAlive(true)
+        // Set false so Pedro's InetAddress.isReachable() ICMP probe never causes false disconnects
+        newClient.setCheckServerAlive(false)
         newClient.setOnlyVideo(false)
         RtmpTelemetryBridge.configureClientSecurityAndPings(newClient)
         try { newClient.resizeCache(120) } catch (_: Throwable) {}
@@ -713,7 +818,7 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
         // Immediately reserve isBroadcastStartingOrLive so background hardware scans cannot overlap
         CodecCapabilityProbe.isBroadcastStartingOrLive = true
 
-        // Promote foreground service FIRST before any validation or early return
+        // Promote foreground service FIRST before any wait or validation
         val notif = buildStreamNotification("Starting SolApex™ HyperStream broadcast...")
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
@@ -730,6 +835,11 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
             DiagnosticsLogger.log("FGS_ERR", "Foreground service promotion failed (${e.javaClass.simpleName}).")
             Toast.makeText(this, "Screen capture token expired. Please tap Go Live again.", Toast.LENGTH_LONG).show()
             return
+        }
+
+        // Wait cleanly for any previous session's background hardware teardown to complete
+        activeTeardownLatch?.let { latch ->
+            try { latch.await(2500L, TimeUnit.MILLISECONDS) } catch (_: InterruptedException) {}
         }
 
         activeSettings = KeystoreVault.loadSettings(this)
@@ -751,6 +861,12 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
         lastVideoSendLatencyMs = 1L
         lastCallbackBitrateKbps = -1
         lastCallbackBitrateElapsedMs = 0L
+        prevProcessCpuTimeMs = Process.getElapsedCpuTime()
+        prevProcessSampleWallMs = SystemClock.elapsedRealtime()
+        lastAppCpuPercent = 4
+        peakAppCpuPercent = 4
+        appCpuSamplesSum = 0L
+        appCpuSamplesCount = 0L
         RtmpTelemetryBridge.resetSessionByteCounter()
 
         val builtPrimaryUrl = KeystoreVault.buildActivePrimaryEndpoint(this, activeSettings)
@@ -805,7 +921,17 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
 
         val simTargets = KeystoreVault.buildSimulcastTargets(this, activeSettings)
         for ((simName, simUrl) in simTargets) {
-            auxTargets.add(AuxRtmpTarget(simName, simUrl, "H264", mySessionGen))
+            auxTargets.add(
+                AuxRtmpTarget(
+                    name = simName,
+                    fullUrl = simUrl,
+                    codecKey = "H264",
+                    sessionGen = mySessionGen,
+                    videoWidth = activeSettings.width,
+                    videoHeight = activeSettings.height,
+                    videoFps = activeSettings.fps
+                )
+            )
             targetNames.add(simName)
         }
 
@@ -814,9 +940,27 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
         } else {
             null
         }
+        val compReport = if (compEndpoint != null) {
+            scan.hevcHardware?.takeIf {
+                it.verifiedRealEncode || it.verifiedSurfaceConfigure || it.advertisedByMetadata
+            } ?: scan.h264Hardware
+        } else {
+            scan.h264Hardware
+        }
+
         if (!compEndpoint.isNullOrBlank()) {
             val compCodec = if (scan.hevcHardware != null) "HEVC" else "H264"
-            companionTarget = AuxRtmpTarget("YT 9:16 Companion", compEndpoint, compCodec, mySessionGen)
+            val (compAlignedW, compAlignedH) = compReport?.alignDimensions(1080, 1920) ?: (1080 to 1920)
+            val compFps = if (compReport?.supports1080p60 != false && activeSettings.fps >= 60) 60 else 30
+            companionTarget = AuxRtmpTarget(
+                name = "YT 9:16 Companion",
+                fullUrl = compEndpoint,
+                codecKey = compCodec,
+                sessionGen = mySessionGen,
+                videoWidth = compAlignedW,
+                videoHeight = compAlignedH,
+                videoFps = compFps
+            )
             targetNames.add("YT 9:16 Companion")
         } else if (activeSettings.simulcastSplitEncode &&
             auxTargets.isNotEmpty() &&
@@ -829,10 +973,14 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
         }
         DiagnosticsLogger.activeSimulcastDesc = targetNames.joinToString(" + ")
 
+        // Immutable per-session target snapshots for thread-safe encoder callbacks
+        val sessionAuxList = auxTargets.toList()
+        val sessionCompTarget = companionTarget
+
         val vPipeline = SolVideoPipeline(this).apply {
             onFatalPipelineError = { errMsg ->
                 mainHandler.post {
-                    if (broadcastActive) {
+                    if (shouldAcceptConnectionCallback(broadcastActive, mySessionGen, connectionSessionGen.get())) {
                         Toast.makeText(this@SolStreamService, errMsg, Toast.LENGTH_LONG).show()
                         stopLiveBroadcast("Video hardware error")
                     }
@@ -840,12 +988,14 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
             }
             onCompanionPipelineStopped = { reason ->
                 mainHandler.post {
-                    val comp = companionTarget
-                    companionTarget = null
-                    comp?.stop()
-                    splitEncodeSimulcastActive = false
-                    DiagnosticsLogger.log("DUAL_STOP", "Secondary companion encoder stopped ($reason); Primary stream continues.")
-                    refreshExpandedControlsState()
+                    if (shouldAcceptConnectionCallback(broadcastActive, mySessionGen, connectionSessionGen.get())) {
+                        val comp = companionTarget
+                        companionTarget = null
+                        comp?.stop()
+                        splitEncodeSimulcastActive = false
+                        DiagnosticsLogger.log("DUAL_STOP", "Secondary companion encoder stopped ($reason); Primary stream continues.")
+                        refreshExpandedControlsState()
+                    }
                 }
             }
         }
@@ -853,21 +1003,21 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
         val aEngine = SolDualAudioEngine(this).apply {
             onFatalAudioError = { errMsg ->
                 mainHandler.post {
-                    if (broadcastActive) {
+                    if (shouldAcceptConnectionCallback(broadcastActive, mySessionGen, connectionSessionGen.get())) {
                         Toast.makeText(this@SolStreamService, errMsg, Toast.LENGTH_LONG).show()
                     }
                 }
             }
         }
 
-        val needSecondEncoder = (companionTarget != null) || splitEncodeSimulcastActive
+        val needSecondEncoder = (sessionCompTarget != null) || splitEncodeSimulcastActive
         val videoInfo = vPipeline.startPipeline(
             settings = activeSettings,
             mediaProjection = projection,
             originTimeNs = originNs,
             onProjectionStoppedBySystem = {
                 mainHandler.post {
-                    if (broadcastActive) {
+                    if (shouldAcceptConnectionCallback(broadcastActive, mySessionGen, connectionSessionGen.get())) {
                         needsProjectionReapproval = true
                         Toast.makeText(
                             this,
@@ -879,6 +1029,9 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
                 }
             },
             onVideoConfig = { sps, pps, vps ->
+                if (!shouldAcceptConnectionCallback(broadcastActive, mySessionGen, connectionSessionGen.get())) {
+                    return@startPipeline
+                }
                 val spsArr = copyToByteArray(sps)
                 val ppsArr = pps?.let { copyToByteArray(it) }
                 val vpsArr = vps?.let { copyToByteArray(it) }
@@ -891,12 +1044,15 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
                     vpsArr?.let { ByteBuffer.wrap(it) }
                 )
                 if (!splitEncodeSimulcastActive) {
-                    for (aux in auxTargets) {
+                    for (aux in sessionAuxList) {
                         aux.sendVideoHeader(spsArr, ppsArr, vpsArr)
                     }
                 }
             },
             onEncodedVideo = { bb, info ->
+                if (!shouldAcceptConnectionCallback(broadcastActive, mySessionGen, connectionSessionGen.get())) {
+                    return@startPipeline
+                }
                 val activeClient = this@SolStreamService.rtmpClient
                 if (rtmpConnected && activeClient != null) {
                     inFlightVideoFrames.incrementAndGet()
@@ -912,34 +1068,39 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
                         inFlightVideoBytes.addAndGet(-info.size.toLong())
                     }
                 }
-                if (auxTargets.isNotEmpty() && !splitEncodeSimulcastActive) {
-                    for (aux in auxTargets) {
+                if (sessionAuxList.isNotEmpty() && !splitEncodeSimulcastActive) {
+                    for (aux in sessionAuxList) {
                         aux.sendVideoBuffer(bb, info)
                     }
                 }
             },
             enableDualCompanion = needSecondEncoder,
             onCompanionConfig = { sps, pps, vps ->
+                if (!shouldAcceptConnectionCallback(broadcastActive, mySessionGen, connectionSessionGen.get())) {
+                    return@startPipeline
+                }
                 val spsArr = copyToByteArray(sps)
                 val ppsArr = pps?.let { copyToByteArray(it) }
                 val vpsArr = vps?.let { copyToByteArray(it) }
                 if (splitEncodeSimulcastActive) {
-                    for (aux in auxTargets) {
+                    for (aux in sessionAuxList) {
                         aux.sendVideoHeader(spsArr, ppsArr, vpsArr)
                     }
                 } else {
-                    companionTarget?.sendVideoHeader(spsArr, ppsArr, vpsArr)
+                    sessionCompTarget?.sendVideoHeader(spsArr, ppsArr, vpsArr)
                 }
             },
             onCompanionVideo = { bb, info ->
+                if (!shouldAcceptConnectionCallback(broadcastActive, mySessionGen, connectionSessionGen.get())) {
+                    return@startPipeline
+                }
                 if (splitEncodeSimulcastActive) {
-                    for (aux in auxTargets) {
+                    for (aux in sessionAuxList) {
                         aux.sendVideoBuffer(bb, info)
                     }
                 } else {
-                    val comp = companionTarget ?: return@startPipeline
-                    if (comp.connected) {
-                        comp.sendVideoBuffer(bb, info)
+                    if (sessionCompTarget != null && sessionCompTarget.connected) {
+                        sessionCompTarget.sendVideoBuffer(bb, info)
                     }
                 }
             },
@@ -975,6 +1136,22 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
         activeNegotiatedHeight = videoInfo.outHeight
         activeNegotiatedFps = videoInfo.fps
 
+        // Update auxiliary Simulcast & Companion targets with actual hardware-negotiated resolution & FPS
+        val (splitAlignedW, splitAlignedH) = (scan.h264Hardware?.alignDimensions(1920, 1080)) ?: (1920 to 1080)
+        val splitNegotiatedFps = if (scan.h264Hardware?.supports1080p60 != false && videoInfo.fps >= 60) 60 else 30
+        for (aux in sessionAuxList) {
+            if (splitEncodeSimulcastActive) {
+                aux.updateNegotiatedFormat(splitAlignedW, splitAlignedH, splitNegotiatedFps)
+            } else {
+                aux.updateNegotiatedFormat(activeNegotiatedWidth, activeNegotiatedHeight, activeNegotiatedFps)
+            }
+        }
+        if (sessionCompTarget != null) {
+            val (cW, cH) = compReport?.alignDimensions(1080, 1920) ?: (1080 to 1920)
+            val cFps = if (compReport?.supports1080p60 != false && videoInfo.fps >= 60) 60 else 30
+            sessionCompTarget.updateNegotiatedFormat(cW, cH, cFps)
+        }
+
         val initialClient = buildConfiguredPrimaryRtmpClient(mySessionGen)
         rtmpClient = initialClient
 
@@ -986,6 +1163,9 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
                 mainHandler.post { refreshExpandedControlsState() }
             },
             onEncodedAac = { aacBuf, aacInfo ->
+                if (!shouldAcceptConnectionCallback(broadcastActive, mySessionGen, connectionSessionGen.get())) {
+                    return@startStreamingAudio
+                }
                 val activeClient = this@SolStreamService.rtmpClient
                 if (rtmpConnected && activeClient != null) {
                     activeClient.sendAudio(aacBuf, aacInfo)
@@ -994,11 +1174,11 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
                 if (vPts > 0L) {
                     DiagnosticsLogger.avDriftMs = (aacInfo.presentationTimeUs - vPts) / 1000L
                 }
-                if (auxTargets.isNotEmpty() || companionTarget != null) {
-                    for (aux in auxTargets) {
+                if (sessionAuxList.isNotEmpty() || sessionCompTarget != null) {
+                    for (aux in sessionAuxList) {
                         aux.sendAudioBuffer(aacBuf, aacInfo)
                     }
-                    companionTarget?.sendAudioBuffer(aacBuf, aacInfo)
+                    sessionCompTarget?.sendAudioBuffer(aacBuf, aacInfo)
                 }
             }
         )
@@ -1044,10 +1224,12 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
         notifyDashboardStateChanged()
 
         connectRtmpAsync(primaryStreamUrl, mySessionGen, initialClient)
-        for (aux in auxTargets) {
+        for (aux in sessionAuxList) {
             aux.startAsync()
         }
-        companionTarget?.startAsync()
+        if (videoInfo.companionActive) {
+            sessionCompTarget?.startAsync()
+        }
 
         mainHandler.removeCallbacks(healthTickRunnable)
         mainHandler.postDelayed(healthTickRunnable, 2000L)
@@ -1250,6 +1432,17 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
         mainHandler.removeCallbacks(healthTickRunnable)
         unregisterMultipathNetworkHandoverWatcher()
 
+        val liveHealth = CodecCapabilityProbe.readLiveHardwareHealth(this)
+        val avgAppCpu = if (appCpuSamplesCount > 0L) (appCpuSamplesSum / appCpuSamplesCount).toInt() else lastAppCpuPercent
+        val gameOsSoC = max(0, liveHealth.socThermalLoadPercent - avgAppCpu)
+        val appRamMb = max(DiagnosticsLogger.peakTotalPssMb, DiagnosticsLogger.lastJavaHeapMb + DiagnosticsLogger.lastNativeHeapMb).coerceAtLeast(45)
+        val totalUsedGb = (liveHealth.totalRamGb.toFloat() - liveHealth.availRamGb).coerceAtLeast(0.5f)
+        val gameOsRamGb = (totalUsedGb - (appRamMb / 1024.0f)).coerceAtLeast(0.3f)
+
+        DiagnosticsLogger.log(
+            "RESOURCE_SPLIT",
+            "App vs. Game Resource Split: SolStream used ~${avgAppCpu}% CPU (Peak ${peakAppCpuPercent}%) & ${appRamMb} MB RAM | Game + Android OS used ~${gameOsSoC}% SoC & ${String.format(Locale.US, "%.1f", gameOsRamGb)} GB RAM (of ${liveHealth.totalRamGb} GB)."
+        )
         DiagnosticsLogger.log("SESSION_END", "Stream ended ($reason).")
         val snap = DiagnosticsLogger.finishAndSaveBenchmark(this, isGlipBaseline = wasBench)
         val fullReport = DiagnosticsLogger.buildShareableReport(this)
@@ -1298,21 +1491,28 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
         }
         try { compToClose?.stop() } catch (_: Exception) {}
 
+        val latch = CountDownLatch(1)
+        activeTeardownLatch = latch
+
         Thread({
-            if (clientToClose != null) {
-                RtmpTelemetryBridge.clearCacheSafely(clientToClose)
-                try { clientToClose.disconnect() } catch (_: Exception) {}
-            }
-            try { audioToClose?.stopStreamingAudio() } catch (_: Exception) {}
-            try { videoToClose?.stopPipeline() } catch (_: Exception) {}
-            try { projToClose?.stop() } catch (_: Exception) {}
             try {
-                if (wifiToRelease?.isHeld == true) wifiToRelease.release()
-            } catch (_: Exception) {
-            }
-            try {
-                if (wlToRelease?.isHeld == true) wlToRelease.release()
-            } catch (_: Exception) {
+                if (clientToClose != null) {
+                    RtmpTelemetryBridge.clearCacheSafely(clientToClose)
+                    try { clientToClose.disconnect() } catch (_: Exception) {}
+                }
+                try { audioToClose?.stopStreamingAudio() } catch (_: Exception) {}
+                try { videoToClose?.stopPipeline() } catch (_: Exception) {}
+                try { projToClose?.stop() } catch (_: Exception) {}
+                try {
+                    if (wifiToRelease?.isHeld == true) wifiToRelease.release()
+                } catch (_: Exception) {
+                }
+                try {
+                    if (wlToRelease?.isHeld == true) wlToRelease.release()
+                } catch (_: Exception) {
+                }
+            } finally {
+                latch.countDown()
             }
         }, "SolAsyncStopCleanup").apply {
             isDaemon = true
@@ -1347,6 +1547,19 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
         val (tempC, thermal) = DiagnosticsLogger.sampleDeviceHealth(this)
         val headroom = DiagnosticsLogger.lastThermalHeadroom
         val nowElapsed = SystemClock.elapsedRealtime()
+
+        // Measure per-process SolStream Studio CPU % vs. rest of phone (Game + Android OS)
+        val nowCpuMs = Process.getElapsedCpuTime()
+        val deltaCpuMs = (nowCpuMs - prevProcessCpuTimeMs).coerceAtLeast(0L)
+        val deltaWallMs = (nowElapsed - prevProcessSampleWallMs).coerceAtLeast(1L)
+        prevProcessCpuTimeMs = nowCpuMs
+        prevProcessSampleWallMs = nowElapsed
+        val cores = Runtime.getRuntime().availableProcessors().coerceAtLeast(1)
+        val measuredAppCpu = ((deltaCpuMs * 100.0f) / (deltaWallMs * cores).toFloat()).roundToInt().coerceIn(1, 100)
+        lastAppCpuPercent = measuredAppCpu
+        if (measuredAppCpu > peakAppCpuPercent) peakAppCpuPercent = measuredAppCpu
+        appCpuSamplesSum += measuredAppCpu.toLong()
+        appCpuSamplesCount++
 
         if (broadcastActive) {
             val client = rtmpClient
@@ -1579,7 +1792,7 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
                     }
                 }
 
-                // Queue-Aware Ping Guard ABR 2.0
+                // Queue-Aware Ping Guard ABR 2.0 (now using true millisecond rttMs!)
                 if (activeSettings.adaptiveBitrate && rtmpConnected && vPipe.activeSceneMode == "LIVE") {
                     val queueCongested = (qCap > 0 && qFrames > (qCap * 35) / 100) ||
                         (qFrames > 35) ||
@@ -1634,7 +1847,7 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
         videoPipeline?.keyboardBlurActive = shouldBlurBottomHalf
     }
 
-    // === 3-TAB FLOATING IN-GAME PILL (Short Closed Pill + Clean Aligned Grid Open Pill + Auto-Blur Keyboard Detector) ===
+    // === 3-TAB FLOATING IN-GAME PILL (Short Closed Pill + SolApex™ Redesigned Open Pill + Live Resource Split) ===
     @SuppressLint("ClickableViewAccessibility")
     private fun attachFloatingOverlayPill() {
         if (!isAccessibilityEnabled(this) || pillRootView != null) return
@@ -1643,17 +1856,19 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
         val d = resources.displayMetrics.density
         fun dp(v: Int): Int = (v * d).roundToInt()
         val screenMinPx = min(resources.displayMetrics.widthPixels, resources.displayMetrics.heightPixels)
-        val expandedPanelWidthPx = min(dp(336), (screenMinPx * 0.92f).roundToInt().coerceAtLeast(dp(276)))
+        val expandedPanelWidthPx = min(dp(344), (screenMinPx * 0.93f).roundToInt().coerceAtLeast(dp(280)))
 
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            background = GradientDrawable().apply {
-                setColor(Color.parseColor("#EC080E1A"))
+            background = GradientDrawable(
+                GradientDrawable.Orientation.TOP_BOTTOM,
+                intArrayOf(Color.parseColor("#F4060B16"), Color.parseColor("#F40A1324"))
+            ).apply {
                 cornerRadius = dp(16).toFloat()
-                setStroke(dp(1), Color.parseColor("#4D00E5FF"))
+                setStroke(dp(1), Color.parseColor("#7300E5FF"))
             }
             setPadding(dp(10), dp(6), dp(10), dp(6))
-            alpha = 0.94f
+            alpha = 0.95f
         }
 
         val header = LinearLayout(this).apply {
@@ -1663,7 +1878,7 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
 
         val dot = TextView(this).apply {
             text = "●"
-            setTextColor(Color.parseColor("#10B981"))
+            setTextColor(Color.parseColor("#00E5FF"))
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
             setPadding(0, 0, dp(5), 0)
         }
@@ -1687,10 +1902,10 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
         }
 
         // Top Quick-Action Bar (5 evenly aligned buttons, zero horizontal scroll)
-        btnQuickMicMute = makePillMiniBtn("Mic:ON", "#10B981") { toggleMicMuteLive() }
-        btnQuickGameMute = makePillMiniBtn("Game:ON", "#38BDF8") { toggleGameAudioMuteLive() }
-        btnQuickScene = makePillMiniBtn("Scene:LIVE", "#A78BFA") { cycleSceneLive() }
-        btnQuickMarkClip = makePillMiniBtn("★ Clip", "#F59E0B") { saveClipMarkerLive("In-Game ★ Clip") }
+        btnQuickMicMute = makePillMiniBtn("🎙️ Mic:ON", "#00E5FF") { toggleMicMuteLive() }
+        btnQuickGameMute = makePillMiniBtn("🎮 Game:ON", "#00E5FF") { toggleGameAudioMuteLive() }
+        btnQuickScene = makePillMiniBtn("🎬 LIVE", "#00E5FF") { cycleSceneLive() }
+        btnQuickMarkClip = makePillMiniBtn("★ Clip", "#38BDF8") { saveClipMarkerLive("In-Game ★ Clip") }
         val btnCollapse = makePillMiniBtn("✕", "#94A3B8") { togglePillDrawer(false) }
 
         drawer.addView(
@@ -1722,44 +1937,47 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
             orientation = LinearLayout.VERTICAL
         }
 
-        // === TAB 0: 🎙️ AUDIO STUDIO + SOUNDSTAGE (Full-Width Aligned Grid Rows, Zero Cut-Off!) ===
+        // === TAB 0: 🎙️ AUDIO STUDIO + SOUNDSTAGE (Grouped With Clean Micro-Headers) ===
         val audioPane = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             visibility = View.VISIBLE
         }
+        audioPane.addView(makePillSectionMicroHeader("SOLLUXE™ 2.0 VOICE & DENOISER"))
         btnOvGender = makePillMiniBtn("Voice:NEUTRAL", "#00E5FF") { cycleVoiceGenderLive() }
-        btnOvVoiceType = makePillMiniBtn("Type:SOL_LUXE", "#A78BFA") { cycleVoicePresetLive() }
+        btnOvVoiceType = makePillMiniBtn("Type:SOL_LUXE", "#00E5FF") { cycleVoicePresetLive() }
         audioPane.addView(makeAlignedGridRow(btnOvGender!!, btnOvVoiceType!!))
 
-        btnOvNsMode = makePillMiniBtn("NS:RNNOISE", "#10B981") { cycleNsModeLive() }
-        btnOvNsLevel = makePillMiniBtn("Lv:2 (88%)", "#10B981") { cycleRnnoiseLive() }
+        btnOvNsMode = makePillMiniBtn("NS:RNNOISE", "#00E5FF") { cycleNsModeLive() }
+        btnOvNsLevel = makePillMiniBtn("Lv:2 (88%)", "#00E5FF") { cycleRnnoiseLive() }
         btnOvHpf = makePillMiniBtn("HPF:65Hz", "#38BDF8") { cycleHpfLive() }
         audioPane.addView(makeAlignedGridRow(btnOvNsMode!!, btnOvNsLevel!!, btnOvHpf!!))
 
-        btnOvEq = makePillMiniBtn("EQ:ON", "#38BDF8") { toggleVoiceEqLive() }
-        btnOvDeEss = makePillMiniBtn("DeEss:ON", "#38BDF8") { toggleDeEsserLive() }
-        btnOvVelvet = makePillMiniBtn("Velvet:ON", "#F59E0B") { toggleVelvetLive() }
-        btnOvAgc = makePillMiniBtn("AGC:ON", "#10B981") { toggleSlowAgcLive() }
+        audioPane.addView(makePillSectionMicroHeader("STUDIO POLISH & VOLUME MIX"))
+        btnOvEq = makePillMiniBtn("EQ:ON", "#00E5FF") { toggleVoiceEqLive() }
+        btnOvDeEss = makePillMiniBtn("DeEss:ON", "#00E5FF") { toggleDeEsserLive() }
+        btnOvVelvet = makePillMiniBtn("Velvet:ON", "#00E5FF") { toggleVelvetLive() }
+        btnOvAgc = makePillMiniBtn("AGC:ON", "#00E5FF") { toggleSlowAgcLive() }
         audioPane.addView(makeAlignedGridRow(btnOvEq!!, btnOvDeEss!!, btnOvVelvet!!, btnOvAgc!!))
 
-        val btnMicDown = makePillMiniBtn("Mic −10%", "#94A3B8") { stepMicBoostLive(-10) }
-        btnOvMicGainLabel = makePillMiniBtn("Mic:130%", "#00E5FF") { stepMicBoostLive(10) }
-        val btnMicUp = makePillMiniBtn("Mic +10%", "#94A3B8") { stepMicBoostLive(10) }
+        val btnMicDown = makePillMiniBtn("Mic −10%", "#38BDF8") { stepMicBoostLive(-10) }
+        btnOvMicGainLabel = makePillMiniBtn("🎙️ Mic:130%", "#00E5FF") { stepMicBoostLive(10) }
+        val btnMicUp = makePillMiniBtn("Mic +10%", "#38BDF8") { stepMicBoostLive(10) }
         audioPane.addView(makeAlignedGridRow(btnMicDown, btnOvMicGainLabel!!, btnMicUp))
 
-        val btnGameDown = makePillMiniBtn("Game −10%", "#94A3B8") { stepGameMixLive(-10) }
-        btnOvGameGainLabel = makePillMiniBtn("Game:100%", "#38BDF8") { stepGameMixLive(10) }
-        val btnGameUp = makePillMiniBtn("Game +10%", "#94A3B8") { stepGameMixLive(10) }
+        val btnGameDown = makePillMiniBtn("Game −10%", "#38BDF8") { stepGameMixLive(-10) }
+        btnOvGameGainLabel = makePillMiniBtn("🎮 Game:100%", "#00E5FF") { stepGameMixLive(10) }
+        val btnGameUp = makePillMiniBtn("Game +10%", "#38BDF8") { stepGameMixLive(10) }
         audioPane.addView(makeAlignedGridRow(btnGameDown, btnOvGameGainLabel!!, btnGameUp))
 
-        btnOvCinemaWide = makePillMiniBtn("3DWide:OFF", "#38BDF8") { toggleGameCinemaWideLive() }
-        btnOvSubPunch = makePillMiniBtn("Sub:OFF", "#F59E0B") { toggleGameSubPunchLive() }
-        btnOvFootstep = makePillMiniBtn("Foot:OFF", "#10B981") { toggleGameFootstepLive() }
+        audioPane.addView(makePillSectionMicroHeader("3D GAME SOUNDSTAGE & MIC ROUTE"))
+        btnOvCinemaWide = makePillMiniBtn("3DWide:OFF", "#94A3B8") { toggleGameCinemaWideLive() }
+        btnOvSubPunch = makePillMiniBtn("Sub:OFF", "#94A3B8") { toggleGameSubPunchLive() }
+        btnOvFootstep = makePillMiniBtn("Foot:OFF", "#94A3B8") { toggleGameFootstepLive() }
         audioPane.addView(makeAlignedGridRow(btnOvCinemaWide!!, btnOvSubPunch!!, btnOvFootstep!!))
 
-        btnOvBlastTamer = makePillMiniBtn("Blast:OFF", "#A78BFA") { toggleGameBlastTamerLive() }
-        btnOvDucking = makePillMiniBtn("Duck:OFF", "#38BDF8") { cycleDuckingLive() }
-        btnOvMicRoute = makePillMiniBtn("Mic:Phone Studio", "#E2E8F0") { cycleMicHardwareLive() }
+        btnOvBlastTamer = makePillMiniBtn("Blast:OFF", "#94A3B8") { toggleGameBlastTamerLive() }
+        btnOvDucking = makePillMiniBtn("Duck:OFF", "#94A3B8") { cycleDuckingLive() }
+        btnOvMicRoute = makePillMiniBtn("Mic:Phone Studio", "#38BDF8") { cycleMicHardwareLive() }
         audioPane.addView(makeAlignedGridRow(btnOvBlastTamer!!, btnOvDucking!!, btnOvMicRoute!!))
 
         // === TAB 1: 🎬 VIDEO, FRAMING, OVERLAY LAYOUT & DUAL PRIVACY BLUR ===
@@ -1767,52 +1985,61 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
             orientation = LinearLayout.VERTICAL
             visibility = View.GONE
         }
-        btnOvSceneSelect = makePillMiniBtn("Scene:LIVE", "#10B981") { cycleSceneLive() }
-        btnOvFraming = makePillMiniBtn("Frame:FIT", "#00E5FF") { cycleFramingModeLive() }
+        videoPane.addView(makePillSectionMicroHeader("SOLCORE™ FRAMING & UPSCALE"))
+        btnOvSceneSelect = makePillMiniBtn("Scene:LIVE", "#00E5FF") { cycleSceneLive() }
+        btnOvFraming = makePillMiniBtn("Frame:FIT", "#38BDF8") { cycleFramingModeLive() }
         btnOvZoom = makePillMiniBtn("Zoom:108%", "#38BDF8") { cycleSmartZoomLive() }
         videoPane.addView(makeAlignedGridRow(btnOvSceneSelect!!, btnOvFraming!!, btnOvZoom!!))
 
         btnOvUpscaler = makePillMiniBtn("Scale:BICUBIC", "#38BDF8") { cycleUpscalerLive() }
-        btnOvSharpen = makePillMiniBtn("Sharp:OFF", "#38BDF8") { toggleGpuSharpenLive() }
+        btnOvSharpen = makePillMiniBtn("Sharp:OFF", "#94A3B8") { toggleGpuSharpenLive() }
         btnOvFlip180 = makePillMiniBtn("Rot:0°", "#38BDF8") { toggleLandscapeFlipLive() }
         videoPane.addView(makeAlignedGridRow(btnOvUpscaler!!, btnOvSharpen!!, btnOvFlip180!!))
 
-        btnOvFilmic = makePillMiniBtn("Filmic:OFF", "#A78BFA") { toggleCinematicFilmicLive() }
-        btnOvVivid = makePillMiniBtn("Vivid:OFF", "#F59E0B") { toggleAmoledVividLive() }
-        btnOvShadowBoost = makePillMiniBtn("Shadow+:OFF", "#10B981") { toggleShadowBoostLive() }
+        videoPane.addView(makePillSectionMicroHeader("STACKABLE GPU COLOR GRADING"))
+        btnOvFilmic = makePillMiniBtn("Filmic:OFF", "#94A3B8") { toggleCinematicFilmicLive() }
+        btnOvVivid = makePillMiniBtn("Vivid:OFF", "#94A3B8") { toggleAmoledVividLive() }
+        btnOvShadowBoost = makePillMiniBtn("Shadow+:OFF", "#94A3B8") { toggleShadowBoostLive() }
         btnOvColorTemp = makePillMiniBtn("Temp:NEUT", "#38BDF8") { cycleColorTempLive() }
         videoPane.addView(makeAlignedGridRow(btnOvFilmic!!, btnOvVivid!!, btnOvShadowBoost!!, btnOvColorTemp!!))
 
-        btnOvOverlayPng = makePillMiniBtn(".PNG:OFF", "#10B981") { toggleOverlayPngLive() }
+        videoPane.addView(makePillSectionMicroHeader("OVERLAY & DUAL PRIVACY SHIELD"))
+        btnOvOverlayPng = makePillMiniBtn(".PNG:OFF", "#94A3B8") { toggleOverlayPngLive() }
         btnOvOverlayPos = makePillMiniBtn("Logo:FULL", "#38BDF8") { cycleOverlayPositionLive() }
-        btnOvLiveBanner = makePillMiniBtn("Banner:OFF", "#F59E0B") { toggleLiveBannerLive() }
+        btnOvLiveBanner = makePillMiniBtn("Banner:OFF", "#94A3B8") { toggleLiveBannerLive() }
         videoPane.addView(makeAlignedGridRow(btnOvOverlayPng!!, btnOvOverlayPos!!, btnOvLiveBanner!!))
 
-        btnOvMinimapShield = makePillMiniBtn("MapBlur:OFF", "#A78BFA") { toggleMinimapShieldLive() }
+        btnOvMinimapShield = makePillMiniBtn("MapBlur:OFF", "#94A3B8") { toggleMinimapShieldLive() }
         btnOvKeyboardBlur = makePillMiniBtn("KeyBlur:AUTO", "#00E5FF") { toggleManualKeyboardBlurLive() }
         videoPane.addView(makeAlignedGridRow(btnOvMinimapShield!!, btnOvKeyboardBlur!!))
 
-        // === TAB 2: 📡 BITRATE / NET / LIVE TELEMETRY / STOP ===
+        // === TAB 2: 📡 BITRATE / NET / APP vs. GAME HEAT & RAM SPLIT / STOP ===
         val netPane = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             visibility = View.GONE
         }
-        val btnBitDown = makePillMiniBtn("− Mbps", "#00E5FF") { stepLiveBitrate(-1) }
-        tvOvBitrateReadout = makePillMiniBtn("20.0 Mbps", "#F8FAFC") {}
-        val btnBitUp = makePillMiniBtn("+ Mbps", "#00E5FF") { stepLiveBitrate(1) }
+        netPane.addView(makePillSectionMicroHeader("SOLRELAY™ BITRATE & THERMAL COOLER"))
+        val btnBitDown = makePillMiniBtn("− Mbps", "#38BDF8") { stepLiveBitrate(-1) }
+        tvOvBitrateReadout = makePillMiniBtn("📡 20.0 Mbps", "#00E5FF") {}
+        val btnBitUp = makePillMiniBtn("+ Mbps", "#38BDF8") { stepLiveBitrate(1) }
         netPane.addView(makeAlignedGridRow(btnBitDown, tvOvBitrateReadout!!, btnBitUp))
 
-        btnOvAbrToggle = makePillMiniBtn("ABR:ON", "#10B981") { toggleAbrLive() }
-        btnOvThermal30Saver = makePillMiniBtn("30FPS Cool:AUTO", "#10B981") { toggleThermal30FpsSaverLive() }
+        btnOvAbrToggle = makePillMiniBtn("ABR:ON", "#00E5FF") { toggleAbrLive() }
+        btnOvThermal30Saver = makePillMiniBtn("30FPS Cool:AUTO", "#00E5FF") { toggleThermal30FpsSaverLive() }
         netPane.addView(makeAlignedGridRow(btnOvAbrToggle!!, btnOvThermal30Saver!!))
 
-        tvOvFpsAndSocReadout = makePillMiniBtn("Stream: 60fps (Game: 60) • SoC: 58%", "#CBD5E1") {}
-        tvOvQueueAndRttReadout = makePillMiniBtn("Queue: 0f (1ms) • Ping: --", "#38BDF8") {}
+        netPane.addView(makePillSectionMicroHeader("LIVE STREAM & APP vs. GAME SPLIT"))
+        tvOvFpsAndSocReadout = makePillMiniBtn("🎥 Stream: 60fps (Game: 60) • SoC: 58%", "#E2E8F0") {}
+        tvOvQueueAndRttReadout = makePillMiniBtn("📡 Queue: 0f (1ms) • RTT: --", "#38BDF8") {}
+        tvOvHeatSplitReadout = makePillMiniBtn("🔥 Heat: App ~4% CPU | Game+OS ~54% SoC", "#00E5FF") {}
+        tvOvRamSplitReadout = makePillMiniBtn("💾 RAM: App 220MB | Game+OS 5.5GB (of 8GB)", "#38BDF8") {}
         netPane.addView(makeAlignedGridRow(tvOvFpsAndSocReadout!!))
         netPane.addView(makeAlignedGridRow(tvOvQueueAndRttReadout!!))
+        netPane.addView(makeAlignedGridRow(tvOvHeatSplitReadout!!))
+        netPane.addView(makeAlignedGridRow(tvOvRamSplitReadout!!))
 
         tvOvSimulcastStatus = makePillMiniBtn("Targets: Primary", "#94A3B8") {}
-        btnOvStopConfirm = makePillMiniBtn("⏹ Stop Stream", "#EF4444") { onStopButtonTappedInOverlay() }
+        btnOvStopConfirm = makePillMiniBtn("⏹ Stop Stream", "#FF1744") { onStopButtonTappedInOverlay() }
         netPane.addView(makeAlignedGridRow(tvOvSimulcastStatus!!, btnOvStopConfirm!!))
 
         tabPaneAudio = audioPane
@@ -1823,7 +2050,7 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
         panesHolder.addView(videoPane)
         panesHolder.addView(netPane)
         vScroll.addView(panesHolder)
-        drawer.addView(vScroll, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(148)))
+        drawer.addView(vScroll, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(168)))
 
         root.addView(drawer)
 
@@ -1976,6 +2203,19 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
         }
     }
 
+    private fun makePillSectionMicroHeader(title: String): TextView {
+        val d = resources.displayMetrics.density
+        fun dp(v: Int): Int = (v * d).roundToInt()
+        return TextView(this).apply {
+            text = title
+            setTextColor(Color.parseColor("#7DD3FC"))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 8.8f)
+            typeface = Typeface.DEFAULT_BOLD
+            letterSpacing = 0.06f
+            setPadding(dp(2), dp(4), dp(2), dp(1))
+        }
+    }
+
     private fun makeAlignedGridRow(vararg buttons: TextView): LinearLayout {
         val d = resources.displayMetrics.density
         fun dp(v: Int): Int = (v * d).roundToInt()
@@ -2005,10 +2245,11 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 10.5f)
             typeface = Typeface.DEFAULT_BOLD
             setPadding(dp(6), dp(5), dp(6), dp(5))
-            setTextColor(if (selected) Color.parseColor("#060B14") else Color.parseColor("#CBD5E1"))
+            setTextColor(if (selected) Color.parseColor("#040812") else Color.parseColor("#CBD5E1"))
             background = GradientDrawable().apply {
-                setColor(if (selected) Color.parseColor("#00E5FF") else Color.parseColor("#182235"))
+                setColor(if (selected) Color.parseColor("#00E5FF") else Color.parseColor("#111B2E"))
                 cornerRadius = dp(8).toFloat()
+                setStroke(1, Color.parseColor(if (selected) "#00E5FF" else "#293B56"))
             }
             setOnClickListener {
                 onClick()
@@ -2030,13 +2271,53 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
             maxLines = 1
             ellipsize = TextUtils.TruncateAt.END
             background = GradientDrawable().apply {
-                setColor(Color.parseColor("#151F30"))
+                setColor(Color.parseColor("#101929"))
                 cornerRadius = dp(8).toFloat()
-                setStroke(1, Color.parseColor("#3300E5FF"))
+                setStroke(1, Color.parseColor("#2E4361"))
             }
             setOnClickListener {
                 onClick()
                 scheduleGhostFade()
+            }
+        }
+    }
+
+    /**
+     * Unified SolApex™ Control State Styler for the Expanded Floating Pill:
+     * - ON / Active: Deep Royal Blue (#0D3652) + Electric Cyan Border (#00E5FF) + Bright White/Cyan Text
+     * - OFF / Inactive: Midnight Slate (#101929) + Subtle Slate Border (#24344D) + Cool Silver Text (#94A3B8)
+     * - Danger / Alert: Signal Red (#3B0D18) + Signal Red Border (#FF1744)
+     */
+    private fun stylePillControlBtn(
+        btn: TextView?,
+        label: String,
+        isOn: Boolean,
+        isSelector: Boolean = false,
+        isDanger: Boolean = false
+    ) {
+        if (btn == null) return
+        btn.text = label
+        val bg = btn.background as? GradientDrawable ?: GradientDrawable().also { btn.background = it }
+        when {
+            isDanger -> {
+                btn.setTextColor(Color.parseColor("#FFE4E6"))
+                bg.setColor(Color.parseColor("#3B0D18"))
+                bg.setStroke(2, Color.parseColor("#FF1744"))
+            }
+            isOn -> {
+                btn.setTextColor(Color.parseColor("#F8FAFC"))
+                bg.setColor(Color.parseColor("#0D3652"))
+                bg.setStroke(2, Color.parseColor("#00E5FF"))
+            }
+            isSelector -> {
+                btn.setTextColor(Color.parseColor("#E0F2FE"))
+                bg.setColor(Color.parseColor("#13284A"))
+                bg.setStroke(1, Color.parseColor("#38BDF8"))
+            }
+            else -> {
+                btn.setTextColor(Color.parseColor("#94A3B8"))
+                bg.setColor(Color.parseColor("#101929"))
+                bg.setStroke(1, Color.parseColor("#24344D"))
             }
         }
     }
@@ -2051,10 +2332,11 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
         for (i in tabs.indices) {
             val tv = tabs[i] ?: continue
             val sel = (i == activePillTab)
-            tv.setTextColor(if (sel) Color.parseColor("#060B14") else Color.parseColor("#CBD5E1"))
-            (tv.background as? GradientDrawable)?.setColor(
-                if (sel) Color.parseColor("#00E5FF") else Color.parseColor("#182235")
-            )
+            tv.setTextColor(if (sel) Color.parseColor("#040812") else Color.parseColor("#CBD5E1"))
+            (tv.background as? GradientDrawable)?.apply {
+                setColor(if (sel) Color.parseColor("#00E5FF") else Color.parseColor("#111B2E"))
+                setStroke(1, Color.parseColor(if (sel) "#00E5FF" else "#293B56"))
+            }
         }
     }
 
@@ -2091,7 +2373,7 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
 
     /**
      * Short Closed Pill (● 05:36 | 17.6M | 60fps | Mic:ON | 38.4°C)
-     * that never cuts off on screen, while keeping SoC %, Game FPS, and Queue (ms) inside the Open Pill!
+     * that never cuts off on screen, while keeping SoC %, Game FPS, Queue, and Heat/RAM Split inside the Open Pill!
      */
     private fun updatePillTelemetryUI() {
         val statusTv = pillStatusText ?: return
@@ -2122,8 +2404,8 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
 
         val dotColor = when {
             !rtmpConnected -> "#F59E0B"
-            DiagnosticsLogger.worstThermalState >= PowerManager.THERMAL_STATUS_SEVERE -> "#EF4444"
-            else -> "#10B981"
+            DiagnosticsLogger.worstThermalState >= PowerManager.THERMAL_STATUS_SEVERE -> "#FF1744"
+            else -> "#00E5FF"
         }
         dot.setTextColor(Color.parseColor(dotColor))
 
@@ -2146,60 +2428,94 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
         val vPipe = videoPipeline
 
         val micMuted = aEng?.micDsp?.streamMicMuted ?: false
-        btnQuickMicMute?.text = if (micMuted) "Mic:MUTE" else "Mic:ON"
-        btnQuickMicMute?.setTextColor(Color.parseColor(if (micMuted) "#EF4444" else "#10B981"))
+        stylePillControlBtn(
+            btnQuickMicMute,
+            label = if (micMuted) "🎙️ Mic:MUTE" else "🎙️ Mic:ON",
+            isOn = !micMuted,
+            isDanger = micMuted
+        )
 
         val gameMuted = aEng?.gameStreamMuted ?: false
-        btnQuickGameMute?.text = if (gameMuted) "Game:MUTE" else "Game:ON"
-        btnQuickGameMute?.setTextColor(Color.parseColor(if (gameMuted) "#EF4444" else "#38BDF8"))
+        stylePillControlBtn(
+            btnQuickGameMute,
+            label = if (gameMuted) "🎮 Game:MUTE" else "🎮 Game:ON",
+            isOn = !gameMuted,
+            isDanger = gameMuted
+        )
 
         val scene = vPipe?.activeSceneMode ?: "LIVE"
         val sceneShort = when (scene) {
-            "STARTING_SOON" -> "Scene:START"
-            "BRB" -> "Scene:BRB"
-            else -> "Scene:LIVE"
+            "STARTING_SOON" -> "🎬 START"
+            "BRB" -> "🎬 BRB"
+            else -> "🎬 LIVE"
         }
-        btnQuickScene?.text = sceneShort
-        btnQuickScene?.setTextColor(Color.parseColor(if (scene == "LIVE") "#10B981" else "#F59E0B"))
-        btnOvSceneSelect?.text = sceneShort
-        btnOvSceneSelect?.setTextColor(Color.parseColor(if (scene == "LIVE") "#10B981" else "#F59E0B"))
+        stylePillControlBtn(btnQuickScene, sceneShort, isOn = (scene == "LIVE"), isSelector = (scene != "LIVE"))
+        stylePillControlBtn(btnOvSceneSelect, "Scene:$scene", isOn = (scene == "LIVE"), isSelector = (scene != "LIVE"))
 
         val clips = DiagnosticsLogger.getClipHighlightCount()
-        btnQuickMarkClip?.text = if (clips > 0) "★ Clip($clips)" else "★ Clip"
+        stylePillControlBtn(
+            btnQuickMarkClip,
+            label = if (clips > 0) "★ Clip($clips)" else "★ Clip",
+            isOn = clips > 0,
+            isSelector = true
+        )
 
         // Tab 0 (Audio)
-        btnOvGender?.text = "Voice:${activeSettings.voiceGenderProfile}"
-        btnOvVoiceType?.text = "Type:${activeSettings.voicePreset}"
-        btnOvNsMode?.text = "NS:${activeSettings.noiseSuppressMode}"
-        btnOvNsLevel?.text = "Lv:${activeSettings.rnnoiseLevel}"
-        btnOvHpf?.text = if (activeSettings.hpfCutoffHz == 0) "HPF:OFF" else "HPF:${activeSettings.hpfCutoffHz}Hz"
-        btnOvEq?.text = if (activeSettings.voiceEqEnabled) "EQ:ON" else "EQ:OFF"
-        btnOvDeEss?.text = if (activeSettings.deEsserEnabled) "DeEss:ON" else "DeEss:OFF"
-        btnOvVelvet?.text = if (activeSettings.velvetWarmthEnabled) "Velvet:ON" else "Velvet:OFF"
-        btnOvAgc?.text = if (activeSettings.slowAgcEnabled) "AGC:ON" else "AGC:OFF"
-        btnOvMicGainLabel?.text = "Mic:${activeSettings.micGainPercent}%"
-        btnOvGameGainLabel?.text = "Game:${activeSettings.gameGainPercent}%"
-        btnOvCinemaWide?.text = if (activeSettings.gameCinemaWideEnabled) "3DWide:ON" else "3DWide:OFF"
-        btnOvSubPunch?.text = if (activeSettings.gameSubPunchEnabled) "Sub:ON" else "Sub:OFF"
-        btnOvFootstep?.text = if (activeSettings.gameFootstepFocusEnabled) "Foot:ON" else "Foot:OFF"
-        btnOvBlastTamer?.text = if (activeSettings.gameBlastTamerEnabled) "Blast:ON" else "Blast:OFF"
-        btnOvDucking?.text = if (activeSettings.vadDuckingPercent == 0) "Duck:OFF" else "Duck:-${activeSettings.vadDuckingPercent}%"
-        btnOvMicRoute?.text = "Mic:${aEng?.shortMicPillLabel ?: "Phone Studio"}"
+        stylePillControlBtn(btnOvGender, "Voice:${activeSettings.voiceGenderProfile}", isOn = false, isSelector = true)
+        stylePillControlBtn(btnOvVoiceType, "Type:${activeSettings.voicePreset}", isOn = (activeSettings.voicePreset != "RAW"), isSelector = true)
+
+        val nsActive = activeSettings.noiseSuppressMode != "OFF" && activeSettings.rnnoiseLevel > 0
+        stylePillControlBtn(btnOvNsMode, "NS:${activeSettings.noiseSuppressMode}", isOn = nsActive)
+        val lvlPct = when (activeSettings.rnnoiseLevel) {
+            1 -> "Lv:1 (65%)"
+            2 -> "Lv:2 (88%)"
+            3 -> "Lv:3 (100%)"
+            else -> "Lv:OFF"
+        }
+        stylePillControlBtn(btnOvNsLevel, lvlPct, isOn = activeSettings.rnnoiseLevel > 0)
+        stylePillControlBtn(
+            btnOvHpf,
+            label = if (activeSettings.hpfCutoffHz == 0) "HPF:OFF" else "HPF:${activeSettings.hpfCutoffHz}Hz",
+            isOn = activeSettings.hpfCutoffHz > 0
+        )
+
+        stylePillControlBtn(btnOvEq, if (activeSettings.voiceEqEnabled) "EQ:ON" else "EQ:OFF", isOn = activeSettings.voiceEqEnabled)
+        stylePillControlBtn(btnOvDeEss, if (activeSettings.deEsserEnabled) "DeEss:ON" else "DeEss:OFF", isOn = activeSettings.deEsserEnabled)
+        stylePillControlBtn(btnOvVelvet, if (activeSettings.velvetWarmthEnabled) "Velvet:ON" else "Velvet:OFF", isOn = activeSettings.velvetWarmthEnabled)
+        stylePillControlBtn(btnOvAgc, if (activeSettings.slowAgcEnabled) "AGC:ON" else "AGC:OFF", isOn = activeSettings.slowAgcEnabled)
+
+        stylePillControlBtn(btnOvMicGainLabel, "🎙️ Mic:${activeSettings.micGainPercent}%", isOn = true)
+        stylePillControlBtn(btnOvGameGainLabel, "🎮 Game:${activeSettings.gameGainPercent}%", isOn = activeSettings.gameGainPercent > 0)
+
+        stylePillControlBtn(btnOvCinemaWide, if (activeSettings.gameCinemaWideEnabled) "3DWide:ON" else "3DWide:OFF", isOn = activeSettings.gameCinemaWideEnabled)
+        stylePillControlBtn(btnOvSubPunch, if (activeSettings.gameSubPunchEnabled) "Sub:ON" else "Sub:OFF", isOn = activeSettings.gameSubPunchEnabled)
+        stylePillControlBtn(btnOvFootstep, if (activeSettings.gameFootstepFocusEnabled) "Foot:ON" else "Foot:OFF", isOn = activeSettings.gameFootstepFocusEnabled)
+        stylePillControlBtn(btnOvBlastTamer, if (activeSettings.gameBlastTamerEnabled) "Blast:ON" else "Blast:OFF", isOn = activeSettings.gameBlastTamerEnabled)
+        stylePillControlBtn(
+            btnOvDucking,
+            label = if (activeSettings.vadDuckingPercent == 0) "Duck:OFF" else "Duck:-${activeSettings.vadDuckingPercent}%",
+            isOn = activeSettings.vadDuckingPercent > 0
+        )
+        stylePillControlBtn(btnOvMicRoute, "Mic:${aEng?.shortMicPillLabel ?: "Phone Studio"}", isOn = false, isSelector = true)
 
         // Tab 1 (Video)
-        btnOvUpscaler?.text = "Scale:${activeSettings.upscalerMode}"
-        btnOvFraming?.text = "Frame:${activeSettings.framingMode}"
-        btnOvZoom?.text = "Zoom:${activeSettings.smartZoomPercent}%"
-        btnOvFilmic?.text = if (activeSettings.cinematicFilmic) "Filmic:ON" else "Filmic:OFF"
-        btnOvVivid?.text = if (activeSettings.amoledVivid) "Vivid:ON" else "Vivid:OFF"
-        btnOvShadowBoost?.text = if (activeSettings.shadowBoost) "Shadow+:ON" else "Shadow+:OFF"
-        btnOvColorTemp?.text = "Temp:${activeSettings.colorTempFilter.take(4)}"
-        btnOvFlip180?.text = "Rot:${activeSettings.landscapeFlip}°"
-        btnOvSharpen?.text = if (activeSettings.gpuSharpen) "Sharp:ON" else "Sharp:OFF"
-        btnOvOverlayPng?.text = if (activeSettings.overlayImageEnabled) ".PNG:ON" else ".PNG:OFF"
-        btnOvOverlayPos?.text = "Logo:${activeSettings.overlayPosition}"
-        btnOvLiveBanner?.text = if (activeSettings.liveBannerEnabled) "Banner:ON" else "Banner:OFF"
-        btnOvMinimapShield?.text = if (activeSettings.minimapShieldEnabled) "Blur:${activeSettings.minimapShieldCorner.take(9)}" else "Blur:OFF"
+        stylePillControlBtn(btnOvUpscaler, "Scale:${activeSettings.upscalerMode}", isOn = activeSettings.upscalerMode != "BILINEAR", isSelector = true)
+        stylePillControlBtn(btnOvFraming, "Frame:${activeSettings.framingMode}", isOn = activeSettings.framingMode != "FIT", isSelector = true)
+        stylePillControlBtn(btnOvZoom, "Zoom:${activeSettings.smartZoomPercent}%", isOn = activeSettings.framingMode == "SMART" && activeSettings.smartZoomPercent > 100, isSelector = true)
+        stylePillControlBtn(btnOvFilmic, if (activeSettings.cinematicFilmic) "Filmic:ON" else "Filmic:OFF", isOn = activeSettings.cinematicFilmic)
+        stylePillControlBtn(btnOvVivid, if (activeSettings.amoledVivid) "Vivid:ON" else "Vivid:OFF", isOn = activeSettings.amoledVivid)
+        stylePillControlBtn(btnOvShadowBoost, if (activeSettings.shadowBoost) "Shadow+:ON" else "Shadow+:OFF", isOn = activeSettings.shadowBoost)
+        stylePillControlBtn(btnOvColorTemp, "Temp:${activeSettings.colorTempFilter.take(4)}", isOn = activeSettings.colorTempFilter != "NEUTRAL", isSelector = true)
+        stylePillControlBtn(btnOvFlip180, "Rot:${activeSettings.landscapeFlip}°", isOn = activeSettings.landscapeFlip == 180, isSelector = true)
+        stylePillControlBtn(btnOvSharpen, if (activeSettings.gpuSharpen) "Sharp:ON" else "Sharp:OFF", isOn = activeSettings.gpuSharpen)
+        stylePillControlBtn(btnOvOverlayPng, if (activeSettings.overlayImageEnabled) ".PNG:ON" else ".PNG:OFF", isOn = activeSettings.overlayImageEnabled)
+        stylePillControlBtn(btnOvOverlayPos, "Logo:${activeSettings.overlayPosition}", isOn = false, isSelector = true)
+        stylePillControlBtn(btnOvLiveBanner, if (activeSettings.liveBannerEnabled) "Banner:ON" else "Banner:OFF", isOn = activeSettings.liveBannerEnabled)
+        stylePillControlBtn(
+            btnOvMinimapShield,
+            label = if (activeSettings.minimapShieldEnabled) "MapBlur:${activeSettings.minimapShieldCorner.take(8)}" else "MapBlur:OFF",
+            isOn = activeSettings.minimapShieldEnabled
+        )
 
         val kbBlurNow = vPipe?.keyboardBlurActive == true
         val kbLabel = when {
@@ -2208,38 +2524,59 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
             activeSettings.autoBlurKeyboard -> "KeyBlur:AUTO"
             else -> "KeyBlur:OFF"
         }
-        btnOvKeyboardBlur?.text = kbLabel
-        btnOvKeyboardBlur?.setTextColor(Color.parseColor(if (kbBlurNow) "#F59E0B" else "#00E5FF"))
+        stylePillControlBtn(btnOvKeyboardBlur, kbLabel, isOn = kbBlurNow || activeSettings.autoBlurKeyboard)
 
-        // Tab 2 (Net / Bitrate / Detailed Telemetry)
-        tvOvBitrateReadout?.text = String.format(Locale.US, "%.1f Mbps", activeBitrateBps / 1_000_000.0)
-        btnOvAbrToggle?.text = if (activeSettings.adaptiveBitrate) "ABR:ON" else "ABR:OFF"
+        // Tab 2 (Net / Bitrate / App vs. Game Heat & RAM Split)
+        stylePillControlBtn(
+            tvOvBitrateReadout,
+            String.format(Locale.US, "📡 %.1f Mbps", activeBitrateBps / 1_000_000.0),
+            isOn = true
+        )
+        stylePillControlBtn(btnOvAbrToggle, if (activeSettings.adaptiveBitrate) "ABR:ON" else "ABR:OFF", isOn = activeSettings.adaptiveBitrate)
+
         val saver30 = vPipe?.thermalThrottle30Fps == true || manual30FpsSaverEnabled || autoThermalNative30BitrateTrimActive
         val saverLabel = when {
             manual30FpsSaverEnabled -> "30FPS Cool:ON"
             saver30 -> "30FPS Cool:ACTIVE"
             else -> "30FPS Cool:AUTO"
         }
-        btnOvThermal30Saver?.text = saverLabel
-        btnOvThermal30Saver?.setTextColor(Color.parseColor(if (saver30) "#F59E0B" else "#10B981"))
+        stylePillControlBtn(btnOvThermal30Saver, saverLabel, isOn = saver30, isSelector = !saver30)
 
         val outFps = vPipe?.actualEncodedFps ?: 0
         val gameFps = vPipe?.actualFreshCaptureFps ?: 0
-        val socLoad = CodecCapabilityProbe.readLiveHardwareHealth(this).socThermalLoadPercent
-        tvOvFpsAndSocReadout?.text = "Stream: ${outFps}fps (Game: $gameFps) • SoC: ${socLoad}%"
+        val liveHealth = CodecCapabilityProbe.readLiveHardwareHealth(this)
+        val socLoad = liveHealth.socThermalLoadPercent
+        tvOvFpsAndSocReadout?.text = "🎥 Stream: ${outFps}fps (Game: $gameFps) • SoC: ${socLoad}%"
 
         val qFrames = max(0, DiagnosticsLogger.lastQueueFrames)
         val sendMs = max(0L, DiagnosticsLogger.lastSendLatencyMs)
         val rtt = DiagnosticsLogger.lastRttMs
         val pingStr = if (rtt > 0L) "${rtt}ms" else "--"
-        tvOvQueueAndRttReadout?.text = "Queue: ${qFrames}f (${sendMs}ms) • Ping: $pingStr"
+        tvOvQueueAndRttReadout?.text = "📡 Queue: ${qFrames}f (${sendMs}ms) • RTT: $pingStr"
+
+        val appCpu = lastAppCpuPercent.coerceIn(1, 100)
+        val gameOsLoad = max(0, socLoad - appCpu)
+        val tempStr = String.format(Locale.US, "%.1f°C", liveHealth.batteryTempC)
+        tvOvHeatSplitReadout?.text = "🔥 Heat: App ~${appCpu}% CPU | Game+OS ~${gameOsLoad}% SoC ($tempStr)"
+
+        val appRamMb = max(DiagnosticsLogger.peakTotalPssMb, DiagnosticsLogger.lastJavaHeapMb + DiagnosticsLogger.lastNativeHeapMb).coerceAtLeast(45)
+        val totalUsedGb = (liveHealth.totalRamGb.toFloat() - liveHealth.availRamGb).coerceAtLeast(0.5f)
+        val gameOsRamGb = (totalUsedGb - (appRamMb / 1024.0f)).coerceAtLeast(0.3f)
+        tvOvRamSplitReadout?.text = String.format(
+            Locale.US,
+            "💾 RAM: App %dMB | Game+OS %.1fGB (of %dGB)",
+            appRamMb,
+            gameOsRamGb,
+            liveHealth.totalRamGb
+        )
 
         val activeAuxCount = auxTargets.count { it.connected } + (if (companionTarget?.connected == true) 1 else 0)
-        tvOvSimulcastStatus?.text = if (activeAuxCount > 0) {
-            "Targets: Primary + $activeAuxCount"
-        } else {
-            "Targets: Primary Only"
-        }
+        stylePillControlBtn(
+            tvOvSimulcastStatus,
+            label = if (activeAuxCount > 0) "Targets: Primary + $activeAuxCount" else "Targets: Primary Only",
+            isOn = activeAuxCount > 0
+        )
+        stylePillControlBtn(btnOvStopConfirm, btnOvStopConfirm?.text?.toString() ?: "⏹ Stop Stream", isOn = false, isDanger = true)
     }
 
     // === LIVE IN-GAME & DASHBOARD ACTION HANDLERS ===
@@ -2869,9 +3206,14 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
             return try { (mQueueBytes?.invoke(client) as? Number)?.toLong() ?: -1L } catch (_: Exception) { -1L }
         }
 
+        /**
+         * Converts Pedro's RtmpClient.getRtt() from microseconds (µs) to milliseconds (ms)!
+         * Fixes the 1000x unit mismatch where a 25 ms RTT was returned as 25,000.
+         */
         fun readRttMs(client: RtmpClient): Long {
             ensureResolved(client)
-            return try { (mRtt?.invoke(client) as? Number)?.toLong() ?: -1L } catch (_: Exception) { -1L }
+            val rawMicros = try { (mRtt?.invoke(client) as? Number)?.toLong() ?: -1L } catch (_: Exception) { -1L }
+            return convertRttMicrosToMs(rawMicros)
         }
 
         fun readDroppedVideoFrames(client: RtmpClient): Long {
@@ -3026,6 +3368,15 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
 
         internal fun formatOverlayQueueTag(qFrames: Int): String =
             if (qFrames >= 0) "Q:${qFrames}f" else "Q:N/A"
+
+        /**
+         * Pure helper converting Pedro's RtmpClient.getRtt() microsecond value (µs) into
+         * milliseconds (ms) with rounding and a 1 ms positive floor.
+         */
+        internal fun convertRttMicrosToMs(rawRttUs: Long): Long {
+            if (rawRttUs <= 0L) return -1L
+            return max(1L, (rawRttUs + 500L) / 1000L)
+        }
 
         internal fun shouldAcceptConnectionCallback(
             isBroadcastActive: Boolean,
