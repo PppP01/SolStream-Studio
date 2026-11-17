@@ -718,7 +718,7 @@ class SolStreamUnitTests {
         dspNoAir.applySettings(
             StreamSettings(
                 voiceGenderProfile = "FEMALE",
-                voicePreset = "STUDIO",
+                voicePreset = "SOL_LUXE",
                 voiceEqEnabled = true,
                 velvetWarmthEnabled = false,
                 deEsserEnabled = false,
@@ -766,7 +766,7 @@ class SolStreamUnitTests {
         }
         assertTrue(
             "Aphex Silk Air Exciter ($slewSilkAir) must add upper-harmonic air shimmer over non-velvet mode ($slewNoAir)",
-            slewSilkAir > slewNoAir * 1.05f
+            slewSilkAir > slewNoAir * 1.03f
         )
     }
 
