@@ -60,7 +60,7 @@ enum class DeviceTier(
     LITE(
         id = "LITE",
         title = "Lite",
-        badgeSummary = "Budget / Mobile-Data Safe • 720p30/1080p30 + Full 13-Stage SolLuxe™ 2.0 Voice",
+        badgeSummary = "Budget / Mobile-Data Safe • 720p30/1080p30 + SolLuxe™ 3.0 Pure Voice",
         defaultWidth = 1920,
         defaultHeight = 1080,
         defaultFps = 30,
@@ -70,7 +70,7 @@ enum class DeviceTier(
     BALANCED(
         id = "BALANCED",
         title = "Balanced",
-        badgeSummary = "Mid-Range Smooth • 1080p60 + Full 13-Stage SolLuxe™ 2.0 Voice Studio",
+        badgeSummary = "Mid-Range Smooth • 1080p60 + SolLuxe™ 3.0 Pure Voice Studio",
         defaultWidth = 1920,
         defaultHeight = 1080,
         defaultFps = 60,
@@ -90,7 +90,7 @@ enum class DeviceTier(
     FLAGSHIP(
         id = "FLAGSHIP",
         title = "Flagship",
-        badgeSummary = "Flagship Esports • 1440p60 HEVC + SOL LUXE 2.0 Voice + 256k Master AAC",
+        badgeSummary = "Flagship Esports • 1440p60 HEVC + SolLuxe™ 3.0 Pure + 256k Master AAC",
         defaultWidth = 2560,
         defaultHeight = 1440,
         defaultFps = 60,
@@ -268,14 +268,53 @@ data class DeviceScanSummary(
     }
 
     /**
-     * Checks all verified hardware encoders (HEVC, H.264, AV1) so a device whose H.264 or AV1
-     * hardware block supports 2+ instances is never falsely rejected if HEVC reports 1.
+     * Returns ONLY the hardware encoders that satisfy the simultaneous-instance requirement
+     * (maxConcurrentInstances >= 2 and 1080p support) for running a secondary companion or
+     * split-encode simulcast pipeline alongside the primary stream.
+     *
+     * Prevents choosing HEVC for a companion stream when only H.264 supports 2+ concurrent instances.
      */
-    fun supportsDualFormatCompanion(): Boolean {
-        if (totalRamGb < 8) return false
-        return listOfNotNull(hevcHardware, h264Hardware, av1Hardware).any {
-            it.maxConcurrentInstances >= 2 && (it.supports1080p60 || it.supports1080p30)
+    fun eligibleCompanionEncoders(
+        primaryCodec: String? = null,
+        requireH264Only: Boolean = false
+    ): List<HardwareEncoderReport> {
+        if (totalRamGb < 8) return emptyList()
+        val orderedPool = if (requireH264Only) {
+            listOfNotNull(h264Hardware)
+        } else {
+            val av1Usable = av1Hardware?.takeIf { it.verifiedRealEncode || it.verifiedSurfaceConfigure }
+            listOfNotNull(hevcHardware, h264Hardware, av1Usable)
         }
+        val primaryUpper = primaryCodec?.uppercase(Locale.US)
+        return orderedPool.filter { report ->
+            val supports1080p = report.supports1080p60 || report.supports1080p30
+            if (!supports1080p) return@filter false
+            // Require >=2 concurrent hardware instances on the companion codec itself
+            // (or explicitly exclude any codec with only 1 instance when it matches primaryCodec).
+            if (primaryUpper != null && report.codecKey.equals(primaryUpper, ignoreCase = true)) {
+                report.maxConcurrentInstances >= 2
+            } else {
+                report.maxConcurrentInstances >= 2
+            }
+        }
+    }
+
+    /**
+     * Picks the highest-priority eligible companion encoder (e.g., HEVC if HEVC supports >=2
+     * instances, otherwise falling back cleanly to H.264).
+     */
+    fun selectCompanionEncoder(
+        primaryCodec: String? = null,
+        requireH264Only: Boolean = false
+    ): HardwareEncoderReport? {
+        return eligibleCompanionEncoders(primaryCodec, requireH264Only).firstOrNull()
+    }
+
+    /**
+     * Checks whether at least one eligible hardware encoder can run concurrently for a companion stream.
+     */
+    fun supportsDualFormatCompanion(primaryCodec: String? = null): Boolean {
+        return eligibleCompanionEncoders(primaryCodec = primaryCodec, requireH264Only = false).isNotEmpty()
     }
 
     fun friendlyHardwareLine(): String {
@@ -431,7 +470,7 @@ object CodecCapabilityProbe {
     private const val CACHE_PREFS = "solstream_hw_probe_cache_v3"
     private const val KEY_FINGERPRINT = "cached_fingerprint"
     private const val KEY_PAYLOAD = "cached_scan_json"
-    private const val CACHE_SCHEMA_TAG = "ultra_v121_r1"
+    private const val CACHE_SCHEMA_TAG = "ultra_v140_r1"
 
     private val scanLock = ReentrantLock()
     private val activeHardwareProbeRunning = AtomicBoolean(false)
@@ -562,7 +601,7 @@ object CodecCapabilityProbe {
 
     /**
      * Reads zero-permission live idle/active hardware telemetry (Battery 0.1C temp, 10s rate-limited
-     * PowerManager thermal headroom, available RAM, and Samsung Game Booster Bypass/Pause PD state).
+     * PowerManager thermal headroom, available RAM, and estimated Bypass/Pause PD state).
      */
     fun readLiveHardwareHealth(context: Context): LiveHardwareHealth {
         val appCtx = context.applicationContext
@@ -583,8 +622,6 @@ object CodecCapabilityProbe {
                 val scale = intent.getIntExtra(BatteryManager.EXTRA_SCALE, 100).coerceAtLeast(1)
                 val battPct = (level * 100) / scale
 
-                // Detect Samsung Game Booster 'Pause USB PD charging when gaming' (Bypass Charging):
-                // When active, plugged != 0, while status is NOT_CHARGING or DISCHARGING (or current is <= ~45,000 µA while <99% full).
                 var pausePdByCurrent = false
                 if (isPlugged && battPct in 15..98) {
                     try {
@@ -775,7 +812,13 @@ object CodecCapabilityProbe {
             cachedScan = it
             return it
         }
-        return if (scanLock.tryLock(effectiveWaitMs.coerceAtMost(1200L), TimeUnit.MILLISECONDS)) {
+        val locked = try {
+            scanLock.tryLock(effectiveWaitMs.coerceAtMost(1200L), TimeUnit.MILLISECONDS)
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+            false
+        }
+        return if (locked) {
             try {
                 cachedScan ?: loadPersistedCache(appCtx) ?: performFastMetadataScan(appCtx)
             } finally {
@@ -786,11 +829,6 @@ object CodecCapabilityProbe {
         }
     }
 
-    /**
-     * Scan getter for SolVideoPipeline.startPipeline(): returns cached or persisted verified scan
-     * immediately; if an initial background scan is still running on first launch, waits up to
-     * 5000 ms on a worker thread so the probe finishes cleanly before encoder setup begins.
-     */
     fun getBestAvailableScanNonBlocking(context: Context): DeviceScanSummary {
         val waitMs = if (Looper.myLooper() == Looper.getMainLooper()) 80L else 5000L
         return awaitCachedSummary(context, maxWaitMs = waitMs)
@@ -802,7 +840,6 @@ object CodecCapabilityProbe {
         onComplete: (DeviceScanSummary) -> Unit
     ) {
         val appCtx = context.applicationContext
-        // Never run hardware MediaCodec probing while a live broadcast is starting or active!
         if (isStreamBusy()) {
             val safeLiveSummary = cachedScan ?: loadPersistedCache(appCtx) ?: performFastMetadataScan(appCtx)
             onComplete(safeLiveSummary)
@@ -827,7 +864,6 @@ object CodecCapabilityProbe {
 
     fun scanDevice(context: Context, forceRefresh: Boolean = false): DeviceScanSummary {
         val appCtx = context.applicationContext
-        // Never allocate test MediaCodec encoders while a livestream is starting or actively encoding!
         if (isStreamBusy()) {
             return cachedScan ?: loadPersistedCache(appCtx) ?: performFastMetadataScan(appCtx)
         }
@@ -840,7 +876,13 @@ object CodecCapabilityProbe {
         }
 
         if (Looper.myLooper() == Looper.getMainLooper()) {
-            if (!scanLock.tryLock(80, TimeUnit.MILLISECONDS)) {
+            val locked = try {
+                scanLock.tryLock(80, TimeUnit.MILLISECONDS)
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+                false
+            }
+            if (!locked) {
                 return cachedScan ?: loadPersistedCache(appCtx) ?: performFastMetadataScan(appCtx)
             }
         } else {
@@ -870,7 +912,6 @@ object CodecCapabilityProbe {
     }
 
     private fun performFastMetadataScan(appCtx: Context): DeviceScanSummary {
-        // Honest metadata-only scan: does NOT set verifiedSurfaceConfigure = true and does NOT overwrite persisted cache
         return executeFullHardwareScan(appCtx, runEglEncodeVerification = false)
     }
 
@@ -1251,7 +1292,6 @@ object CodecCapabilityProbe {
                 1
             }
 
-            // Distinguish honest metadata-only scans (surfaceOk = false) from real surface/frame verification!
             val (surfaceOk, realEncodeOk) = if (runEglEncodeVerification && !isStreamBusy()) {
                 verifyHardwareSurfaceEncoder(
                     encoderName = info.name,
@@ -1442,7 +1482,6 @@ object CodecCapabilityProbe {
             if (eglSurface == EGL14.EGL_NO_SURFACE) return false
             if (!EGL14.eglMakeCurrent(eglDisplay, eglSurface, eglSurface, eglContext)) return false
 
-            // Zero-cost GPU Renderer lookup while the test EGL context is already current!
             if (detectedGpuRenderer.isBlank()) {
                 try {
                     val renderer = GLES20.glGetString(GLES20.GL_RENDERER)?.trim().orEmpty()
