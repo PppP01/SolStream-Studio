@@ -261,6 +261,23 @@ class SolStreamUnitTests {
     }
 
     @Test
+    fun tierPresetCoordinator_preservesExplicitManualHpfWhenAutoModeIsOff() {
+        val manualSettings = StreamSettings(
+            platformPreset = "YOUTUBE",
+            voiceGenderProfile = "MALE",
+            hpfCutoffHz = 95,
+            hpfAutoMode = false
+        )
+        val applied = KeystoreVault.applyPlatformAndVoiceAwareTierPreset(
+            current = manualSettings,
+            tier = DeviceTier.FLAGSHIP,
+            scan = null
+        )
+        assertEquals(95, applied.hpfCutoffHz)
+        assertFalse(applied.hpfAutoMode)
+    }
+
+    @Test
     fun smartClipboardGuard_stripsInvisibleWhitespaceAndDetectsRtmpUrls() {
         val dirtyKey = "  abcd-1234-xy98\n\t\u200B\uFEFF  "
         assertEquals("abcd-1234-xy98", KeystoreVault.sanitizeStreamKeyInput(dirtyKey))
@@ -964,6 +981,25 @@ class SolStreamUnitTests {
             val rms = sqrt(sumSq / dest480.size)
             assertTrue("Resampled $srcRate Hz RMS ($rms) should match ~0.353f sine RMS", rms in 0.30f..0.40f)
         }
+    }
+
+    @Test
+    fun adaptiveRtmpChunkSize_uses65535OnWifiMajorIngestsAnd4096OnCellularOrCustom() {
+        assertEquals(65535, SolStreamService.resolveAdaptiveRtmpChunkSize(true, "rtmps://a.rtmps.youtube.com:443/live2/key"))
+        assertEquals(65535, SolStreamService.resolveAdaptiveRtmpChunkSize(true, "rtmps://ingest.global-contribute.live-video.net:443/app/key"))
+        assertEquals(4096, SolStreamService.resolveAdaptiveRtmpChunkSize(true, "rtmp://my-custom-nginx.example.com:1935/live/key"))
+        assertEquals(4096, SolStreamService.resolveAdaptiveRtmpChunkSize(false, "rtmps://a.rtmps.youtube.com:443/live2/key"))
+    }
+
+    @Test
+    fun unifiedOverlayLogoTag_formatsOffAndAllFivePositionsCleanly() {
+        assertEquals("Logo:OFF", SolStreamService.formatCompactOverlayPositionTag(false, "FULL"))
+        assertEquals("Logo:OFF", SolStreamService.formatCompactOverlayPositionTag(false, "TOP_LEFT"))
+        assertEquals("Logo:FULL", SolStreamService.formatCompactOverlayPositionTag(true, "FULL"))
+        assertEquals("Logo:TL", SolStreamService.formatCompactOverlayPositionTag(true, "TOP_LEFT"))
+        assertEquals("Logo:TR", SolStreamService.formatCompactOverlayPositionTag(true, "TOP_RIGHT"))
+        assertEquals("Logo:BL", SolStreamService.formatCompactOverlayPositionTag(true, "BOTTOM_LEFT"))
+        assertEquals("Logo:BR", SolStreamService.formatCompactOverlayPositionTag(true, "BOTTOM_RIGHT"))
     }
 
     @Test
