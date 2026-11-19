@@ -59,7 +59,7 @@ data class StreamSettings(
     val hdr10Enabled: Boolean = false,            // True 10-Bit HLG10 HDR (when HW Main10 supported)
     val cinematicFilmic: Boolean = false,         // Stackable SDR ACES Filmic S-Curve (with Shadow Toe Guard)
     val amoledVivid: Boolean = false,             // Stackable SDR Mid-Tone Saturation Pop (Skin-Tone Safe)
-    val shadowBoost: Boolean = false,             // Stackable AI Adaptive Dark-Corner Enemy Clarifier
+    val shadowBoost: Boolean = false,             // Stackable Adaptive Dark-Corner Enemy Clarifier
     val colorTempFilter: String = "NEUTRAL",      // "NEUTRAL", "WARM", "COOL"
     val gpuSharpen: Boolean = false,              // Stackable Contrast-Adaptive Crisp Sharpen
     val roiMode: String = "AUTO",                 // "OFF", "AUTO", "CENTER", "HUD"
@@ -75,25 +75,26 @@ data class StreamSettings(
     val minimapShieldEnabled: Boolean = false,    // Stream-sniper / Privacy zone blur
     val minimapShieldCorner: String = "TOP_RIGHT",// "TOP_RIGHT", "TOP_RIGHT_SMALL", "TOP_RIGHT_LARGE", "TOP_LEFT", "BOTTOM_LEFT", "BOTTOM_RIGHT", "CENTER_BOX", "KEYBOARD"
 
-    // === 13-Stage Isolated 32-Bit Float / 64-Bit Double SolLuxe™ 2.0 Voice + Stereo Game Soundstage ===
+    // === 6-Stage Isolated 32-Bit Float / 64-Bit Double SolLuxe™ 3.0 Pure Voice + Stereo Game Soundstage ===
     val micDeviceId: Int = -1,
     val micAudioSource: Int = 0,                  // 0 = AUTO, 1 = MIC, 6 = VOICE_RECOGNITION, 7 = VOICE_COMM
     val audioBitrateKbps: Int = 256,              // 64, 96, 128, 160, 192, 256, 320 kbps
-    val voiceGenderProfile: String = "NEUTRAL",   // Pick-1: "NEUTRAL" (65Hz), "MALE" (50Hz), "FEMALE" (85Hz)
+    val voiceGenderProfile: String = "NEUTRAL",   // Pick-1: "NEUTRAL" (68Hz), "MALE" (55Hz), "FEMALE" (85Hz)
     val voicePreset: String = "SOL_LUXE",         // "RAW", "CLEAN", "NEURAL", "STUDIO", "VELVET", "SOL_LUXE"
     val noiseSuppressMode: String = "RNNOISE",    // Pick-1: "OFF", "LIGHT", "RNNOISE", "HW_NS"
     val rnnoiseLevel: Int = 2,                    // Strength: 0 = Off, 1 = Gentle (65%), 2 = Natural (88%), 3 = Max (100%)
-    val hpfCutoffHz: Int = 65,                    // 0, 50(Male), 55, 60, 65(Neutral), 70, 75, 85(Female), 95, 105, 120 Hz
-    val transientTamerEnabled: Boolean = true,    // Stage 2: Spark/Hammer & Grip Blanker
-    val noiseGateEnabled: Boolean = true,         // Stage 4: 0-ms Instant Vocal Gate & Breath Expander
-    val voiceEqEnabled: Boolean = true,           // Stage 6/8: Deep Proximity, Grip Mud Cut, 920Hz Velvet Dip & Presence
-    val deEsserEnabled: Boolean = true,           // Stage 12: Post-Compressor Split-Band Sibilance Tamer
-    val velvetWarmthEnabled: Boolean = true,      // Stage 7/9: Pure Analog Sub-Warmth + Aphex Silk Air Exciter & Shelf
-    val compressorEnabled: Boolean = true,        // Stage 11: High-Pass Sidechain 12ms-Punch 3:1 Leveler
-    val whisperLiftEnabled: Boolean = true,       // Stage 11: Upward Low-Level Callout Booster
-    val slowAgcEnabled: Boolean = true,           // Stage 11: Speech-Gated Slow Broadcast Loudness Ride
-    val speakerAecEnabled: Boolean = false,       // Stage 0: Default OFF (Forced disabled on earphones; ON for speaker players)
-    val micGainPercent: Int = 130,                // Stage 13: True Post-DSP Mic Boost (50..250%)
+    val hpfCutoffHz: Int = 68,                    // Auto (55M/68N/85F) or Manual: 0, 50, 55, 60, 65, 68, 70, 75, 85, 95, 105, 120 Hz
+    val hpfAutoMode: Boolean = true,              // true = tracks profile/hardware default; false = preserves explicit manual HPF across preset switches
+    val transientTamerEnabled: Boolean = true,    // Stage 2: Raised-Cosine Micro-Impulse Clamper (<0.6ms zap/pop guard)
+    val noiseGateEnabled: Boolean = true,         // Stage 3: Hybrid Neural-VAD Smooth Soft-Floor Expander (8ms attack / 220ms release)
+    val voiceEqEnabled: Boolean = true,           // Stage 5: 4-Gear × 3-Gender Condenser EQ (Chest, Mud, Anti-Nasal, Silk Presence, Air Shelf)
+    val deEsserEnabled: Boolean = true,           // Stage 6: Post-EQ/Post-Comp Dynamic Sibilance-Ratio De-Esser (6.2/6.7/7.2 kHz)
+    val velvetWarmthEnabled: Boolean = true,      // Stage 5: Low-Band Analog Warmth Shaper (clean sub-warmth; zero Neutral/Female 2f mud)
+    val compressorEnabled: Boolean = true,        // Stage 6: Gender-Sidechain Soft-Knee Broadcast Leveler (10ms/130ms, 2.5:1)
+    val whisperLiftEnabled: Boolean = true,       // Stage 6: Continuous VAD-Synced Quiet-Speech Upward Lift (0.25..0.55 ramp × expander gain)
+    val slowAgcEnabled: Boolean = true,           // Stage 6: Gentle Speech-Synced Broadcast Loudness Stabilization
+    val speakerAecEnabled: Boolean = false,       // Default OFF (Strictly disabled on earphones via effectiveSpeakerAec; double-talk safe on speakerphone)
+    val micGainPercent: Int = 130,                // Stage 6 Output: True Post-DSP Mic Boost (50..250%)
     val gameGainPercent: Int = 100,               // 0..250% (Protected by 4x Cubic Look-Ahead Limiter)
     val gameCinemaWideEnabled: Boolean = false,   // Stackable Game Bus: Loudness-normalized Mid-Side 3D widener
     val gameSubPunchEnabled: Boolean = false,     // Stackable Game Bus: +3.0 dB @ 62 Hz theater sub-punch (Phase-safe voice duck)
@@ -102,7 +103,7 @@ data class StreamSettings(
     val vadDuckingPercent: Int = 0,               // 0, 10, 15, 20, 25, 30, 35, 40, 50, 60, 70%
     val micSyncDelayMs: Int = 0,                  // 0, 15, 30, 45, 60, 80, 100, 120, 150, 180, 200 ms
 
-    // === Survival, Privacy & v1.3.0 Extensions ===
+    // === Survival, Privacy & v1.4.0 Extensions ===
     val brbMuteMicToo: Boolean = true,
     val wifiLowLatencyLock: Boolean = true,
     val overlayPosition: String = "FULL",         // "FULL", "TOP_LEFT", "TOP_RIGHT", "BOTTOM_LEFT", "BOTTOM_RIGHT"
@@ -136,17 +137,16 @@ object KeystoreVault {
     @Volatile private var cachedSecurityLabel: String? = null
 
     /**
-     * Single shared coordinator for gender-matched High-Pass Filter cutoffs across
-     * Card 0 (Tier Presets), Card 4 (Voice Studio), and the in-game Floating Pill.
-     * - MALE: 50 Hz (preserves 55-95 Hz deep baritone chest + cubic sub-warmth)
-     * - NEUTRAL: 65 Hz
-     * - FEMALE: 85 Hz
+     * Single shared coordinator for gender-matched High-Pass Filter cutoffs (SolLuxe™ 3.0 Pure):
+     * - MALE:    55 Hz (clears table taps & AC hum while preserving full 95 Hz baritone chest resonance)
+     * - NEUTRAL: 68 Hz
+     * - FEMALE:  85 Hz
      */
     fun resolveDefaultHpfForProfile(genderProfile: String): Int {
         return when (genderProfile.uppercase(Locale.US)) {
-            "MALE" -> 50
+            "MALE" -> 55
             "FEMALE" -> 85
-            else -> 65
+            else -> 68
         }
     }
 
@@ -217,7 +217,7 @@ object KeystoreVault {
         }
         val swapped = primaryFullEndpoint
             .replace("a.rtmps.youtube.com", "b.rtmps.youtube.com", ignoreCase = true)
-            .replace("a.rtmp.youtube.com", "b.rtmps.youtube.com", ignoreCase = true)
+            .replace("a.rtmp.youtube.com", "b.rtmp.youtube.com", ignoreCase = true)
         return if (swapped.contains("backup=1")) {
             swapped
         } else if (swapped.contains("?")) {
@@ -390,6 +390,7 @@ object KeystoreVault {
         scan: DeviceScanSummary?
     ): StreamSettings {
         val matchedHpf = resolveDefaultHpfForProfile(current.voiceGenderProfile)
+        val resolvedHpf = if (current.hpfAutoMode) matchedHpf else current.hpfCutoffHz
         val isTwitchPrimary = current.platformPreset.equals("TWITCH", ignoreCase = true)
         val isKickPrimary = current.platformPreset.equals("KICK", ignoreCase = true)
         val singleEncodeSimulcastActive = (current.simulcastTwitchEnabled || current.simulcastKickEnabled) &&
@@ -486,7 +487,8 @@ object KeystoreVault {
             voicePreset = "SOL_LUXE",
             noiseSuppressMode = "RNNOISE",
             rnnoiseLevel = 2,
-            hpfCutoffHz = matchedHpf,
+            hpfCutoffHz = resolvedHpf,
+            hpfAutoMode = current.hpfAutoMode,
             transientTamerEnabled = true,
             noiseGateEnabled = true,
             voiceEqEnabled = true,
@@ -500,7 +502,7 @@ object KeystoreVault {
     }
 
     /**
-     * Smart Cross-Phone Preset Clamping (#4): validates an imported JSON preset against the
+     * Smart Cross-Phone Preset Clamping: validates an imported JSON preset against the
      * receiving phone's hardware scan and adapts unsupported codecs/resolutions/bitrates cleanly.
      */
     fun clampImportedSettingsToHardware(
@@ -658,7 +660,7 @@ object KeystoreVault {
                 )
                 return "$iv:$ct"
             } catch (e: Exception) {
-                // Non-Destructive Keystore Recovery Fix (#8): only delete/regenerate master key on permanent invalidation
+                // Non-Destructive Keystore Recovery: only delete/regenerate master key on permanent invalidation
                 if (attempt == 0 && isPermanentKeyInvalidation(e)) {
                     try {
                         val ks = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
@@ -711,7 +713,7 @@ object KeystoreVault {
 
     fun exportPresetJson(s: StreamSettings): String {
         return JSONObject().apply {
-            put("solPresetSchema", 3)
+            put("solPresetSchema", 4)
             put("deviceTier", s.deviceTier)
             put("platformPreset", s.platformPreset)
             put("useShortsKeySlot", s.useShortsKeySlot)
@@ -730,7 +732,7 @@ object KeystoreVault {
             put("useVbr", s.useVbr)
             put("adaptiveBitrate", s.adaptiveBitrate)
             put("framingMode", s.framingMode)
-            // Fix: Snap legacy orphan zoom values (like 104%) to the nearest valid step (108%)
+            // Snap legacy orphan zoom values (like 104%) to the nearest valid step (108%)
             val clampedZoom = when (s.smartZoomPercent) {
                 in 100..106 -> 100
                 in 107..111 -> 108
@@ -774,6 +776,7 @@ object KeystoreVault {
             put("noiseSuppressMode", s.noiseSuppressMode)
             put("rnnoiseLevel", s.rnnoiseLevel)
             put("hpfCutoffHz", s.hpfCutoffHz)
+            put("hpfAutoMode", s.hpfAutoMode)
             put("transientTamerEnabled", s.transientTamerEnabled)
             put("noiseGateEnabled", s.noiseGateEnabled)
             put("voiceEqEnabled", s.voiceEqEnabled)
@@ -804,7 +807,22 @@ object KeystoreVault {
         return try {
             val j = JSONObject(rawJson.trim())
             val gender = j.optString("voiceGenderProfile", fallback.voiceGenderProfile)
+            val legacyDefaultHpf = when (gender.uppercase(Locale.US)) {
+                "MALE" -> 50
+                "FEMALE" -> 85
+                else -> 65
+            }
             val defaultHpf = resolveDefaultHpfForProfile(gender)
+            val rawHpf = j.optInt("hpfCutoffHz", defaultHpf).coerceIn(0, 160)
+            val inferredAutoHpf = if (j.has("hpfAutoMode")) {
+                j.optBoolean("hpfAutoMode", fallback.hpfAutoMode)
+            } else if (!j.has("hpfCutoffHz")) {
+                true
+            } else {
+                rawHpf == legacyDefaultHpf
+            }
+            val resolvedHpf = if (inferredAutoHpf) defaultHpf else rawHpf
+
             val rawZoom = j.optInt("smartZoomPercent", fallback.smartZoomPercent)
             val clampedZoom = when (rawZoom) {
                 in 100..106 -> 100
@@ -868,7 +886,8 @@ object KeystoreVault {
                 voicePreset = j.optString("voicePreset", fallback.voicePreset),
                 noiseSuppressMode = j.optString("noiseSuppressMode", fallback.noiseSuppressMode),
                 rnnoiseLevel = j.optInt("rnnoiseLevel", fallback.rnnoiseLevel).coerceIn(0, 3),
-                hpfCutoffHz = j.optInt("hpfCutoffHz", defaultHpf).coerceIn(0, 160),
+                hpfCutoffHz = resolvedHpf,
+                hpfAutoMode = inferredAutoHpf,
                 transientTamerEnabled = j.optBoolean("transientTamerEnabled", fallback.transientTamerEnabled),
                 noiseGateEnabled = j.optBoolean("noiseGateEnabled", fallback.noiseGateEnabled),
                 voiceEqEnabled = j.optBoolean("voiceEqEnabled", fallback.voiceEqEnabled),
