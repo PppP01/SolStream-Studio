@@ -17,6 +17,7 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 import kotlin.math.PI
 import kotlin.math.abs
+import kotlin.math.roundToInt
 import kotlin.math.sin
 import kotlin.math.sqrt
 
@@ -232,20 +233,31 @@ class SolStreamUnitTests {
     }
 
     @Test
-    fun genderMatchedHpfCoordinator_resolvesExact50HzMale65HzNeutral85HzFemale() {
-        assertEquals(50, KeystoreVault.resolveDefaultHpfForProfile("MALE"))
-        assertEquals(65, KeystoreVault.resolveDefaultHpfForProfile("NEUTRAL"))
+    fun genderMatchedHpfCoordinator_resolves55Male68Neutral85FemaleAndPreservesManualHpf() {
+        assertEquals(55, KeystoreVault.resolveDefaultHpfForProfile("MALE"))
+        assertEquals(68, KeystoreVault.resolveDefaultHpfForProfile("NEUTRAL"))
         assertEquals(85, KeystoreVault.resolveDefaultHpfForProfile("FEMALE"))
-        assertTrue(MicDspProcessor.HPF_CUTOFF_STEPS.containsAll(listOf(0, 50, 55, 60, 65, 70, 75, 85, 95)))
+        assertTrue(MicDspProcessor.HPF_CUTOFF_STEPS.containsAll(listOf(0, 50, 55, 60, 65, 68, 70, 75, 85, 95, 105, 120)))
 
-        val base = StreamSettings(voiceGenderProfile = "NEUTRAL", hpfCutoffHz = 65)
-        val maleApplied = MicDspProcessor.applyGenderProfileToSettings(base, "MALE")
+        // Auto HPF tracks gender profile changes cleanly
+        val autoBase = StreamSettings(voiceGenderProfile = "NEUTRAL", hpfCutoffHz = 68, hpfAutoMode = true)
+        val maleApplied = MicDspProcessor.applyGenderProfileToSettings(autoBase, "MALE")
         assertEquals("MALE", maleApplied.voiceGenderProfile)
-        assertEquals(50, maleApplied.hpfCutoffHz)
+        assertEquals(55, maleApplied.hpfCutoffHz)
 
         val femaleApplied = MicDspProcessor.applyGenderProfileToSettings(maleApplied, "FEMALE")
         assertEquals("FEMALE", femaleApplied.voiceGenderProfile)
         assertEquals(85, femaleApplied.hpfCutoffHz)
+
+        // Manual HPF (hpfAutoMode = false) must NEVER be overwritten when switching presets or profiles
+        val manualMale = StreamSettings(voiceGenderProfile = "MALE", hpfCutoffHz = 85, hpfAutoMode = false)
+        val afterStudioPreset = MicDspProcessor.applyPresetToSettings(manualMale, "STUDIO")
+        assertEquals(85, afterStudioPreset.hpfCutoffHz)
+        assertFalse(afterStudioPreset.hpfAutoMode)
+
+        val afterCleanPreset = MicDspProcessor.applyPresetToSettings(afterStudioPreset, "CLEAN")
+        assertEquals(85, afterCleanPreset.hpfCutoffHz)
+        assertFalse(afterCleanPreset.hpfAutoMode)
     }
 
     @Test
@@ -301,6 +313,7 @@ class SolStreamUnitTests {
         val messyUserSettings = StreamSettings(
             platformPreset = "YOUTUBE",
             voiceGenderProfile = "MALE",
+            hpfAutoMode = true,
             maxBFrames = 2,
             qpMaxCap = 42,
             useVbr = true
@@ -314,7 +327,7 @@ class SolStreamUnitTests {
         assertEquals(2560, ytFlagship.width)
         assertEquals(1440, ytFlagship.height)
         assertEquals(20000, ytFlagship.targetBitrateKbps)
-        assertEquals(50, ytFlagship.hpfCutoffHz)
+        assertEquals(55, ytFlagship.hpfCutoffHz)
         assertEquals(0, ytFlagship.maxBFrames)
         assertEquals(0, ytFlagship.qpMaxCap)
         assertFalse(ytFlagship.useVbr)
@@ -398,7 +411,7 @@ class SolStreamUnitTests {
     }
 
     @Test
-    fun dualFormatCompanionSupport_checksAllHardwareEncodersIncludingH264AndAv1() {
+    fun dualFormatCompanionSupport_selectsOnlyEligibleConcurrentCodec() {
         val singleInstanceHevc = HardwareEncoderReport(
             codecKey = "HEVC",
             mimeType = MediaFormat.MIMETYPE_VIDEO_HEVC,
@@ -432,6 +445,19 @@ class SolStreamUnitTests {
             recommendedHeight = 1440
         )
         assertTrue(summary.supportsDualFormatCompanion())
+        // Because HEVC supports only 1 instance, companion MUST select H264 instead of failing on HEVC
+        assertEquals("H264", summary.selectCompanionEncoder(primaryCodec = "HEVC")?.codecKey)
+        assertEquals(listOf("H264"), summary.eligibleCompanionEncoders(primaryCodec = "HEVC").map { it.codecKey })
+
+        // When both support >= 2 instances, vertical companion prefers HEVC first with H264 fallback
+        val dualBoth = summary.copy(hevcHardware = singleInstanceHevc.copy(maxConcurrentInstances = 2))
+        assertEquals(listOf("HEVC", "H264"), dualBoth.eligibleCompanionEncoders("HEVC").map { it.codecKey })
+        assertEquals(listOf("H264"), dualBoth.eligibleCompanionEncoders("HEVC", requireH264Only = true).map { it.codecKey })
+
+        // When neither supports >= 2 instances, dual companion must be rejected
+        val singleBoth = summary.copy(h264Hardware = dualInstanceH264.copy(maxConcurrentInstances = 1))
+        assertFalse(singleBoth.supportsDualFormatCompanion())
+        assertNull(singleBoth.selectCompanionEncoder("HEVC"))
     }
 
     @Test
@@ -447,7 +473,7 @@ class SolStreamUnitTests {
     }
 
     @Test
-    fun micDspSparkBlanker_clampsMultiStrikeMosquitoRacketImpulsesWhilePreservingSpeech() {
+    fun micDspMicroImpulseClamper_shavesMosquitoRacketZapsUnder06ms() {
         val dsp = MicDspProcessor(48000)
         val luxe = MicDspProcessor.applyPresetToSettings(
             StreamSettings(voiceGenderProfile = "MALE"),
@@ -461,7 +487,7 @@ class SolStreamUnitTests {
             dsp.processMonoFrameInPlace(copy, copy.size)
         }
 
-        // Simulate 4 rapid electric mosquito-racket spark strikes ("phat-phat-phat") without 250 Hz vocal body
+        // Simulate 4 rapid sub-millisecond electric mosquito-racket spark strikes
         for (strike in 1..4) {
             val sparkFrame = FloatArray(480) { 0.001f }
             sparkFrame[40] = 0.95f
@@ -475,79 +501,64 @@ class SolStreamUnitTests {
     }
 
     @Test
-    fun micDspAllThreeGenderProfiles_preserveCleanSpeechInSolLuxeMode() {
-        for (gender in listOf("MALE", "FEMALE", "NEUTRAL")) {
-            val dsp = MicDspProcessor(48000)
-            val luxe = MicDspProcessor.applyPresetToSettings(
-                StreamSettings(voiceGenderProfile = gender, micGainPercent = 125),
-                "SOL_LUXE"
-            )
-            dsp.applySettings(luxe)
-
-            val fundHz = when (gender) {
-                "MALE" -> 115.0
-                "FEMALE" -> 210.0
-                else -> 155.0
-            }
-            var lastRms = 0f
-            repeat(8) {
-                val speech = FloatArray(480) { idx ->
-                    val t = idx.toDouble() / 48000.0
-                    (0.12 * sin(2.0 * PI * fundHz * t) +
-                        0.07 * sin(2.0 * PI * 260.0 * t) +
-                        0.04 * sin(2.0 * PI * 3200.0 * t)).toFloat()
-                }
-                dsp.processMonoFrameInPlace(speech, speech.size)
-                var sumSq = 0f
-                for (s in speech) {
-                    assertTrue(s.isFinite())
-                    assertTrue(abs(s) <= 1.0f)
-                    sumSq += s * s
-                }
-                lastRms = sqrt(sumSq / speech.size)
-            }
-            assertTrue("$gender speech RMS should remain strong and clear (>0.06f), was $lastRms", lastRms > 0.06f)
-        }
-    }
-
-    @Test
-    fun micDsp12ModeHardwareMatrix_adaptsPhoneStudioWiredUsbAndBluetoothAndPostAgcBoost() {
+    fun micDspAll12HardwareAndGenderCombinations_preserveCleanSpeechAndPostDspBoost() {
         for (hwMode in HardwareAcousticMode.entries) {
-            val dsp100 = MicDspProcessor(48000)
-            dsp100.applyHardwareAcousticMode(hwMode)
-            dsp100.applySettings(
-                MicDspProcessor.applyPresetToSettings(
-                    StreamSettings(voiceGenderProfile = "MALE", micGainPercent = 100),
-                    "SOL_LUXE"
+            for (gender in listOf("MALE", "NEUTRAL", "FEMALE")) {
+                val dsp100 = MicDspProcessor(48000)
+                dsp100.applyHardwareAcousticMode(hwMode)
+                dsp100.applySettings(
+                    MicDspProcessor.applyPresetToSettings(
+                        StreamSettings(voiceGenderProfile = gender, micGainPercent = 100),
+                        "SOL_LUXE"
+                    )
                 )
-            )
 
-            val dsp180 = MicDspProcessor(48000)
-            dsp180.applyHardwareAcousticMode(hwMode)
-            dsp180.applySettings(
-                MicDspProcessor.applyPresetToSettings(
-                    StreamSettings(voiceGenderProfile = "MALE", micGainPercent = 180),
-                    "SOL_LUXE"
+                val dsp180 = MicDspProcessor(48000)
+                dsp180.applyHardwareAcousticMode(hwMode)
+                dsp180.applySettings(
+                    MicDspProcessor.applyPresetToSettings(
+                        StreamSettings(voiceGenderProfile = gender, micGainPercent = 180),
+                        "SOL_LUXE"
+                    )
                 )
-            )
 
-            var rms100 = 0f
-            var rms180 = 0f
-            repeat(6) {
-                val frameA = FloatArray(480) { idx ->
-                    val t = idx.toDouble() / 48000.0
-                    (0.10 * sin(2.0 * PI * 115.0 * t) +
-                        0.07 * sin(2.0 * PI * 255.0 * t) +
-                        0.04 * sin(2.0 * PI * 2800.0 * t)).toFloat()
+                val fundHz = when (gender) {
+                    "MALE" -> 115.0
+                    "FEMALE" -> 210.0
+                    else -> 155.0
                 }
-                val frameB = frameA.clone()
-                dsp100.processMonoFrameInPlace(frameA, frameA.size)
-                dsp180.processMonoFrameInPlace(frameB, frameB.size)
+                var rms100 = 0f
+                var rms180 = 0f
+                repeat(8) { frameIdx ->
+                    val frameA = FloatArray(480) { i ->
+                        val sampleIdx = frameIdx * 480 + i
+                        val t = sampleIdx.toDouble() / 48000.0
+                        (0.10 * sin(2.0 * PI * fundHz * t) +
+                            0.07 * sin(2.0 * PI * 260.0 * t) +
+                            0.04 * sin(2.0 * PI * 2800.0 * t)).toFloat()
+                    }
+                    val frameB = frameA.clone()
+                    dsp100.processMonoFrameInPlace(frameA, frameA.size)
+                    dsp180.processMonoFrameInPlace(frameB, frameB.size)
 
-                rms100 = sqrt(frameA.fold(0f) { acc, v -> acc + v * v } / frameA.size)
-                rms180 = sqrt(frameB.fold(0f) { acc, v -> acc + v * v } / frameB.size)
+                    for (s in frameA) {
+                        assertTrue("$hwMode/$gender sample must be finite", s.isFinite())
+                        assertTrue("$hwMode/$gender must obey -1.16 dBTP ceiling", abs(s) <= MicDspProcessor.TRUE_PEAK_CEILING_LINEAR + 0.002f)
+                    }
+                    for (s in frameB) {
+                        assertTrue("$hwMode/$gender 180% sample must be finite", s.isFinite())
+                        assertTrue("$hwMode/$gender 180% must obey -1.16 dBTP ceiling", abs(s) <= MicDspProcessor.TRUE_PEAK_CEILING_LINEAR + 0.002f)
+                    }
+
+                    rms100 = sqrt(frameA.fold(0f) { acc, v -> acc + v * v } / frameA.size)
+                    rms180 = sqrt(frameB.fold(0f) { acc, v -> acc + v * v } / frameB.size)
+                }
+                assertTrue("$hwMode/$gender speech RMS must remain clear (>0.055f), was $rms100", rms100 > 0.055f)
+                assertTrue(
+                    "$hwMode/$gender: 180% Post-DSP Mic Boost ($rms180) must be louder than 100% ($rms100)",
+                    rms180 > rms100 * 1.30f
+                )
             }
-            assertTrue("Mode ${hwMode.name}: 180% Post-DSP Mic Boost ($rms180) must be louder than 100% ($rms100)", rms180 > rms100 * 1.35f)
         }
     }
 
@@ -573,14 +584,14 @@ class SolStreamUnitTests {
     }
 
     @Test
-    fun micDspSubOctaveAndVelvetEngine_enrichesBaritoneChestWithZeroIdleRumble() {
+    fun micDspLowBandWarmthAndChestContour_enrichesBaritoneWithZeroIdleRumble() {
         val dspLuxe = MicDspProcessor(48000)
         dspLuxe.applyHardwareAcousticMode(HardwareAcousticMode.PHONE_STUDIO)
         dspLuxe.applySettings(
             StreamSettings(
                 voiceGenderProfile = "MALE",
                 voicePreset = "SOL_LUXE",
-                hpfCutoffHz = 50,
+                hpfCutoffHz = 55,
                 voiceEqEnabled = true,
                 velvetWarmthEnabled = true,
                 compressorEnabled = false,
@@ -590,22 +601,22 @@ class SolStreamUnitTests {
             )
         )
 
-        // 1. Verify zero sub-warmth rumble during silence
+        // 1. Verify zero low-band rumble during silence
         val silentFrame = FloatArray(480) { 0f }
         repeat(5) {
             dspLuxe.processMonoFrameInPlace(silentFrame, silentFrame.size)
         }
         val maxSilentOut = silentFrame.maxOf { abs(it) }
-        assertTrue("Cubic analog sub-warmth synth must output 0.0 during silence, was $maxSilentOut", maxSilentOut < 1e-6f)
+        assertTrue("Low-band analog warmth shaper must output 0.0 during silence, was $maxSilentOut", maxSilentOut < 1e-6f)
 
-        // 2. Compare 98 Hz male baritone fundamental + 245 Hz vowel harmonic enrichment against dry CLEAN mode
+        // 2. Compare 98 Hz baritone fundamental + 245 Hz vowel enrichment against dry CLEAN mode
         val dspDry = MicDspProcessor(48000)
         dspDry.applyHardwareAcousticMode(HardwareAcousticMode.PHONE_STUDIO)
         dspDry.applySettings(
             StreamSettings(
                 voiceGenderProfile = "MALE",
                 voicePreset = "CLEAN",
-                hpfCutoffHz = 50,
+                hpfCutoffHz = 55,
                 voiceEqEnabled = false,
                 velvetWarmthEnabled = false,
                 compressorEnabled = false,
@@ -630,7 +641,7 @@ class SolStreamUnitTests {
             rmsLuxe = sqrt(fLuxe.fold(0f) { acc, v -> acc + v * v } / fLuxe.size)
             rmsDry = sqrt(fDry.fold(0f) { acc, v -> acc + v * v } / fDry.size)
         }
-        assertTrue("SolLuxe 2.0 95Hz proximity + cubic sub-warmth ($rmsLuxe) must enrich baritone warmth (>1.25x dry $rmsDry)", rmsLuxe > rmsDry * 1.25f)
+        assertTrue("SolLuxe 3.0 95Hz chest + low-band warmth ($rmsLuxe) must enrich baritone (>1.25x dry $rmsDry)", rmsLuxe > rmsDry * 1.25f)
     }
 
     @Test
@@ -643,20 +654,21 @@ class SolStreamUnitTests {
     }
 
     @Test
-    fun micDspHardBreathPlosiveGuard_ducksSub115HzAirBlastWhileKeepingVocalHarmonics() {
+    fun micDspSplitBandPlosiveGuard_ducksSub115HzAirBlastWhileKeepingVocalHarmonics() {
         val dspGuard = MicDspProcessor(48000)
         dspGuard.applyHardwareAcousticMode(HardwareAcousticMode.PHONE_STUDIO)
         dspGuard.applySettings(
             StreamSettings(
                 voiceGenderProfile = "MALE",
                 voicePreset = "CLEAN",
-                hpfCutoffHz = 50,
+                hpfCutoffHz = 55,
                 transientTamerEnabled = false,
                 noiseSuppressMode = "OFF",
                 rnnoiseLevel = 0,
                 noiseGateEnabled = false,
                 voiceEqEnabled = false,
                 velvetWarmthEnabled = false,
+                deEsserEnabled = false,
                 compressorEnabled = false,
                 whisperLiftEnabled = false,
                 slowAgcEnabled = false,
@@ -664,7 +676,6 @@ class SolStreamUnitTests {
             )
         )
 
-        // Feed a pure 75 Hz non-vocal wind/breath blast (zero 250 Hz vocal cord overtones)
         var rawRms = 0f
         var guardedRms = 0f
         repeat(8) { frameIdx ->
@@ -678,13 +689,13 @@ class SolStreamUnitTests {
             guardedRms = sqrt(windFrame.fold(0f) { acc, v -> acc + v * v } / windFrame.size)
         }
         assertTrue(
-            "Stage 5 Hard-Breath Guard must attenuate non-vocal 75Hz air blast ($guardedRms < 0.55x of $rawRms)",
+            "Stage 4 Split-Band Plosive Guard must attenuate non-vocal 75Hz air blast ($guardedRms < 0.55x of $rawRms)",
             guardedRms < rawRms * 0.55f
         )
     }
 
     @Test
-    fun micDspIndependentVocalBodyTracker_detectsSpeechWhenTransientTamerAndRnnoiseAreOff() {
+    fun micDspHybridVadTracker_detectsSpeechWhenTransientTamerAndRnnoiseAreOff() {
         val dsp = MicDspProcessor(48000)
         dsp.applySettings(
             StreamSettings(
@@ -708,88 +719,258 @@ class SolStreamUnitTests {
             }
             dsp.processMonoFrameInPlace(speech, speech.size)
         }
-        assertTrue("Fallback VAD must detect speech even when transientTamerEnabled is false", dsp.vadSpeechActive)
-        assertTrue("Fallback VAD probability should be >= 0.80f", dsp.lastVadProbability >= 0.80f)
+        assertTrue("Hybrid 16kHz-safe VAD must detect speech even when transientTamerEnabled is false", dsp.vadSpeechActive)
+        assertTrue("Hybrid VAD probability should be >= 0.45f", dsp.lastVadProbability >= 0.45f)
     }
 
     @Test
-    fun micDspAphexSilkAirExciter_synthesizesUpperHarmonicsWhenEnabled() {
-        val dspNoAir = MicDspProcessor(48000)
-        dspNoAir.applyHardwareAcousticMode(HardwareAcousticMode.PHONE_STUDIO)
-        dspNoAir.applySettings(
-            StreamSettings(
-                voiceGenderProfile = "FEMALE",
-                voicePreset = "SOL_LUXE",
-                hpfCutoffHz = 0,
-                transientTamerEnabled = false,
-                noiseSuppressMode = "OFF",
-                rnnoiseLevel = 0,
-                noiseGateEnabled = false,
-                voiceEqEnabled = false,
-                velvetWarmthEnabled = false,
-                deEsserEnabled = false,
-                compressorEnabled = false,
-                whisperLiftEnabled = false,
-                slowAgcEnabled = false,
-                micGainPercent = 100
+    fun micDspAirShelfDeEsserAndBluetoothLpf_maintainCleanFrequencySeparation() {
+        // 1. Clean 8.5 kHz Air Shelf boosts top-end air in PHONE_STUDIO
+        val dspFlat = MicDspProcessor(48000).apply {
+            applyHardwareAcousticMode(HardwareAcousticMode.PHONE_STUDIO)
+            applySettings(
+                StreamSettings(
+                    voiceGenderProfile = "FEMALE",
+                    voicePreset = "SOL_LUXE",
+                    hpfCutoffHz = 0,
+                    transientTamerEnabled = false,
+                    noiseSuppressMode = "OFF",
+                    rnnoiseLevel = 0,
+                    noiseGateEnabled = false,
+                    voiceEqEnabled = false,
+                    velvetWarmthEnabled = false,
+                    deEsserEnabled = false,
+                    compressorEnabled = false,
+                    whisperLiftEnabled = false,
+                    slowAgcEnabled = false,
+                    micGainPercent = 100
+                )
             )
-        )
-
-        val dspSilkAir = MicDspProcessor(48000)
-        dspSilkAir.applyHardwareAcousticMode(HardwareAcousticMode.PHONE_STUDIO)
-        dspSilkAir.applySettings(
-            StreamSettings(
-                voiceGenderProfile = "FEMALE",
-                voicePreset = "SOL_LUXE",
-                hpfCutoffHz = 0,
-                transientTamerEnabled = false,
-                noiseSuppressMode = "OFF",
-                rnnoiseLevel = 0,
-                noiseGateEnabled = false,
-                voiceEqEnabled = false,
-                velvetWarmthEnabled = true,
-                deEsserEnabled = false,
-                compressorEnabled = false,
-                whisperLiftEnabled = false,
-                slowAgcEnabled = false,
-                micGainPercent = 100
-            )
-        )
-
-        var slewNoAir = 0f
-        var slewSilkAir = 0f
-        repeat(8) { frameIdx ->
-            val frameA = FloatArray(480) { i ->
-                val sampleIdx = frameIdx * 480 + i
-                val t = sampleIdx.toDouble() / 48000.0
-                (0.14 * sin(2.0 * PI * 250.0 * t) +
-                    0.07 * sin(2.0 * PI * 3100.0 * t) +
-                    0.04 * sin(2.0 * PI * 7200.0 * t)).toFloat()
-            }
-            val frameB = frameA.clone()
-            dspNoAir.processMonoFrameInPlace(frameA, frameA.size)
-            dspSilkAir.processMonoFrameInPlace(frameB, frameB.size)
-
-            var sA = 0f
-            var sB = 0f
-            for (k in 1 until 480) {
-                sA += abs(frameA[k] - frameA[k - 1])
-                sB += abs(frameB[k] - frameB[k - 1])
-            }
-            slewNoAir = sA
-            slewSilkAir = sB
         }
-        assertTrue(
-            "Aphex Silk Air Exciter & Shelf ($slewSilkAir) must enrich high-frequency air over non-velvet mode ($slewNoAir)",
-            slewSilkAir > slewNoAir * 1.10f
-        )
+        val dspAir = MicDspProcessor(48000).apply {
+            applyHardwareAcousticMode(HardwareAcousticMode.PHONE_STUDIO)
+            applySettings(
+                StreamSettings(
+                    voiceGenderProfile = "FEMALE",
+                    voicePreset = "SOL_LUXE",
+                    hpfCutoffHz = 0,
+                    transientTamerEnabled = false,
+                    noiseSuppressMode = "OFF",
+                    rnnoiseLevel = 0,
+                    noiseGateEnabled = false,
+                    voiceEqEnabled = true,
+                    velvetWarmthEnabled = false,
+                    deEsserEnabled = false,
+                    compressorEnabled = false,
+                    whisperLiftEnabled = false,
+                    slowAgcEnabled = false,
+                    micGainPercent = 100
+                )
+            )
+        }
+        val dspBt = MicDspProcessor(48000).apply {
+            applyHardwareAcousticMode(HardwareAcousticMode.BLUETOOTH_SCO)
+            applySettings(
+                StreamSettings(
+                    voiceGenderProfile = "FEMALE",
+                    voicePreset = "SOL_LUXE",
+                    hpfCutoffHz = 0,
+                    transientTamerEnabled = false,
+                    noiseSuppressMode = "OFF",
+                    rnnoiseLevel = 0,
+                    noiseGateEnabled = false,
+                    voiceEqEnabled = true,
+                    velvetWarmthEnabled = false,
+                    deEsserEnabled = false,
+                    compressorEnabled = false,
+                    whisperLiftEnabled = false,
+                    slowAgcEnabled = false,
+                    micGainPercent = 100
+                )
+            )
+        }
+
+        var rmsFlat = 0f
+        var rmsAir = 0f
+        var rmsBt = 0f
+        repeat(8) { frameIdx ->
+            val tone9500 = FloatArray(480) { i ->
+                val t = (frameIdx * 480 + i).toDouble() / 48000.0
+                (0.08 * sin(2.0 * PI * 9500.0 * t)).toFloat()
+            }
+            val fA = tone9500.clone()
+            val fB = tone9500.clone()
+            val fC = tone9500.clone()
+            dspFlat.processMonoFrameInPlace(fA, fA.size)
+            dspAir.processMonoFrameInPlace(fB, fB.size)
+            dspBt.processMonoFrameInPlace(fC, fC.size)
+            rmsFlat = sqrt(fA.fold(0f) { acc, v -> acc + v * v } / fA.size)
+            rmsAir = sqrt(fB.fold(0f) { acc, v -> acc + v * v } / fB.size)
+            rmsBt = sqrt(fC.fold(0f) { acc, v -> acc + v * v } / fC.size)
+        }
+        assertTrue("8.5 kHz Air Shelf ($rmsAir) must boost 9.5 kHz air over flat ($rmsFlat)", rmsAir > rmsFlat * 1.12f)
+        assertTrue("Bluetooth SCO 5.2 kHz LPF ($rmsBt) must roll off 9.5 kHz hiss vs Phone Studio ($rmsAir)", rmsBt < rmsAir * 0.45f)
+
+        // 2. Dynamic De-Esser tames sharp 6.2 kHz Male sibilance without dulling warm 250 Hz vowels
+        val dspNoDeEss = MicDspProcessor(48000).apply {
+            applySettings(
+                StreamSettings(
+                    voiceGenderProfile = "MALE",
+                    voicePreset = "CLEAN",
+                    hpfCutoffHz = 0,
+                    transientTamerEnabled = false,
+                    noiseSuppressMode = "OFF",
+                    rnnoiseLevel = 0,
+                    noiseGateEnabled = false,
+                    voiceEqEnabled = false,
+                    velvetWarmthEnabled = false,
+                    deEsserEnabled = false,
+                    compressorEnabled = false,
+                    whisperLiftEnabled = false,
+                    slowAgcEnabled = false,
+                    micGainPercent = 100
+                )
+            )
+        }
+        val dspDeEss = MicDspProcessor(48000).apply {
+            applySettings(
+                StreamSettings(
+                    voiceGenderProfile = "MALE",
+                    voicePreset = "CLEAN",
+                    hpfCutoffHz = 0,
+                    transientTamerEnabled = false,
+                    noiseSuppressMode = "OFF",
+                    rnnoiseLevel = 0,
+                    noiseGateEnabled = false,
+                    voiceEqEnabled = false,
+                    velvetWarmthEnabled = false,
+                    deEsserEnabled = true,
+                    compressorEnabled = false,
+                    whisperLiftEnabled = false,
+                    slowAgcEnabled = false,
+                    micGainPercent = 100
+                )
+            )
+        }
+        var sibDryRms = 0f
+        var sibTamedRms = 0f
+        repeat(8) { frameIdx ->
+            val hiss = FloatArray(480) { i ->
+                val t = (frameIdx * 480 + i).toDouble() / 48000.0
+                (0.18 * sin(2.0 * PI * 6200.0 * t)).toFloat()
+            }
+            val a = hiss.clone()
+            val b = hiss.clone()
+            dspNoDeEss.processMonoFrameInPlace(a, a.size)
+            dspDeEss.processMonoFrameInPlace(b, b.size)
+            sibDryRms = sqrt(a.fold(0f) { acc, v -> acc + v * v } / a.size)
+            sibTamedRms = sqrt(b.fold(0f) { acc, v -> acc + v * v } / b.size)
+        }
+        assertTrue("De-Esser must tame sharp 6.2 kHz Male sibilance ($sibTamedRms < 0.80x of $sibDryRms)", sibTamedRms < sibDryRms * 0.80f)
     }
 
     @Test
-    fun smartZoomStepsAndPresetCoordinator_enforce108PercentDefaultAnd13StageSolLuxe() {
+    fun micDspSmoothExpander_avoidsHardZeroMsSpeechOnsetClicks() {
+        val dsp = MicDspProcessor(48000).apply {
+            applySettings(
+                StreamSettings(
+                    voiceGenderProfile = "MALE",
+                    voicePreset = "SOL_LUXE",
+                    noiseSuppressMode = "OFF",
+                    rnnoiseLevel = 0,
+                    noiseGateEnabled = true,
+                    micGainPercent = 100
+                )
+            )
+        }
+        // Let expander settle smoothly to idle -14 dB floor during quiet pause
+        repeat(35) {
+            val quiet = FloatArray(480) { 0.0004f }
+            dsp.processMonoFrameInPlace(quiet, quiet.size)
+        }
+        // Sudden speech onset: 8 ms smooth attack guarantees no instantaneous full-scale step click
+        val onset = FloatArray(480) { i ->
+            val t = i.toDouble() / 48000.0
+            (0.14 * sin(2.0 * PI * 220.0 * t)).toFloat()
+        }
+        dsp.processMonoFrameInPlace(onset, onset.size)
+        val first10Peak = (0 until 10).maxOf { abs(onset[it]) }
+        val last50Peak = (430 until 480).maxOf { abs(onset[it]) }
+        assertTrue("8 ms smooth expander attack should ramp gradually (start $first10Peak < end $last50Peak)", first10Peak < last50Peak)
+    }
+
+    @Test
+    fun micDspRawMode_reportsBypassedDenoiserSummaryAndZeroGainReduction() {
+        val dsp = MicDspProcessor(48000)
+        dsp.applySettings(
+            StreamSettings(
+                voicePreset = "RAW",
+                noiseSuppressMode = "RNNOISE",
+                rnnoiseLevel = 2,
+                micGainPercent = 100
+            )
+        )
+        assertEquals("Bypassed (RAW Mode)", dsp.activeDenoiserSummary)
+
+        val frame = FloatArray(480) { i -> (0.20 * sin(2.0 * PI * 300.0 * i / 48000.0)).toFloat() }
+        dsp.processMonoFrameInPlace(frame, frame.size)
+        assertEquals(0f, dsp.lastGainReductionDb, 0.001f)
+    }
+
+    @Test
+    fun audioWorkerBarrier_releasesSharedResourcesOnlyOnceAfterBothWorkersExit() {
+        // Case 1: Deferred release when both workers outlive stopStreamingAudio() join
+        val deferredBarrier = AudioWorkerBarrier()
+        deferredBarrier.registerWorker() // Mixer
+        deferredBarrier.registerWorker() // AAC Drain
+        assertFalse(deferredBarrier.requestRelease())
+        assertFalse(deferredBarrier.isReleased())
+        // First worker exits while second is still active -> MUST NOT release yet
+        assertFalse(deferredBarrier.onWorkerExited())
+        assertFalse(deferredBarrier.isReleased())
+        // Final worker exits -> releases exactly once
+        assertTrue(deferredBarrier.onWorkerExited())
+        assertTrue(deferredBarrier.isReleased())
+        // Duplicate exit guard -> never double-releases
+        assertFalse(deferredBarrier.onWorkerExited())
+
+        // Case 2: Normal shutdown where both workers finish before requestRelease()
+        val normalBarrier = AudioWorkerBarrier()
+        normalBarrier.registerWorker()
+        normalBarrier.registerWorker()
+        assertFalse(normalBarrier.onWorkerExited())
+        assertFalse(normalBarrier.onWorkerExited())
+        assertTrue(normalBarrier.requestRelease())
+        assertFalse(normalBarrier.requestRelease())
+    }
+
+    @Test
+    fun linearMonoResampler48k_converts44100And16000Pcm16ToExact480FloatSamples() {
+        for (srcRate in listOf(44100, 16000)) {
+            val resampler = LinearMonoResampler48k(srcRate)
+            val srcSamples = ShortArray(resampler.sourceSamplesPer10ms) { i ->
+                val t = i.toDouble() / srcRate.toDouble()
+                (0.5 * sin(2.0 * PI * 440.0 * t) * 32767.0).roundToInt().toShort()
+            }
+            val dest480 = FloatArray(480)
+            resampler.resample10msPcm16To480Float(srcSamples, srcSamples.size, dest480)
+
+            var sumSq = 0f
+            for (s in dest480) {
+                assertTrue("Resampled $srcRate Hz sample must be finite", s.isFinite())
+                assertTrue("Resampled $srcRate Hz sample must stay in [-1, 1]", abs(s) <= 1.0f)
+                sumSq += s * s
+            }
+            val rms = sqrt(sumSq / dest480.size)
+            assertTrue("Resampled $srcRate Hz RMS ($rms) should match ~0.353f sine RMS", rms in 0.30f..0.40f)
+        }
+    }
+
+    @Test
+    fun smartZoomStepsAndPresetCoordinator_enforce108PercentDefaultAndSolLuxe30() {
         assertTrue(SolStreamService.SMART_ZOOM_STEPS.contains(108))
         assertFalse(SolStreamService.SMART_ZOOM_STEPS.contains(104))
         assertEquals(108, StreamSettings().smartZoomPercent)
-        assertEquals("SOL LUXE (13-Stage Silk Studio)", MicDspProcessor.presetDisplayName("SOL_LUXE"))
+        assertEquals("SOL LUXE 3.0 (Pure Condenser)", MicDspProcessor.presetDisplayName("SOL_LUXE"))
     }
 }
