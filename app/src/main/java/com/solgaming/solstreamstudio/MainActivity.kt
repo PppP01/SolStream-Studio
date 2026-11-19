@@ -34,12 +34,14 @@ import android.os.PowerManager
 import android.os.SystemClock
 import android.provider.Settings
 import android.text.InputType
+import android.text.TextUtils
 import android.text.method.PasswordTransformationMethod
 import android.util.TypedValue
 import android.view.Gravity
 import android.view.View
 import android.widget.Button
 import android.widget.EditText
+import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.SeekBar
@@ -88,7 +90,7 @@ class MainActivity : AppCompatActivity() {
     private val netTestBusy = AtomicBoolean(false)
     private val hwScanBusy = AtomicBoolean(false)
 
-    // Responsive Layout Containers (for Android 16/17 Foldables, Tablets & Rotation)
+    // Responsive Layout Containers (Android 10–18 Phones, Foldables & Tablets)
     private lateinit var fixedHeaderBox: LinearLayout
     private lateinit var mainContentContainer: LinearLayout
     private var lastInsetLeft = 0
@@ -96,8 +98,15 @@ class MainActivity : AppCompatActivity() {
     private var lastInsetRight = 0
     private var lastInsetBottom = 0
 
-    // Fixed Header, Live Idle Telemetry Banner & 3-Tile Hero Summary Bar
+    // Fixed Header, Glanceable Live Chips, Protect Long Streams Banner & 3-Tile Hero Bar
     private lateinit var tvHeaderSubtitle: TextView
+    private lateinit var tvChipAudio: TextView
+    private lateinit var tvChipVideo: TextView
+    private lateinit var tvChipProtection: TextView
+    private lateinit var boxProtectBanner: LinearLayout
+    private lateinit var tvProtectTitle: TextView
+    private lateinit var tvProtectTip: TextView
+    private lateinit var btnProtectAction: Button
     private lateinit var tvLiveBanner: TextView
     private lateinit var tvHeroResValue: TextView
     private lateinit var tvHeroFpsValue: TextView
@@ -169,7 +178,6 @@ class MainActivity : AppCompatActivity() {
     private lateinit var btnPickOverlayPng: Button
     private lateinit var btnOverlayPosition: Button
     private lateinit var btnPickShortsPoster: Button
-    private lateinit var btnToggleOverlayOn: Button
     private lateinit var etBannerText: EditText
     private lateinit var btnBannerToggle: Button
     private lateinit var btnBannerPos: Button
@@ -182,7 +190,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var btnKeyframeAndBFrames: Button
     private lateinit var btnQpAndLatency: Button
 
-    // Card 4: 13-Stage SolLuxe™ 2.0 Audio, SeekBar Sliders, 250% Game Soundstage & 10s Calibrator
+    // Card 4: 6-Stage SolLuxe™ 3.0 Pure Voice Studio, SeekBar Sliders, 250% Game Soundstage & 10s Calibrator
     private lateinit var btnMicDevice: Button
     private lateinit var btnMicSource: Button
     private lateinit var btnAudioBitrate: Button
@@ -222,6 +230,7 @@ class MainActivity : AppCompatActivity() {
 
     // Card 5: Launch, Reports, Saved Clips, Benchmark & Support
     private lateinit var btnGoLive: Button
+    private lateinit var btnReportsQuick: Button
     private lateinit var btnSavedClipsQuick: Button
     private lateinit var btnGlipBench: Button
 
@@ -254,15 +263,7 @@ class MainActivity : AppCompatActivity() {
                     "Android blocked the permission popup — turn ON Microphone & Notifications in App Permissions here!",
                     Toast.LENGTH_LONG
                 ).show()
-                try {
-                    startActivity(
-                        Intent(
-                            Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
-                            Uri.parse("package:$packageName")
-                        )
-                    )
-                } catch (_: Exception) {
-                }
+                openAppInfoSettings()
             }
         }
         askedRuntimePermOnce = true
@@ -317,7 +318,6 @@ class MainActivity : AppCompatActivity() {
         DiagnosticsLogger.installPrivacySafeCrashHandler(this)
         appVersionName = readAppVersionName()
 
-        // Instant 0-ms cached/placeholder summary so MainActivity.onCreate() NEVER blocks UI thread!
         scanSummary = CodecCapabilityProbe.peekCachedOrPlaceholder(this)
         settings = KeystoreVault.loadSettings(this)
         micOptions = CodecCapabilityProbe.listAvailableMicInputs(this)
@@ -334,7 +334,6 @@ class MainActivity : AppCompatActivity() {
         }
         refreshAllUi()
 
-        // Complete full multi-encoder hardware verification asynchronously in background.
         CodecCapabilityProbe.scanDeviceAsync(this, forceRefresh = false) { verifiedScan ->
             if (!isFinishing && !isDestroyed) {
                 scanSummary = verifiedScan
@@ -346,17 +345,12 @@ class MainActivity : AppCompatActivity() {
                     KeystoreVault.markInitialAutoScanDone(this)
                 }
                 tvHeaderSubtitle.text =
-                    "SolApex™ HyperStream • ${scanSummary.friendlyHardwareLine()}\n${scanSummary.toBadgeText()}"
+                    "${scanSummary.friendlyHardwareLine()}\n${scanSummary.toBadgeText()}"
                 refreshAllUi()
             }
         }
     }
 
-    /**
-     * Android 16/17 (API 36/37) Large-Screen, Foldable & Rotation Handler:
-     * Updates responsive horizontal centering padding whenever the phone rotates or a foldable unfolds
-     * without destroying or resetting the active dashboard state!
-     */
     override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)
         applyResponsiveContainerPadding()
@@ -371,10 +365,6 @@ class MainActivity : AppCompatActivity() {
         uiHandler.post(idleTelemetryRefreshRunnable)
     }
 
-    /**
-     * Auto-saves any typed Ingest URL, Stream Keys, or Live Banner Text when the user
-     * switches to Chrome/YouTube Studio or back to CODM so unsaved edits are never wiped in onResume()!
-     */
     override fun onPause() {
         uiHandler.removeCallbacks(idleTelemetryRefreshRunnable)
         try {
@@ -400,53 +390,67 @@ class MainActivity : AppCompatActivity() {
                 @Suppress("DEPRECATION")
                 packageManager.getPackageInfo(packageName, 0)
             }
-            info.versionName?.removeSuffix("-debug") ?: "1.3.0"
+            info.versionName?.removeSuffix("-debug") ?: "1.4.0"
         } catch (_: Exception) {
-            "1.3.0"
+            "1.4.0"
         }
     }
 
     private fun applyResponsiveContainerPadding() {
         if (!::fixedHeaderBox.isInitialized || !::mainContentContainer.isInitialized) return
         val screenW = resources.displayMetrics.widthPixels
-        val maxContentW = dp(640)
+        val maxContentW = dp(660)
         val extraSidePad = if (screenW > maxContentW) ((screenW - maxContentW) / 2) else 0
-        val leftPad = max(dp(14), lastInsetLeft + dp(10)) + extraSidePad
-        val rightPad = max(dp(14), lastInsetRight + dp(10)) + extraSidePad
+        val leftPad = max(dp(16), lastInsetLeft + dp(12)) + extraSidePad
+        val rightPad = max(dp(16), lastInsetRight + dp(12)) + extraSidePad
 
         fixedHeaderBox.setPadding(
             leftPad,
-            max(dp(10), lastInsetTop + dp(6)),
+            max(dp(12), lastInsetTop + dp(8)),
             rightPad,
-            dp(9)
+            dp(10)
         )
         mainContentContainer.setPadding(
             leftPad,
-            dp(8),
+            dp(10),
             rightPad,
-            max(dp(24), lastInsetBottom + dp(16))
+            max(dp(28), lastInsetBottom + dp(20))
         )
     }
 
+    private fun buildBrandAntiKillOneLiner(): String {
+        val mfr = "${Build.MANUFACTURER} ${Build.BRAND}".lowercase(Locale.US)
+        return when {
+            mfr.contains("samsung") ->
+                "Samsung Tip: Set Battery → Unrestricted, add SolStream & your game to Device Care → Memory → Excluded apps, and keep RAM Plus OFF."
+            mfr.contains("xiaomi") || mfr.contains("redmi") || mfr.contains("poco") ->
+                "HyperOS/MIUI Tip: Set Battery → No restrictions, enable Autostart, and lock SolStream in Recents."
+            mfr.contains("oneplus") || mfr.contains("oppo") || mfr.contains("realme") ->
+                "ColorOS/OxygenOS Tip: Turn ON Allow Background Activity and lock SolStream in Recents."
+            mfr.contains("vivo") || mfr.contains("iqoo") ->
+                "Vivo/iQOO Tip: Allow High Background Power Consumption, lock in Recents, and keep Game Frame Interpolation OFF."
+            else ->
+                "Android Tip: Set Battery → Unrestricted in App Info so Android never cuts long broadcasts."
+        }
+    }
+
     private fun buildDashboardUi(): View {
-        // Outer vertical root pins the Top Header Bar above the ScrollView so scrolling
-        // cards never collide with the phone's top status bar clock or battery icon!
         val outerRoot = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setBackgroundColor(Color.parseColor("#050914"))
+            setBackgroundColor(Color.parseColor("#050A14"))
         }
 
         fixedHeaderBox = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             background = GradientDrawable(
                 GradientDrawable.Orientation.TOP_BOTTOM,
-                intArrayOf(Color.parseColor("#060C1A"), Color.parseColor("#0B162C"))
+                intArrayOf(Color.parseColor("#050A14"), Color.parseColor("#0A1324"))
             )
-            setPadding(dp(14), dp(12), dp(14), dp(9))
+            setPadding(dp(16), dp(14), dp(16), dp(10))
         }
 
         val rootScroll = ScrollView(this).apply {
-            setBackgroundColor(Color.parseColor("#050914"))
+            setBackgroundColor(Color.parseColor("#050A14"))
             isFillViewport = true
             layoutParams = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
@@ -457,7 +461,7 @@ class MainActivity : AppCompatActivity() {
 
         val container = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(14), dp(8), dp(14), dp(28))
+            setPadding(dp(16), dp(10), dp(16), dp(28))
         }
         mainContentContainer = container
 
@@ -473,65 +477,85 @@ class MainActivity : AppCompatActivity() {
             insets
         }
 
-        // === FIXED SOLAPEX™ BRANDED STUDIO HEADER WITH SIGNAL CREST ===
+        // === FIXED OBSIDIAN-GLASS STUDIO HEADER WITH SOLAR ECLIPSE 'S' ICON ===
         val titleRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
         }
 
-        // Mini SolStream 'S' Energy Signal Core Crest Badge
-        val crestBadge = TextView(this).apply {
-            text = "S•"
-            gravity = Gravity.CENTER
-            setTextColor(Color.parseColor("#00E5FF"))
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13.5f)
-            typeface = Typeface.DEFAULT_BOLD
-            background = GradientDrawable(
-                GradientDrawable.Orientation.TL_BR,
-                intArrayOf(Color.parseColor("#0D254C"), Color.parseColor("#2A125E"))
-            ).apply {
-                cornerRadius = dp(8).toFloat()
-                setStroke(dp(1), Color.parseColor("#00E5FF"))
-            }
-            layoutParams = LinearLayout.LayoutParams(dp(30), dp(30)).apply {
-                marginEnd = dp(8)
+        val logoIconView = ImageView(this).apply {
+            setImageResource(R.drawable.ic_solstream_logo)
+            contentDescription = "SolStream Studio Logo"
+            scaleType = ImageView.ScaleType.FIT_CENTER
+            layoutParams = LinearLayout.LayoutParams(dp(36), dp(36)).apply {
+                marginEnd = dp(10)
             }
         }
 
-        val title = TextView(this).apply {
-            text = "SOLSTREAM STUDIO • ULTRA"
-            setTextColor(Color.parseColor("#F8FAFC"))
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 17.5f)
-            typeface = Typeface.DEFAULT_BOLD
-            letterSpacing = 0.02f
+        val titleCol = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
             layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
         }
-        val verBadge = TextView(this).apply {
-            text = "v$appVersionName • SolApex™"
-            setTextColor(Color.parseColor("#00E5FF"))
+        val title = TextView(this).apply {
+            text = "SolStream Studio"
+            setTextColor(Color.parseColor("#F8FAFC"))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 18.0f)
+            typeface = Typeface.DEFAULT_BOLD
+            letterSpacing = 0.01f
+        }
+        val subtitleTag = TextView(this).apply {
+            text = "SolApex™ HyperStream • v$appVersionName"
+            setTextColor(Color.parseColor("#38BDF8"))
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 10.5f)
             typeface = Typeface.DEFAULT_BOLD
-            setPadding(dp(8), dp(3), dp(8), dp(3))
-            background = roundedDrawable("#0F2744", "#00E5FF")
         }
-        titleRow.addView(crestBadge)
-        titleRow.addView(title)
-        titleRow.addView(verBadge)
+        titleCol.addView(title)
+        titleCol.addView(subtitleTag)
+
+        val btnGuideTop = TextView(this).apply {
+            text = "📖 Guide"
+            setTextColor(Color.parseColor("#E0F2FE"))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f)
+            typeface = Typeface.DEFAULT_BOLD
+            setPadding(dp(11), dp(6), dp(11), dp(6))
+            background = roundedDrawable("#0E2A47", "#00E5FF")
+            setOnClickListener { showPlainEnglishGlossaryDialog() }
+        }
+
+        titleRow.addView(logoIconView)
+        titleRow.addView(titleCol)
+        titleRow.addView(btnGuideTop)
+
+        // 3 Glanceable Studio Chips (Audio Engine • Video Target • Long-Stream Protection)
+        val chipRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, dp(8), 0, dp(2))
+        }
+        tvChipAudio = makeStatusChip("SolLuxe 3.0", "#0C2138", "#00E5FF", "#E0F2FE")
+        tvChipVideo = makeStatusChip("1440p60 • HEVC", "#0C2138", "#38BDF8", "#E0F2FE")
+        tvChipProtection = makeStatusChip("Protected ✓", "#0A2B22", "#10B981", "#A7F3D0").apply {
+            setOnClickListener { openBatteryUnrestricted() }
+        }
+        chipRow.addView(tvChipAudio, LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply { marginEnd = dp(6) })
+        chipRow.addView(tvChipVideo, LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply { marginEnd = dp(6) })
+        chipRow.addView(tvChipProtection)
 
         tvHeaderSubtitle = TextView(this).apply {
-            text = "SolApex™ HyperStream • ${scanSummary.friendlyHardwareLine()}\n${scanSummary.toBadgeText()}"
-            setTextColor(Color.parseColor("#94A3B8"))
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 10.5f)
-            setPadding(0, dp(4), 0, dp(4))
+            text = "${scanSummary.friendlyHardwareLine()}\n${scanSummary.toBadgeText()}"
+            setTextColor(Color.parseColor("#8FA3BD"))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 10.2f)
+            setPadding(0, dp(5), 0, dp(4))
         }
 
         val topHelperRow = buttonRow(
-            actionButton("📖 Guide, Privacy & Licenses", "#0D3652") { showPlainEnglishGlossaryDialog() },
-            actionButton("Copy Preset", "#152338") { copyPresetToClipboard() },
-            actionButton("Import Preset", "#152338") { importPresetFromClipboard() }
+            actionButton("📖 User Guide & Privacy", "#0D3652") { showPlainEnglishGlossaryDialog() },
+            actionButton("Copy Preset", "#111C2F") { copyPresetToClipboard() },
+            actionButton("Import Preset", "#111C2F") { importPresetFromClipboard() }
         )
 
         fixedHeaderBox.addView(titleRow)
+        fixedHeaderBox.addView(chipRow)
         fixedHeaderBox.addView(tvHeaderSubtitle)
         fixedHeaderBox.addView(topHelperRow)
 
@@ -541,24 +565,71 @@ class MainActivity : AppCompatActivity() {
                 intArrayOf(
                     Color.parseColor("#00E5FF"),
                     Color.parseColor("#2979FF"),
-                    Color.parseColor("#7C3AED")
+                    Color.parseColor("#1D4ED8")
                 )
             )
-            layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(2))
+            layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(1.5f.roundToInt()))
         }
+
+        // === LIVE "PROTECT LONG STREAMS" READINESS BANNER (ZERO EXTRA PERMISSIONS) ===
+        boxProtectBanner = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(14), dp(11), dp(14), dp(11))
+            val lp = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = dp(6) }
+            layoutParams = lp
+            background = cardDrawable("#1F170A", "#F59E0B")
+        }
+        val protectTopRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        tvProtectTitle = TextView(this).apply {
+            text = "🛡️ Long-Stream Protection: Setup Needed"
+            setTextColor(Color.parseColor("#FDE68A"))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.2f)
+            typeface = Typeface.DEFAULT_BOLD
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+        }
+        btnProtectAction = Button(this).apply {
+            text = "Protect"
+            isAllCaps = false
+            setTextColor(Color.parseColor("#050A14"))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.2f)
+            typeface = Typeface.DEFAULT_BOLD
+            background = roundedDrawable("#F59E0B", "#FDE68A")
+            setPadding(dp(12), dp(4), dp(12), dp(4))
+            layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, dp(32))
+            setOnClickListener { openBatteryUnrestricted() }
+        }
+        protectTopRow.addView(tvProtectTitle)
+        protectTopRow.addView(btnProtectAction)
+
+        tvProtectTip = TextView(this).apply {
+            text = buildBrandAntiKillOneLiner()
+            setTextColor(Color.parseColor("#CBD5E1"))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 10.8f)
+            setPadding(0, dp(5), 0, 0)
+        }
+        boxProtectBanner.addView(protectTopRow)
+        boxProtectBanner.addView(tvProtectTip)
+        boxProtectBanner.setOnClickListener { showAllBrandSetupGuide() }
+        container.addView(boxProtectBanner)
 
         // === LIVE IDLE / ACTIVE TELEMETRY BANNER ===
         tvLiveBanner = TextView(this).apply {
             setTextColor(Color.parseColor("#F8FAFC"))
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f)
             typeface = Typeface.DEFAULT_BOLD
-            setPadding(dp(12), dp(9), dp(12), dp(9))
+            setPadding(dp(14), dp(10), dp(14), dp(10))
             val lp = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT
-            ).apply { topMargin = dp(4) }
+            ).apply { topMargin = dp(10) }
             layoutParams = lp
-            background = cardDrawable("#0B1D2C", "#00E5FF")
+            background = cardDrawable("#0B1829", "#00E5FF")
         }
 
         btnReapproveCapture = actionButton("RE-APPROVE SCREEN CAPTURE TO RESUME VIDEO", "#E65100") {
@@ -577,7 +648,7 @@ class MainActivity : AppCompatActivity() {
             val lp = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT
-            ).apply { topMargin = dp(9) }
+            ).apply { topMargin = dp(12) }
             layoutParams = lp
         }
         val (tileResBox, tileResVal) = makeHeroTile("RESOLUTION", "1440p (2K)") {
@@ -593,8 +664,8 @@ class MainActivity : AppCompatActivity() {
         tvHeroFpsValue = tileFpsVal
         tvHeroBitrateValue = tileBitVal
 
-        heroRow.addView(tileResBox, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply { marginEnd = dp(6) })
-        heroRow.addView(tileFpsBox, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply { marginEnd = dp(6) })
+        heroRow.addView(tileResBox, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply { marginEnd = dp(8) })
+        heroRow.addView(tileFpsBox, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply { marginEnd = dp(8) })
         heroRow.addView(tileBitBox, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
         container.addView(heroRow)
 
@@ -618,8 +689,8 @@ class MainActivity : AppCompatActivity() {
                 setTextColor(Color.WHITE)
                 setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
                 setPadding(dp(2), dp(6), dp(2), dp(6))
-                val lp = LinearLayout.LayoutParams(0, dp(38), 1f).apply {
-                    if (idx > 0) marginStart = dp(4)
+                val lp = LinearLayout.LayoutParams(0, dp(40), 1f).apply {
+                    if (idx > 0) marginStart = dp(5)
                 }
                 layoutParams = lp
                 setOnClickListener {
@@ -640,7 +711,7 @@ class MainActivity : AppCompatActivity() {
         cardTier.addView(tvTierDescription)
         container.addView(cardTier)
 
-        // === CARD 1: PRE-FLIGHT READINESS, AUTO-COLLAPSE, 5TH AUDIO/WIFI LINE & ALL-BRAND GUIDE ===
+        // === CARD 1: PRE-FLIGHT READINESS, AUTO-COLLAPSE & ALL-BRAND ANTI-KILL GUIDE ===
         val cardPreflight = sectionCard(
             heading = "1. Pre-Flight Readiness & Setup",
             engineBadge = "PRE-FLIGHT",
@@ -652,13 +723,13 @@ class MainActivity : AppCompatActivity() {
             setTextColor(Color.parseColor("#00E5FF"))
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
             typeface = Typeface.DEFAULT_BOLD
-            setPadding(0, dp(2), 0, dp(4))
+            setPadding(0, dp(3), 0, dp(6))
         }
         cardPreflight.addView(tvPreflightStatus)
         cardPreflight.addView(tvPreflightAudioWifiLine)
 
         btnPreflightCollapsedToggle = actionButton(
-            "✅ All 4 Pre-Flight Checks READY (Tap to Show Setup & All-Brand Guide)",
+            "✅ All 4 Pre-Flight Checks READY (Tap to Expand Setup & Anti-Kill Guide)",
             "#0D3652"
         ) {
             preflightManuallyExpanded = !preflightManuallyExpanded
@@ -671,15 +742,15 @@ class MainActivity : AppCompatActivity() {
         }
 
         tvRestrictedHint = TextView(this).apply {
-            text = "Android 13–18 Tip (For Sideloaded APKs): Tap '3. Tap Accessibility 1st' -> Accept disclosure -> tap greyed-out SolStream Studio once & hit OK -> then tap '4. Unlock Restricted (⋮)' -> tap ⋮ at top-right (or scroll to bottom of App Info on Xiaomi/POCO/Vivo) -> tap 'Allow restricted settings'! (Play Store installs unlock automatically.)"
-            setTextColor(Color.parseColor("#FFD54F"))
+            text = "Android 13–18 Tip (Sideloaded APK): Tap '3. Tap Accessibility 1st' → Accept disclosure → tap greyed-out SolStream Studio once & OK → then tap '4. Unlock Restricted (⋮)' → tap ⋮ at top-right → 'Allow restricted settings'."
+            setTextColor(Color.parseColor("#FDE68A"))
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
-            setPadding(0, dp(2), 0, dp(6))
+            setPadding(0, dp(3), 0, dp(6))
         }
         boxPreflightButtonsContainer.addView(tvRestrictedHint)
 
         btnGrantMicNotif = actionButton("1. Grant Mic & Notif", "#101929") { requestRuntimePermissions() }
-        btnUnrestrictedBatt = actionButton("2. Unrestricted Batt", "#101929") { openBatteryUnrestricted() }
+        btnUnrestrictedBatt = actionButton("2. Battery Unrestricted", "#101929") { openBatteryUnrestricted() }
         btnTapAccessibilityFirst = actionButton("3. Tap Accessibility 1st", "#101929") {
             showPlayStoreCompliantAccessibilityDisclosure(allowSkipToStream = false)
         }
@@ -688,7 +759,7 @@ class MainActivity : AppCompatActivity() {
         boxPreflightButtonsContainer.addView(buttonRow(btnGrantMicNotif, btnUnrestrictedBatt))
         boxPreflightButtonsContainer.addView(buttonRow(btnTapAccessibilityFirst, btnUnlockRestricted))
         boxPreflightButtonsContainer.addView(
-            actionButton("All-Brand Phone Setup, Earphones & Cool-Stream Guide", "#152844") {
+            actionButton("🛡️ All-Brand Anti-Kill, Excluded Apps & Cool-Stream Guide", "#152844") {
                 showAllBrandSetupGuide()
             }
         )
@@ -702,13 +773,13 @@ class MainActivity : AppCompatActivity() {
             badgeHex = "#00E5FF"
         )
 
-        cardStream.addView(labelText("Select Broadcast Platform (Auto-configures Codec, Max Mbps & AAC):"))
+        cardStream.addView(labelText("Broadcast Platform (Auto-configures Codec, Max Mbps & AAC):"))
         val platRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             layoutParams = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT
-            ).apply { topMargin = dp(3); bottomMargin = dp(4) }
+            ).apply { topMargin = dp(4); bottomMargin = dp(6) }
         }
         val platforms = listOf("YOUTUBE" to "YouTube", "TWITCH" to "Twitch", "KICK" to "Kick", "CUSTOM" to "Custom")
         platforms.forEachIndexed { idx, (platKey, platTitle) ->
@@ -716,10 +787,10 @@ class MainActivity : AppCompatActivity() {
                 text = platTitle
                 isAllCaps = false
                 setTextColor(Color.WHITE)
-                setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.2f)
                 setPadding(dp(2), dp(6), dp(2), dp(6))
-                layoutParams = LinearLayout.LayoutParams(0, dp(38), 1f).apply {
-                    if (idx > 0) marginStart = dp(4)
+                layoutParams = LinearLayout.LayoutParams(0, dp(40), 1f).apply {
+                    if (idx > 0) marginStart = dp(5)
                 }
                 setOnClickListener { selectPlatformPreset(platKey) }
             }
@@ -735,7 +806,7 @@ class MainActivity : AppCompatActivity() {
         val keyHeaderRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(0, dp(6), 0, dp(2))
+            setPadding(0, dp(8), 0, dp(4))
         }
         tvVaultSecurityLabel = TextView(this).apply {
             text = "Primary Stream Key (${KeystoreVault.getKeySecurityDescription()}):"
@@ -748,7 +819,7 @@ class MainActivity : AppCompatActivity() {
             setTextColor(Color.parseColor("#00E5FF"))
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 10.5f)
             typeface = Typeface.DEFAULT_BOLD
-            setPadding(dp(7), dp(2), dp(7), dp(2))
+            setPadding(dp(8), dp(3), dp(8), dp(3))
             background = roundedDrawable("#0D3652", "#00E5FF")
         }
         keyHeaderRow.addView(tvVaultSecurityLabel)
@@ -777,29 +848,25 @@ class MainActivity : AppCompatActivity() {
             )
         )
 
-        // Collapsible Drawer: 9:16 Shorts Key Slot + Custom Simulcast + Dual-Format Companion
+        // Collapsible Accordion Drawer: 9:16 Shorts Key Slot + Simulcast + Dual-Format
         boxSimulcastDrawer = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             visibility = View.GONE
-            setPadding(dp(8), dp(6), dp(8), dp(8))
-            background = cardDrawable("#08101E", "#1E3A5F")
+            setPadding(dp(12), dp(10), dp(12), dp(12))
+            background = cardDrawable("#070D19", "#1E3A5F")
             val lp = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT
-            ).apply { topMargin = dp(6) }
+            ).apply { topMargin = dp(8) }
             layoutParams = lp
         }
         btnToggleSimulcastDrawer = actionButton(
-            "▼ Expand: 9:16 Shorts Key Slot, Simulcast (Twitch/Kick/Custom) & Dual-Format",
-            "#122036"
+            "▸ Simulcast, 9:16 Shorts Key & Dual-Format (Tap to Expand)",
+            "#111D30"
         ) {
             val show = boxSimulcastDrawer.visibility != View.VISIBLE
             boxSimulcastDrawer.visibility = if (show) View.VISIBLE else View.GONE
-            btnToggleSimulcastDrawer.text = if (show) {
-                "▲ Hide: 9:16 Shorts Key Slot, Simulcast & Dual-Format"
-            } else {
-                "▼ Expand: 9:16 Shorts Key Slot, Simulcast (Twitch/Kick/Custom) & Dual-Format"
-            }
+            refreshAccordionHeaders()
         }
 
         boxSimulcastDrawer.addView(
@@ -870,9 +937,9 @@ class MainActivity : AppCompatActivity() {
         cardStream.addView(boxSimulcastDrawer)
 
         tvNetTestResult = bodyText(
-            "Tip: Keep 'Turn on manual settings' OFF in YouTube Studio so one Default Stream Key works automatically for both 16:9 Landscape & 9:16 Vertical Shorts!"
+            "Tip: Keep 'Turn on manual settings' OFF in YouTube Studio so one Default Stream Key works automatically for both 16:9 Landscape & 9:16 Shorts. Adaptive RTMP chunking uses 64 KB on Wi-Fi and 4 KB on Mobile Data / Custom relays."
         )
-        btnNetTest = actionButton("Test Internet: Download, Upload, TCP RTT & Bitrate Advisor", "#153969") {
+        btnNetTest = actionButton("Test Internet: Download, Upload, RTT & Bitrate Advisor", "#153969") {
             runRtmpsNetworkCheck()
         }
         cardStream.addView(
@@ -894,17 +961,16 @@ class MainActivity : AppCompatActivity() {
             badgeHex = "#2979FF"
         )
         cardVideo.addView(
-            bodyText("Plays at 120–185 Hz on your screen while hardware silicon encodes 60/30 FPS. Tap any Resolution, Codec, FPS, or Framing pill directly below!")
+            bodyText("Plays at 120–185 Hz on your display while hardware silicon encodes steady 60/30 FPS. Tap any Resolution, Codec, FPS, or Framing pill below.")
         )
 
-        // Direct-Tap 6-Pill Resolution Row
         cardVideo.addView(labelText("Direct-Tap Stream Resolution:"))
         val resRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             layoutParams = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT
-            ).apply { topMargin = dp(2) }
+            ).apply { topMargin = dp(3) }
         }
         val resOptions = listOf(
             640 to "360p",
@@ -924,8 +990,8 @@ class MainActivity : AppCompatActivity() {
                 setTextColor(Color.WHITE)
                 setTextSize(TypedValue.COMPLEX_UNIT_SP, 10.5f)
                 setPadding(dp(2), dp(5), dp(2), dp(5))
-                layoutParams = LinearLayout.LayoutParams(0, dp(36), 1f).apply {
-                    if (idx > 0) marginStart = dp(3)
+                layoutParams = LinearLayout.LayoutParams(0, dp(38), 1f).apply {
+                    if (idx > 0) marginStart = dp(4)
                 }
                 setOnClickListener {
                     updateSetting(settings.copy(width = longW, height = shortH), requiresRestartIfLive = true)
@@ -936,14 +1002,13 @@ class MainActivity : AppCompatActivity() {
         }
         cardVideo.addView(resRow)
 
-        // Direct-Tap Codec & FPS Row
         cardVideo.addView(labelText("Direct-Tap Hardware Codec & Frame Rate:"))
         val codecFpsRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             layoutParams = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT
-            ).apply { topMargin = dp(2) }
+            ).apply { topMargin = dp(3) }
         }
         listOf("HEVC" to "HEVC", "H264" to "H.264", "AV1" to "AV1").forEachIndexed { idx, (cKey, cTitle) ->
             val b = Button(this).apply {
@@ -952,8 +1017,8 @@ class MainActivity : AppCompatActivity() {
                 setTextColor(Color.WHITE)
                 setTextSize(TypedValue.COMPLEX_UNIT_SP, 10.5f)
                 setPadding(dp(2), dp(5), dp(2), dp(5))
-                layoutParams = LinearLayout.LayoutParams(0, dp(36), 1f).apply {
-                    if (idx > 0) marginStart = dp(3)
+                layoutParams = LinearLayout.LayoutParams(0, dp(38), 1f).apply {
+                    if (idx > 0) marginStart = dp(4)
                 }
                 setOnClickListener { selectCodecDirect(cKey) }
             }
@@ -967,8 +1032,8 @@ class MainActivity : AppCompatActivity() {
                 setTextColor(Color.WHITE)
                 setTextSize(TypedValue.COMPLEX_UNIT_SP, 10.5f)
                 setPadding(dp(2), dp(5), dp(2), dp(5))
-                layoutParams = LinearLayout.LayoutParams(0, dp(36), 1f).apply {
-                    marginStart = dp(4)
+                layoutParams = LinearLayout.LayoutParams(0, dp(38), 1f).apply {
+                    marginStart = dp(5)
                 }
                 setOnClickListener {
                     updateSetting(settings.copy(fps = fpsVal), requiresRestartIfLive = true)
@@ -979,14 +1044,13 @@ class MainActivity : AppCompatActivity() {
         }
         cardVideo.addView(codecFpsRow)
 
-        // Direct-Tap Framing Row
         cardVideo.addView(labelText("Direct-Tap Screen Framing (STRETCH = Full 16:9 Zero-Bars + 100% HUD):"))
         val framingRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             layoutParams = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT
-            ).apply { topMargin = dp(2); bottomMargin = dp(3) }
+            ).apply { topMargin = dp(3); bottomMargin = dp(4) }
         }
         listOf("FIT" to "FIT", "STRETCH" to "STRETCH (16:9)", "SMART" to "SMART", "FILL" to "FILL").forEachIndexed { idx, (fKey, fTitle) ->
             val b = Button(this).apply {
@@ -995,8 +1059,8 @@ class MainActivity : AppCompatActivity() {
                 setTextColor(Color.WHITE)
                 setTextSize(TypedValue.COMPLEX_UNIT_SP, 10.5f)
                 setPadding(dp(2), dp(5), dp(2), dp(5))
-                layoutParams = LinearLayout.LayoutParams(0, dp(36), 1f).apply {
-                    if (idx > 0) marginStart = dp(3)
+                layoutParams = LinearLayout.LayoutParams(0, dp(38), 1f).apply {
+                    if (idx > 0) marginStart = dp(4)
                 }
                 setOnClickListener {
                     updateSetting(settings.copy(framingMode = fKey))
@@ -1037,7 +1101,7 @@ class MainActivity : AppCompatActivity() {
         cardVideo.addView(buttonRow(btnRateControl, btnAbr))
         cardVideo.addView(buttonRow(btnUpscaler, btnFraming, btnSmartZoom))
 
-        cardVideo.addView(labelText("Stackable Live Visual Filters (Mix & Match Any Combo Live):"))
+        cardVideo.addView(labelText("Stackable Live Visual Filters (Mix & Match Live):"))
         btnFilmic = actionButton("", "#101929") {
             updateSetting(settings.copy(cinematicFilmic = !settings.cinematicFilmic))
         }
@@ -1059,29 +1123,25 @@ class MainActivity : AppCompatActivity() {
         cardVideo.addView(buttonRow(btnShadowBoost, btnColorTemp))
         cardVideo.addView(btnSharpen)
 
-        // Collapsible Drawer: Scenes, .PNG Overlay Layout, Text Banner, Dual Privacy Blur & Pro Silicon
+        // Collapsible Accordion Drawer: Scenes, Unified Logo:OFF, Text Banner, Privacy Blur & SolCodec
         boxSceneProDrawer = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             visibility = View.GONE
-            setPadding(dp(8), dp(6), dp(8), dp(8))
-            background = cardDrawable("#08101E", "#1E3A5F")
+            setPadding(dp(12), dp(10), dp(12), dp(12))
+            background = cardDrawable("#070D19", "#1E3A5F")
             val lp = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT
-            ).apply { topMargin = dp(6) }
+            ).apply { topMargin = dp(8) }
             layoutParams = lp
         }
         btnToggleSceneProDrawer = actionButton(
-            "▼ Expand: Custom Scenes, .PNG Corner Logo, Text Banner, Privacy Blur & SolCodec™",
-            "#122036"
+            "▸ Scenes, Logo Overlay, Privacy Blur & SolCodec™ (Tap to Expand)",
+            "#111D30"
         ) {
             val show = boxSceneProDrawer.visibility != View.VISIBLE
             boxSceneProDrawer.visibility = if (show) View.VISIBLE else View.GONE
-            btnToggleSceneProDrawer.text = if (show) {
-                "▲ Hide: Custom Scenes, .PNG Corner Logo, Text Banner, Privacy Blur & SolCodec™"
-            } else {
-                "▼ Expand: Custom Scenes, .PNG Corner Logo, Text Banner, Privacy Blur & SolCodec™"
-            }
+            refreshAccordionHeaders()
         }
 
         boxSceneProDrawer.addView(labelText("Zero-Permission Saved Graphics (Tap to Pick from Gallery):"))
@@ -1097,13 +1157,10 @@ class MainActivity : AppCompatActivity() {
             pendingAssetPickSlot = SolSceneAssetStore.AssetSlot.OVERLAY_PNG
             imageAssetPickerLauncher.launch("image/*")
         }
-        btnOverlayPosition = actionButton("", "#13284A") { cycleOverlayPosition() }
+        btnOverlayPosition = actionButton("", "#101929") { cycleUnifiedOverlayLogo() }
         btnPickShortsPoster = actionButton("", "#13284A") {
             pendingAssetPickSlot = SolSceneAssetStore.AssetSlot.SHORTS_POSTER
             imageAssetPickerLauncher.launch("image/*")
-        }
-        btnToggleOverlayOn = actionButton("Toggle .PNG Overlay ON/OFF", "#101929") {
-            updateSetting(settings.copy(overlayImageEnabled = !settings.overlayImageEnabled))
         }
         val btnClearGraphics = actionButton("Clear Saved Graphics", "#1E293B") {
             SolSceneAssetStore.AssetSlot.entries.forEach { SolSceneAssetStore.clearCustomAsset(this, it) }
@@ -1113,10 +1170,9 @@ class MainActivity : AppCompatActivity() {
 
         boxSceneProDrawer.addView(buttonRow(btnPickStartImg, btnPickBrbImg))
         boxSceneProDrawer.addView(buttonRow(btnPickOverlayPng, btnPickShortsPoster))
-        boxSceneProDrawer.addView(btnOverlayPosition)
-        boxSceneProDrawer.addView(buttonRow(btnToggleOverlayOn, btnClearGraphics))
+        boxSceneProDrawer.addView(buttonRow(btnOverlayPosition, btnClearGraphics))
 
-        boxSceneProDrawer.addView(labelText("Built-In GPU Live Text Banner (Updates Live on Next Frame!):"))
+        boxSceneProDrawer.addView(labelText("Built-In GPU Live Text Banner (Updates Live on Next Frame):"))
         etBannerText = styledEditText(settings.liveBannerText, isPassword = false).apply {
             hint = "e.g. SUB GOAL 75 • @Sol_CODM • 120 FPS LIVE"
         }
@@ -1160,14 +1216,14 @@ class MainActivity : AppCompatActivity() {
         cardVideo.addView(boxSceneProDrawer)
         container.addView(cardVideo)
 
-        // === CARD 4: SOLLUXE™ 2.0 13-STAGE VOICE STUDIO, 12-MODE MATRIX & 250% GAME SOUNDSTAGE ===
+        // === CARD 4: SOLLUXE™ 3.0 PURE 6-STAGE VOICE STUDIO & 3D GAME SOUNDSTAGE ===
         val cardAudio = sectionCard(
-            heading = "4. 13-Stage Voice Studio & 3D Game Audio",
-            engineBadge = "SOLLUXE™ 2.0",
+            heading = "4. SolLuxe™ 3.0 Voice Studio & Game Audio",
+            engineBadge = "SOLLUXE™ 3.0",
             badgeHex = "#8B5CF6"
         )
         cardAudio.addView(
-            bodyText("Auto-adapts across Phone Studio Mic, Wired/USB-C Close Mic & Bluetooth! Includes 50/65/85Hz Gender HPF, Hard-Breath Plosive Guard, Cubic Analog Sub-Warmth, -3.5dB Boxy Mud Scoop, 920Hz Velvet Dip & Aphex Silk Air Exciter.")
+            bodyText("6-Stage 64-Bit Pure Condenser Chain: 55/68/85Hz Gender HPF, <0.6ms Raised-Cosine Impulse Clamper, Native C 48kHz RNNoise + Hybrid VAD Expander, Split-Band Plosive Guard, 4×3 Condenser EQ & 4× True-Peak Limiter.")
         )
 
         btnMicDevice = actionButton("", "#13284A") { cycleMicInputDevice() }
@@ -1177,14 +1233,14 @@ class MainActivity : AppCompatActivity() {
         cardAudio.addView(btnMicDevice)
         cardAudio.addView(buttonRow(btnMicSource, btnAudioBitrate))
 
-        cardAudio.addView(labelText("Voice Profile (Pick 1 — Auto-Sets 50/65/85Hz HPF, Cubic Sub-Warmth, 315–365Hz Mud Scoop, 920Hz Velvet Dip & Aphex Silk Air):"))
-        btnGenderNeutral = actionButton("Neutral (65Hz)", "#101929") {
+        cardAudio.addView(labelText("Voice Profile (Pick 1 — Auto-Matches 55/68/85Hz HPF, Condenser EQ, Sidechain & De-Esser):"))
+        btnGenderNeutral = actionButton("Neutral (68Hz)", "#101929") {
             updateSetting(MicDspProcessor.applyGenderProfileToSettings(settings, "NEUTRAL"))
         }
-        btnGenderMale = actionButton("Male Voice (50Hz)", "#101929") {
+        btnGenderMale = actionButton("Male (55Hz)", "#101929") {
             updateSetting(MicDspProcessor.applyGenderProfileToSettings(settings, "MALE"))
         }
-        btnGenderFemale = actionButton("Female Voice (85Hz)", "#101929") {
+        btnGenderFemale = actionButton("Female (85Hz)", "#101929") {
             updateSetting(MicDspProcessor.applyGenderProfileToSettings(settings, "FEMALE"))
         }
         cardAudio.addView(buttonRow(btnGenderNeutral, btnGenderMale, btnGenderFemale))
@@ -1199,8 +1255,7 @@ class MainActivity : AppCompatActivity() {
         cardAudio.addView(btnVoicePreset)
         cardAudio.addView(buttonRow(btnNoiseSuppressMode, btnNoiseSuppressLevel))
 
-        // Glowing Cyan SeekBar Volume Sliders + -10% / +10% Fine Step Buttons
-        cardAudio.addView(labelText("Post-DSP Mic Boost (50%–250% • Placed at Stage 13 After Slow AGC):"))
+        cardAudio.addView(labelText("Post-DSP Mic Boost (50%–250% • Protected by 4× True-Peak Limiter):"))
         btnMicGain = actionButton("", "#0D3652") { cycleMicGain() }
         val micSliderRow = buildVolumeSeekBarRow(
             minPct = 50,
@@ -1220,7 +1275,7 @@ class MainActivity : AppCompatActivity() {
         cardAudio.addView(btnMicGain)
         cardAudio.addView(micSliderRow.first)
 
-        cardAudio.addView(labelText("Internal Stereo Game Mix (0%–250% • Protected by 4x True-Peak Limiter):"))
+        cardAudio.addView(labelText("Internal Stereo Game Mix (0%–250% • Protected by 4× True-Peak Limiter):"))
         btnGameGain = actionButton("", "#153969") { cycleGameGain() }
         val gameSliderRow = buildVolumeSeekBarRow(
             minPct = 0,
@@ -1244,7 +1299,7 @@ class MainActivity : AppCompatActivity() {
         btnMicDelay = actionButton("", "#13284A") { cycleMicSyncDelay() }
         cardAudio.addView(buttonRow(btnDucking, btnMicDelay))
 
-        cardAudio.addView(labelText("Stackable Stereo Game Soundstage (Stream-Only • Phase-Safe 62Hz Voice Ducking):"))
+        cardAudio.addView(labelText("Stackable Stereo Game Soundstage (Stream-Only • Phase-Safe 62Hz Voice Duck):"))
         btnGameWide = actionButton("", "#101929") {
             updateSetting(settings.copy(gameCinemaWideEnabled = !settings.gameCinemaWideEnabled))
         }
@@ -1260,29 +1315,25 @@ class MainActivity : AppCompatActivity() {
         cardAudio.addView(buttonRow(btnGameWide, btnGameSubPunch))
         cardAudio.addView(buttonRow(btnGameFootsteps, btnGameBlastTamer))
 
-        // Collapsible Drawer: Individual 13-Stage Voice Filter Switches
+        // Collapsible Accordion Drawer: Individual 6-Stage Voice Controls
         boxVoiceStageDrawer = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             visibility = View.GONE
-            setPadding(dp(8), dp(6), dp(8), dp(8))
-            background = cardDrawable("#08101E", "#1E3A5F")
+            setPadding(dp(12), dp(10), dp(12), dp(12))
+            background = cardDrawable("#070D19", "#1E3A5F")
             val lp = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT
-            ).apply { topMargin = dp(6) }
+            ).apply { topMargin = dp(8) }
             layoutParams = lp
         }
         btnToggleVoiceStageDrawer = actionButton(
-            "▼ Expand: Individual Voice Filter Switches (Mix & Match All 13 Stages)",
-            "#122036"
+            "▸ Individual Voice Stage Switches (Tap to Customize)",
+            "#111D30"
         ) {
             val show = boxVoiceStageDrawer.visibility != View.VISIBLE
             boxVoiceStageDrawer.visibility = if (show) View.VISIBLE else View.GONE
-            btnToggleVoiceStageDrawer.text = if (show) {
-                "▲ Hide: Individual Voice Filter Switches"
-            } else {
-                "▼ Expand: Individual Voice Filter Switches (Mix & Match All 13 Stages)"
-            }
+            refreshAccordionHeaders()
         }
 
         btnStageHpf = actionButton("", "#101929") { cycleHpf() }
@@ -1326,7 +1377,7 @@ class MainActivity : AppCompatActivity() {
         cardAudio.addView(boxVoiceStageDrawer)
 
         tvMicTestStatus = bodyText(
-            "10s Studio Voice Test (Loads 100% of your active Profile, Hard-Breath Plosive Guard, Cubic Sub-Warmth, Aphex Silk Air & Mic Boost % so you hear your exact live stream voice!):"
+            "10s Studio Voice Test (Runs your exact live SolLuxe™ 3.0 Pure chain so you hear your real broadcast voice before going live):"
         )
         btnRecordMicTest = actionButton("Record 10s Test", "#0D3652") { runTenSecMicCalibration() }
         btnPlayMicTest = actionButton("Play Test", "#153969") { playMicTestSample() }
@@ -1362,15 +1413,16 @@ class MainActivity : AppCompatActivity() {
             badgeHex = "#00E5FF"
         )
 
-        btnGoLive = actionButton("GO LIVE — START STREAM", "#00897B") {
+        btnGoLive = actionButton("GO LIVE — START STREAM", "#00695C") {
             onGoLiveClicked()
         }.apply {
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 15.5f)
             typeface = Typeface.DEFAULT_BOLD
-            minimumHeight = dp(52)
+            minimumHeight = dp(54)
         }
         cardLaunch.addView(btnGoLive)
 
+        btnReportsQuick = actionButton("Session Reports & History", "#153969") { showDiagnosticsDialog() }
         btnSavedClipsQuick = actionButton("★ Saved Clips & AI Highlights", "#4C1D95") {
             showSavedClipsDialog()
         }
@@ -1378,12 +1430,7 @@ class MainActivity : AppCompatActivity() {
             toggleCompetitorBenchmark()
         }
 
-        cardLaunch.addView(
-            buttonRow(
-                actionButton("Session Reports & History", "#153969") { showDiagnosticsDialog() },
-                btnSavedClipsQuick
-            )
-        )
+        cardLaunch.addView(buttonRow(btnReportsQuick, btnSavedClipsQuick))
         cardLaunch.addView(
             buttonRow(
                 btnGlipBench,
@@ -1400,11 +1447,11 @@ class MainActivity : AppCompatActivity() {
 
         // === FOOTER ===
         val footer = TextView(this).apply {
-            text = "ॐ नमः शिवाय\nMade by Sol (@Sol_CODM) • Powered by SolApex™ HyperStream Engine v$appVersionName (SolCore Ultra • SolLuxe 2.0 • SolRelay Omega • SolCodec)"
+            text = "ॐ नमः शिवाय\nMade by Sol (@Sol_CODM) • SolApex™ HyperStream v$appVersionName (SolCore Ultra • SolLuxe™ 3.0 Pure • SolRelay Omega • SolCodec)"
             setTextColor(Color.parseColor("#64748B"))
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
             gravity = Gravity.CENTER
-            setPadding(0, dp(16), 0, dp(8))
+            setPadding(0, dp(18), 0, dp(10))
         }
         container.addView(footer)
 
@@ -1416,6 +1463,24 @@ class MainActivity : AppCompatActivity() {
         return outerRoot
     }
 
+    private fun makeStatusChip(
+        initialText: String,
+        fillHex: String,
+        strokeHex: String,
+        textHex: String
+    ): TextView {
+        return TextView(this).apply {
+            text = initialText
+            setTextColor(Color.parseColor(textHex))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 10.2f)
+            typeface = Typeface.DEFAULT_BOLD
+            maxLines = 1
+            ellipsize = TextUtils.TruncateAt.END
+            setPadding(dp(9), dp(3), dp(9), dp(3))
+            background = roundedDrawable(fillHex, strokeHex)
+        }
+    }
+
     private fun makeHeroTile(
         caption: String,
         initialValue: String,
@@ -1424,13 +1489,13 @@ class MainActivity : AppCompatActivity() {
         val box = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER
-            setPadding(dp(8), dp(8), dp(8), dp(8))
+            setPadding(dp(10), dp(11), dp(10), dp(11))
             background = GradientDrawable(
                 GradientDrawable.Orientation.TOP_BOTTOM,
-                intArrayOf(Color.parseColor("#0D1C33"), Color.parseColor("#091324"))
+                intArrayOf(Color.parseColor("#0D1B30"), Color.parseColor("#081120"))
             ).apply {
-                cornerRadius = dp(12).toFloat()
-                setStroke(dp(1), Color.parseColor("#00E5FF"))
+                cornerRadius = dp(14).toFloat()
+                setStroke(dp(1), Color.parseColor("#1E4E79"))
             }
             isClickable = true
             isFocusable = true
@@ -1446,11 +1511,13 @@ class MainActivity : AppCompatActivity() {
         }
         val capTv = TextView(this).apply {
             text = caption
-            setTextColor(Color.parseColor("#94A3B8"))
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 9.5f)
+            setTextColor(Color.parseColor("#8FA3BD"))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 9.2f)
             typeface = Typeface.DEFAULT_BOLD
+            letterSpacing = 0.06f
             gravity = Gravity.CENTER
             maxLines = 1
+            setPadding(0, dp(2), 0, 0)
         }
         box.addView(valTv)
         box.addView(capTv)
@@ -1470,7 +1537,7 @@ class MainActivity : AppCompatActivity() {
             layoutParams = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT
-            ).apply { topMargin = dp(4); bottomMargin = dp(2) }
+            ).apply { topMargin = dp(5); bottomMargin = dp(3) }
         }
         val btnMinus = Button(this).apply {
             text = "−10%"
@@ -1487,8 +1554,8 @@ class MainActivity : AppCompatActivity() {
             progressTintList = ColorStateList.valueOf(Color.parseColor("#00E5FF"))
             thumbTintList = ColorStateList.valueOf(Color.parseColor("#00E5FF"))
             layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
-                marginStart = dp(6)
-                marginEnd = dp(6)
+                marginStart = dp(8)
+                marginEnd = dp(8)
             }
             setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
                 override fun onProgressChanged(sb: SeekBar?, progressVal: Int, fromUser: Boolean) {
@@ -1516,11 +1583,6 @@ class MainActivity : AppCompatActivity() {
         return row to seek
     }
 
-    /**
-     * Unified SolApex™ Button State Styler:
-     * - ON / Active: Deep Royal-Cyan Fill (#0D3652) + Electric Cyan Border (#00E5FF) + Pure White Text
-     * - OFF / Inactive: Midnight Slate Fill (#101929) + Subtle Slate Border (#24344D) + Cool Silver Text (#94A3B8)
-     */
     private fun styleToggleBtn(
         btn: Button,
         isOn: Boolean,
@@ -1532,15 +1594,10 @@ class MainActivity : AppCompatActivity() {
             btn.background = roundedDrawable(activeFillHex, activeStrokeHex)
         } else {
             btn.setTextColor(Color.parseColor("#94A3B8"))
-            btn.background = roundedDrawable("#101929", "#24344D")
+            btn.background = roundedDrawable("#0F1727", "#223149")
         }
     }
 
-    /**
-     * Platform-Aware & Voice-Aware Tier Presets (#8):
-     * Applies optimal defaults across all 5 tiers, respects active Platform in Card 2 (YouTube vs Twitch 6M vs Kick 8M),
-     * sets the gender-matched HPF (50/65/85 Hz), and resets advanced silicon controls cleanly.
-     */
     private fun applyTierDefaultsToSettings(
         base: StreamSettings,
         tier: DeviceTier,
@@ -1550,7 +1607,6 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun refreshHardwareAndMicsAsync() {
-        // Never run hardware MediaCodec probing while a live broadcast is starting or active!
         if (SolStreamService.isBroadcastLive || CodecCapabilityProbe.isBroadcastStartingOrLive) {
             micOptions = CodecCapabilityProbe.listAvailableMicInputs(this)
             refreshAllUi()
@@ -1569,10 +1625,40 @@ class MainActivity : AppCompatActivity() {
                 scanSummary = freshScan
                 micOptions = CodecCapabilityProbe.listAvailableMicInputs(this)
                 tvHeaderSubtitle.text =
-                    "SolApex™ HyperStream • ${scanSummary.friendlyHardwareLine()}\n${scanSummary.toBadgeText()}"
+                    "${scanSummary.friendlyHardwareLine()}\n${scanSummary.toBadgeText()}"
                 refreshAllUi()
                 Toast.makeText(this, "Hardware & mic list refreshed!", Toast.LENGTH_SHORT).show()
             }
+        }
+    }
+
+    private fun refreshAccordionHeaders() {
+        val simOpen = boxSimulcastDrawer.visibility == View.VISIBLE
+        val activeSimCount = (if (settings.simulcastTwitchEnabled) 1 else 0) +
+            (if (settings.simulcastKickEnabled) 1 else 0) +
+            (if (settings.dualFormatCompanionEnabled) 1 else 0)
+        val simSummary = if (activeSimCount > 0) "$activeSimCount Active" else "Primary Only"
+        btnToggleSimulcastDrawer.text = if (simOpen) {
+            "▾ Simulcast, 9:16 Shorts Key & Dual-Format ($simSummary)"
+        } else {
+            "▸ Simulcast, 9:16 Shorts Key & Dual-Format ($simSummary)"
+        }
+
+        val sceneOpen = boxSceneProDrawer.visibility == View.VISIBLE
+        val logoTag = SolStreamService.formatCompactOverlayPositionTag(settings.overlayImageEnabled, settings.overlayPosition)
+        val blurTag = if (settings.minimapShieldEnabled) "Blur:ON" else "Blur:OFF"
+        btnToggleSceneProDrawer.text = if (sceneOpen) {
+            "▾ Scenes, $logoTag, $blurTag & SolCodec™"
+        } else {
+            "▸ Scenes, $logoTag, $blurTag & SolCodec™"
+        }
+
+        val voiceOpen = boxVoiceStageDrawer.visibility == View.VISIBLE
+        val hpfTag = if (settings.hpfCutoffHz == 0) "HPF:OFF" else "${settings.hpfCutoffHz}Hz"
+        btnToggleVoiceStageDrawer.text = if (voiceOpen) {
+            "▾ Individual Voice Stages ($hpfTag • ${settings.voiceGenderProfile})"
+        } else {
+            "▸ Individual Voice Stages ($hpfTag • ${settings.voiceGenderProfile})"
         }
     }
 
@@ -1592,20 +1678,6 @@ class MainActivity : AppCompatActivity() {
         val accEnabled = isAccessibilityServiceEnabled()
         val isLive = SolStreamService.isBroadcastLive
 
-        val idleHealth = CodecCapabilityProbe.readLiveHardwareHealth(this)
-        tvLiveBanner.text = when {
-            SolStreamService.needsProjectionReapproval ->
-                "STATUS: Screen capture paused by Android (lock/system). Tap orange button below to re-approve!"
-            isLive ->
-                "STATUS: ${SolStreamService.currentLiveStateLabel} • All live controls & Floating Pill sync in 0 ms!"
-            SolStreamService.isGlipBenchmarkRunning ->
-                "STATUS: Passive Benchmark Recording Thermal & RAM for $benchmarkTargetAppName..."
-            else ->
-                "STATUS: ${idleHealth.toIdleStatusBanner()}"
-        }
-        btnReapproveCapture.visibility = if (SolStreamService.needsProjectionReapproval) View.VISIBLE else View.GONE
-
-        // 3-Tile Hero Summary Bar
         val longDim = max(settings.width, settings.height)
         val heroResShort = when {
             longDim >= 3840 -> "4K (2160p)"
@@ -1615,6 +1687,62 @@ class MainActivity : AppCompatActivity() {
             longDim >= 800 -> "480p"
             else -> "360p"
         }
+        val compactRes = when {
+            longDim >= 3840 -> "4K"
+            longDim >= 2560 -> "1440p"
+            longDim >= 1920 -> "1080p"
+            longDim >= 1280 -> "720p"
+            longDim >= 800 -> "480p"
+            else -> "360p"
+        }
+        val singleEncodeSimLock = (settings.simulcastTwitchEnabled || settings.simulcastKickEnabled) && !settings.simulcastSplitEncode
+        val effectiveActiveCodec = if (singleEncodeSimLock) "H264" else settings.codec.uppercase(Locale.US)
+
+        // Glanceable Header Chips & Live Protect Long Streams Banner
+        tvChipAudio.text = "SolLuxe 3.0 • ${settings.voicePreset}"
+        tvChipVideo.text = "${compactRes}${settings.fps} • $effectiveActiveCodec"
+        if (battUnrestricted) {
+            tvChipProtection.text = "Protected ✓"
+            tvChipProtection.setTextColor(Color.parseColor("#A7F3D0"))
+            tvChipProtection.background = roundedDrawable("#0A2B22", "#10B981")
+
+            boxProtectBanner.background = cardDrawable("#08201A", "#10B981")
+            tvProtectTitle.text = "🛡️ Long-Stream Protection: Unrestricted ✓"
+            tvProtectTitle.setTextColor(Color.parseColor("#A7F3D0"))
+            tvProtectTip.visibility = View.VISIBLE
+            tvProtectTip.text = buildBrandAntiKillOneLiner()
+            btnProtectAction.text = "Tips"
+            btnProtectAction.setTextColor(Color.parseColor("#A7F3D0"))
+            btnProtectAction.background = roundedDrawable("#0D3329", "#10B981")
+        } else {
+            tvChipProtection.text = "Setup Needed"
+            tvChipProtection.setTextColor(Color.parseColor("#FDE68A"))
+            tvChipProtection.background = roundedDrawable("#2B1D0A", "#F59E0B")
+
+            boxProtectBanner.background = cardDrawable("#1F170A", "#F59E0B")
+            tvProtectTitle.text = "🛡️ Long-Stream Protection: Setup Needed"
+            tvProtectTitle.setTextColor(Color.parseColor("#FDE68A"))
+            tvProtectTip.visibility = View.VISIBLE
+            tvProtectTip.text = buildBrandAntiKillOneLiner()
+            btnProtectAction.text = "Protect"
+            btnProtectAction.setTextColor(Color.parseColor("#050A14"))
+            btnProtectAction.background = roundedDrawable("#F59E0B", "#FDE68A")
+        }
+
+        val idleHealth = CodecCapabilityProbe.readLiveHardwareHealth(this)
+        tvLiveBanner.text = when {
+            SolStreamService.needsProjectionReapproval ->
+                "STATUS: Screen capture paused by Android (lock/system). Tap orange button below to re-approve!"
+            isLive ->
+                "STATUS: ${SolStreamService.currentLiveStateLabel} • Live controls & Floating Pill sync in 0 ms"
+            SolStreamService.isGlipBenchmarkRunning ->
+                "STATUS: Passive Benchmark Recording Thermal & RAM for $benchmarkTargetAppName..."
+            else ->
+                "STATUS: ${idleHealth.toIdleStatusBanner()}"
+        }
+        btnReapproveCapture.visibility = if (SolStreamService.needsProjectionReapproval) View.VISIBLE else View.GONE
+
+        // 3-Tile Hero Summary Bar
         val mbpsStr = formatBitrateMbps(settings.targetBitrateKbps)
         tvHeroResValue.text = "🎥 $heroResShort"
         tvHeroFpsValue.text = "⚡ ${settings.fps} FPS"
@@ -1628,54 +1756,34 @@ class MainActivity : AppCompatActivity() {
             val fill = when {
                 selected && t == DeviceTier.ULTRA -> "#4C1D95"
                 selected -> "#0D3652"
-                else -> "#101929"
+                else -> "#0F1727"
             }
-            val stroke = if (selected) "#00E5FF" else if (t == recTier) "#38BDF8" else "#24344D"
+            val stroke = if (selected) "#00E5FF" else if (t == recTier) "#38BDF8" else "#223149"
             btn.setTextColor(Color.parseColor(if (selected) "#F8FAFC" else "#94A3B8"))
             btn.background = roundedDrawable(fill, stroke)
         }
         tvTierDescription.text =
             "Active Tier: ${activeTier.title} (${activeTier.badgeSummary})\n" +
-                "Scanner Recommended for ${scanSummary.deviceModel}: ${recTier.title} Tier"
+                "Recommended for ${scanSummary.deviceModel}: ${recTier.title} Tier"
 
-        // Card 1: Pre-Flight Readiness & Smart Auto-Collapse (#10, #13)
+        // Card 1: Pre-Flight Readiness & Smart Auto-Collapse
         val allFourReady = micGranted && notifGranted && battUnrestricted && accEnabled
         tvPreflightStatus.text =
             "• Mic Permission: ${okWait(micGranted)}   • Notifications: ${okWait(notifGranted)}\n" +
-                "• Battery Unrestricted: ${okWait(battUnrestricted)}   • Accessibility Service: ${okWait(accEnabled)}"
+                "• Battery Unrestricted: ${okWait(battUnrestricted)}   • Accessibility Dock: ${okWait(accEnabled)}"
         tvPreflightAudioWifiLine.text = SolDualAudioEngine.inspectPreFlightAudioAndWifiCoexistence(this)
 
-        styleToggleBtn(
-            btnGrantMicNotif,
-            isOn = micGranted && notifGranted,
-            activeFillHex = "#0D3652",
-            activeStrokeHex = "#00E5FF"
-        )
-        styleToggleBtn(
-            btnUnrestrictedBatt,
-            isOn = battUnrestricted,
-            activeFillHex = "#0D3652",
-            activeStrokeHex = "#00E5FF"
-        )
-        styleToggleBtn(
-            btnTapAccessibilityFirst,
-            isOn = accEnabled,
-            activeFillHex = "#0D3652",
-            activeStrokeHex = "#00E5FF"
-        )
-        styleToggleBtn(
-            btnUnlockRestricted,
-            isOn = accEnabled,
-            activeFillHex = "#13284A",
-            activeStrokeHex = "#38BDF8"
-        )
+        styleToggleBtn(btnGrantMicNotif, isOn = micGranted && notifGranted)
+        styleToggleBtn(btnUnrestrictedBatt, isOn = battUnrestricted)
+        styleToggleBtn(btnTapAccessibilityFirst, isOn = accEnabled)
+        styleToggleBtn(btnUnlockRestricted, isOn = accEnabled, activeFillHex = "#13284A", activeStrokeHex = "#38BDF8")
 
         if (allFourReady) {
             btnPreflightCollapsedToggle.visibility = View.VISIBLE
             btnPreflightCollapsedToggle.text = if (preflightManuallyExpanded) {
-                "▲ All 4 Pre-Flight Checks READY (Tap to Collapse Setup Buttons)"
+                "▾ All 4 Pre-Flight Checks READY (Tap to Collapse)"
             } else {
-                "✅ All 4 Pre-Flight Checks READY (Tap to Show Setup & All-Brand Guide)"
+                "✅ All 4 Pre-Flight Checks READY (Tap to Expand Setup & Anti-Kill Guide)"
             }
             boxPreflightButtonsContainer.visibility = if (preflightManuallyExpanded) View.VISIBLE else View.GONE
         } else {
@@ -1687,8 +1795,7 @@ class MainActivity : AppCompatActivity() {
         // Card 2: 4-Pill Platform Selector, Key Vault Badge, Simulcast & Speed Test
         val activePlat = settings.platformPreset.uppercase(Locale.US)
         platformPillButtons.forEach { (pKey, btn) ->
-            val sel = (pKey == activePlat)
-            styleToggleBtn(btn, isOn = sel)
+            styleToggleBtn(btn, isOn = (pKey == activePlat))
         }
         tvVaultSecurityLabel.text = "Primary Stream Key (AES-256-GCM • ${KeystoreVault.getKeySecurityDescription()}):"
         val currentTypedOrSavedKey = etStreamKey.text?.toString()?.takeIf { it.isNotBlank() } ?: KeystoreVault.getStreamKey(this)
@@ -1705,8 +1812,9 @@ class MainActivity : AppCompatActivity() {
             "Auto-Use Slot #2 Key When 9:16 Shorts Selected: ${onOff(settings.useShortsKeySlot)}"
         styleToggleBtn(btnUseShortsSlot, isOn = settings.useShortsKeySlot)
 
-        val dualSupported = scanSummary.supportsDualFormatCompanion()
-        val splitModeActive = settings.simulcastSplitEncode && dualSupported
+        val dualSupported = scanSummary.supportsDualFormatCompanion(primaryCodec = settings.codec)
+        val splitSupported = scanSummary.selectCompanionEncoder(primaryCodec = settings.codec, requireH264Only = true) != null
+        val splitModeActive = settings.simulcastSplitEncode && splitSupported
         btnSimulcastMode.text = if (splitModeActive) {
             "Simulcast Mode: Dual-Encode Split Quality (YT 1440p HEVC + Aux 1080p H.264)"
         } else {
@@ -1722,9 +1830,14 @@ class MainActivity : AppCompatActivity() {
             "Simulcast Target #2 (Kick / Rooter / Custom): ${onOff(settings.simulcastKickEnabled)}"
         styleToggleBtn(btnSimulcastKick, isOn = settings.simulcastKickEnabled)
 
+        val compCodecHint = scanSummary.selectCompanionEncoder(settings.codec, requireH264Only = false)?.codecKey
         btnDualCompanion.text =
-            "Dual-Format 16:9 + 9:16 Simultaneous Companion: ${onOff(settings.dualFormatCompanionEnabled)}" +
-                (if (!dualSupported) " (Needs Flagship/Ultra 2-Instance HW)" else "")
+            "Dual-Format 16:9 + 9:16 Companion: ${onOff(settings.dualFormatCompanionEnabled)}" +
+                when {
+                    !dualSupported -> " (Needs 2-Instance HW)"
+                    compCodecHint != null -> " ($compCodecHint)"
+                    else -> ""
+                }
         styleToggleBtn(btnDualCompanion, isOn = settings.dualFormatCompanionEnabled)
 
         btnCompanionBitrate.text =
@@ -1733,19 +1846,17 @@ class MainActivity : AppCompatActivity() {
         btnNetTest.text = if (isLive) {
             "Speed Test Locked While Live (See Floating Pill Net Tab)"
         } else {
-            "Test Internet: Download, Upload, TCP RTT & Bitrate Advisor"
+            "Test Internet: Download, Upload, RTT & Bitrate Advisor"
         }
 
         // Card 3: Direct-Tap Pills & Video Engine
         val restartSuffix = if (isLive) " [Next]" else ""
         val av1Available = scanSummary.av1Hardware != null &&
             (scanSummary.av1Hardware?.supports1440p60 == true || scanSummary.av1Hardware?.supports1080p60 == true)
-        val singleEncodeSimLock = (settings.simulcastTwitchEnabled || settings.simulcastKickEnabled) && !settings.simulcastSplitEncode
 
         resPillButtons.forEach { (wKey, btn) ->
             styleToggleBtn(btn, isOn = (longDim == wKey))
         }
-        val effectiveActiveCodec = if (singleEncodeSimLock) "H264" else settings.codec.uppercase(Locale.US)
         codecPillButtons.forEach { (cKey, btn) ->
             styleToggleBtn(btn, isOn = (cKey == effectiveActiveCodec))
         }
@@ -1759,7 +1870,7 @@ class MainActivity : AppCompatActivity() {
         btnCodec.text = if (singleEncodeSimLock) {
             "Codec: H264 (Locked for Single-Encode Simulcast)$restartSuffix"
         } else {
-            "Codec: ${settings.codec}" + (if (!av1Available && settings.codec != "AV1") " (AV1: No HW Enc)" else "") + restartSuffix
+            "Codec: ${settings.codec}" + (if (!av1Available && settings.codec != "AV1") " (AV1: No HW)" else "") + restartSuffix
         }
         btnResolution.text = "Res: $heroResShort$restartSuffix"
         btnFps.text = "Stream: ${settings.fps} FPS$restartSuffix" +
@@ -1786,7 +1897,7 @@ class MainActivity : AppCompatActivity() {
         btnAmoledVivid.text = "AMOLED Vivid Pop: ${onOff(settings.amoledVivid)}"
         styleToggleBtn(btnAmoledVivid, isOn = settings.amoledVivid)
 
-        btnShadowBoost.text = "AI Dark-Corner Boost: ${onOff(settings.shadowBoost)}"
+        btnShadowBoost.text = "Adaptive Dark-Corner Boost: ${onOff(settings.shadowBoost)}"
         styleToggleBtn(btnShadowBoost, isOn = settings.shadowBoost)
 
         btnColorTemp.text = "Color Temp: ${settings.colorTempFilter}"
@@ -1799,7 +1910,7 @@ class MainActivity : AppCompatActivity() {
         }
         styleToggleBtn(btnSharpen, isOn = settings.gpuSharpen)
 
-        // Scenes, Overlay Position, Dual Privacy Blur & Pro Silicon Drawer
+        // Scenes, Unified Logo:OFF Overlay, Dual Privacy Blur & Pro Silicon Drawer
         val hasStart = SolSceneAssetStore.hasCustomAsset(this, SolSceneAssetStore.AssetSlot.STARTING_SOON)
         val hasBrb = SolSceneAssetStore.hasCustomAsset(this, SolSceneAssetStore.AssetSlot.BRB_SCENE)
         val hasOv = SolSceneAssetStore.hasCustomAsset(this, SolSceneAssetStore.AssetSlot.OVERLAY_PNG)
@@ -1810,18 +1921,23 @@ class MainActivity : AppCompatActivity() {
         btnPickBrbImg.text = "BRB Privacy Img (${if (hasBrb) "Custom Saved" else "Default Slate"})"
         styleToggleBtn(btnPickBrbImg, isOn = hasBrb, activeFillHex = "#13284A", activeStrokeHex = "#38BDF8")
 
-        btnPickOverlayPng.text = ".PNG Overlay (${if (hasOv) "Saved • ${onOff(settings.overlayImageEnabled)}" else "Pick .PNG"})"
-        styleToggleBtn(btnPickOverlayPng, isOn = settings.overlayImageEnabled)
-        styleToggleBtn(btnToggleOverlayOn, isOn = settings.overlayImageEnabled)
+        btnPickOverlayPng.text = "Pick .PNG Logo (${if (hasOv) "Saved" else "None"})"
+        styleToggleBtn(btnPickOverlayPng, isOn = hasOv, activeFillHex = "#13284A", activeStrokeHex = "#38BDF8")
 
-        val posFriendly = when (settings.overlayPosition) {
-            "TOP_LEFT" -> "Corner Logo: Top-Left"
-            "TOP_RIGHT" -> "Corner Logo: Top-Right"
-            "BOTTOM_LEFT" -> "Corner Logo: Bottom-Left"
-            "BOTTOM_RIGHT" -> "Corner Logo: Bottom-Right"
-            else -> "Full-Screen 16:9 Frame"
+        val posFriendly = if (!settings.overlayImageEnabled) {
+            "Logo Overlay: OFF (Tap to Enable/Cycle)"
+        } else {
+            when (settings.overlayPosition) {
+                "TOP_LEFT" -> "Logo: Top-Left (TL)"
+                "TOP_RIGHT" -> "Logo: Top-Right (TR)"
+                "BOTTOM_LEFT" -> "Logo: Bottom-Left (BL)"
+                "BOTTOM_RIGHT" -> "Logo: Bottom-Right (BR)"
+                else -> "Logo: Full-Screen Frame"
+            }
         }
-        btnOverlayPosition.text = ".PNG Overlay Layout: $posFriendly"
+        btnOverlayPosition.text = posFriendly
+        styleToggleBtn(btnOverlayPosition, isOn = settings.overlayImageEnabled)
+
         btnPickShortsPoster.text = "9:16 Poster (${if (hasPost) "Custom Saved" else "Pick Image"})"
         styleToggleBtn(btnPickShortsPoster, isOn = hasPost, activeFillHex = "#13284A", activeStrokeHex = "#38BDF8")
 
@@ -1842,7 +1958,7 @@ class MainActivity : AppCompatActivity() {
         styleToggleBtn(btnAutoBlurKeyboard, isOn = settings.autoBlurKeyboard)
 
         val glDisp = if (settings.glEngineMode == "ES20") "ES 2.0" else "ES 3.0 Fast-FP16"
-        btnGlEngine.text = "OpenGL Engine: ${settings.glEngineMode} ($glDisp • Device Max: ES ${scanSummary.maxGlEsVersion})$restartSuffix"
+        btnGlEngine.text = "OpenGL Engine: ${settings.glEngineMode} ($glDisp • Max: ES ${scanSummary.maxGlEsVersion})$restartSuffix"
         val hdrSupported = scanSummary.hevcHardware?.supports10BitHdr == true
         btnHdr10.text = "True 10-Bit HDR10 (HLG): ${onOff(settings.hdr10Enabled)}" +
             (if (!hdrSupported) " (HW 8-Bit Only)" else "") + restartSuffix
@@ -1854,14 +1970,14 @@ class MainActivity : AppCompatActivity() {
         btnKeyframeAndBFrames.text = "IDR Keyframe: ${settings.keyframeIntervalSec}s | B-Frames: ${settings.maxBFrames}$restartSuffix"
         val qpLabel = when (settings.qpMaxCap) {
             0 -> "Auto (14..51)"
-            32 -> "14..32 (Ultra Crisp Foliage)"
+            32 -> "14..32 (Ultra Crisp)"
             36 -> "14..36 (High)"
             38 -> "14..38 (Balanced)"
             else -> "14..${settings.qpMaxCap}"
         }
-        btnQpAndLatency.text = "QP Range: $qpLabel | Low-Lat Hint: ${onOff(settings.lowLatencyCodecHint)}$restartSuffix"
+        btnQpAndLatency.text = "QP Range: $qpLabel | Low-Lat: ${onOff(settings.lowLatencyCodecHint)}$restartSuffix"
 
-        // Card 4: SolLuxe™ 2.0 13-Stage Audio Studio & SeekBar Sync
+        // Card 4: SolLuxe™ 3.0 Pure 6-Stage Audio Studio & SeekBar Sync
         val selectedMicLabel = micOptions.firstOrNull { it.deviceId == settings.micDeviceId }?.label
             ?: micOptions.firstOrNull()?.label ?: "Auto (Phone Studio Mic Locked)"
         val activeHwAcoustic = SolDualAudioEngine.detectHardwareAcousticMode(this, settings.micDeviceId, settings.speakerAecEnabled)
@@ -1880,33 +1996,33 @@ class MainActivity : AppCompatActivity() {
         styleToggleBtn(btnGenderMale, isOn = (gProf == "MALE"))
         styleToggleBtn(btnGenderFemale, isOn = (gProf == "FEMALE"))
 
-        btnVoicePreset.text = "Voice Type: ${MicDspProcessor.presetDisplayName(settings.voicePreset)}"
+        btnVoicePreset.text = "Voice Preset: ${MicDspProcessor.presetDisplayName(settings.voicePreset)}"
         styleToggleBtn(btnVoicePreset, isOn = settings.voicePreset != "RAW", activeFillHex = "#2E1065", activeStrokeHex = "#8B5CF6")
 
-        // Verify both isLibraryLoaded and isNeuralModelReady on the Denoiser badge
-        val nsModeDesc = when (settings.noiseSuppressMode) {
-            "RNNOISE" -> when {
+        val nsModeDesc = when {
+            settings.voicePreset == "RAW" -> "Bypassed (RAW Mode)"
+            settings.noiseSuppressMode == "RNNOISE" -> when {
                 SolNativeRnnoise.isLibraryLoaded && SolNativeRnnoise.isNeuralModelReady -> "Native C 48kHz RNNoise"
                 SolNativeRnnoise.isLibraryLoaded -> "Native C 48kHz Bark-MMSE"
                 else -> "RNNoise (Spectral Fallback)"
             }
-            "LIGHT" -> "Light Mathematical Cut"
-            "HW_NS" -> "Phone Chip HW NS"
+            settings.noiseSuppressMode == "LIGHT" -> "Light Mathematical Cut"
+            settings.noiseSuppressMode == "HW_NS" -> "Phone Chip HW NS"
             else -> "OFF"
         }
         val nsLvlDesc = when (settings.rnnoiseLevel) {
             0 -> "OFF (0%)"
             1 -> "Lv1 Gentle (65%)"
             2 -> "Lv2 Natural (88%)"
-            else -> "Lv3 Max (98%)"
+            else -> "Lv3 Max (100%)"
         }
-        val denoiserActive = settings.noiseSuppressMode != "OFF" && settings.rnnoiseLevel > 0
+        val denoiserActive = settings.voicePreset != "RAW" && settings.noiseSuppressMode != "OFF" && settings.rnnoiseLevel > 0
         btnNoiseSuppressMode.text = "Denoiser (Pick 1): $nsModeDesc"
         styleToggleBtn(btnNoiseSuppressMode, isOn = denoiserActive)
         btnNoiseSuppressLevel.text = "Strength: $nsLvlDesc"
         styleToggleBtn(btnNoiseSuppressLevel, isOn = denoiserActive)
 
-        btnMicGain.text = "🎙️ Mic Boost: ${settings.micGainPercent}% (Post-DSP Stage 13)"
+        btnMicGain.text = "🎙️ Mic Boost: ${settings.micGainPercent}% (Post-DSP + True-Peak Limiter)"
         btnGameGain.text = "🎮 Game Mix: ${settings.gameGainPercent}% (Up to 250%)"
         suppressSeekBarCallback = true
         seekMicGain.progress = ((settings.micGainPercent.coerceIn(50, 250) - 50) / 5)
@@ -1926,36 +2042,45 @@ class MainActivity : AppCompatActivity() {
         btnGameBlastTamer.text = "Blast Tamer (35ms Smooth): ${onOff(settings.gameBlastTamerEnabled)}"
         styleToggleBtn(btnGameBlastTamer, isOn = settings.gameBlastTamerEnabled)
 
-        // Individual 13-Stage Voice Filter Switches
-        btnStageHpf.text = if (settings.hpfCutoffHz == 0) "1. HPF Rumble: OFF" else "1. HPF Rumble: ${settings.hpfCutoffHz} Hz"
+        // Individual 6-Stage SolLuxe™ 3.0 Pure Switches (Accurate Naming + Auto/Manual HPF Badge)
+        btnStageHpf.text = when {
+            settings.hpfCutoffHz == 0 -> "1. Butterworth HPF: OFF"
+            settings.hpfAutoMode -> "1. HPF: ${settings.hpfCutoffHz} Hz (Auto)"
+            else -> "1. HPF: ${settings.hpfCutoffHz} Hz (Manual)"
+        }
         styleToggleBtn(btnStageHpf, isOn = settings.hpfCutoffHz > 0)
 
-        btnStageTransient.text = "2. Spark/Hammer & Grip Blanker: ${onOff(settings.transientTamerEnabled)}"
+        btnStageTransient.text = "2. <0.6ms Impulse Clamper: ${onOff(settings.transientTamerEnabled)}"
         styleToggleBtn(btnStageTransient, isOn = settings.transientTamerEnabled)
 
-        btnStageGate.text = "3. 0-ms Gate + Hard-Breath Guard: ${onOff(settings.noiseGateEnabled)}"
+        btnStageGate.text = "3. Hybrid VAD Expander (-14dB): ${onOff(settings.noiseGateEnabled)}"
         styleToggleBtn(btnStageGate, isOn = settings.noiseGateEnabled)
 
-        btnStageEq.text = "4. ${settings.voiceGenderProfile} Proximity, Mud Scoop & 920Hz Velvet: ${onOff(settings.voiceEqEnabled)}"
+        btnStageEq.text = "5a. ${settings.voiceGenderProfile} Condenser EQ: ${onOff(settings.voiceEqEnabled)}"
         styleToggleBtn(btnStageEq, isOn = settings.voiceEqEnabled)
 
-        btnStageVelvet.text = "5. Cubic Sub-Warmth & Aphex Silk Air: ${onOff(settings.velvetWarmthEnabled)}"
+        btnStageVelvet.text = "5b. Low-Band Analog Warmth: ${onOff(settings.velvetWarmthEnabled)}"
         styleToggleBtn(btnStageVelvet, isOn = settings.velvetWarmthEnabled)
 
-        btnStageDeEss.text = "6. Post-Comp Split-Band De-Esser: ${onOff(settings.deEsserEnabled)}"
+        btnStageDeEss.text = "6b. Dynamic Sibilance De-Esser: ${onOff(settings.deEsserEnabled)}"
         styleToggleBtn(btnStageDeEss, isOn = settings.deEsserEnabled)
 
-        btnStageComp.text = "7. High-Pass Sidechain 3:1 Leveler: ${onOff(settings.compressorEnabled)}"
+        btnStageComp.text = "6a. Soft-Knee 2.5:1 Leveler: ${onOff(settings.compressorEnabled)}"
         styleToggleBtn(btnStageComp, isOn = settings.compressorEnabled)
 
-        btnStageWhisper.text = "8. Whisper Callout Lift: ${onOff(settings.whisperLiftEnabled)}"
+        btnStageWhisper.text = "6a. VAD Quiet-Speech Lift: ${onOff(settings.whisperLiftEnabled)}"
         styleToggleBtn(btnStageWhisper, isOn = settings.whisperLiftEnabled)
 
-        btnStageSlowAgc.text = "9. Speech-Gated Slow AGC: ${onOff(settings.slowAgcEnabled)}"
+        btnStageSlowAgc.text = "6a. Speech-Synced Slow AGC: ${onOff(settings.slowAgcEnabled)}"
         styleToggleBtn(btnStageSlowAgc, isOn = settings.slowAgcEnabled)
 
-        btnStageSpeakerAec.text = "10. Speaker Echo Canceler: ${onOff(settings.speakerAecEnabled)}"
-        styleToggleBtn(btnStageSpeakerAec, isOn = settings.speakerAecEnabled)
+        val effectiveAecNow = SolDualAudioEngine.computeEffectiveSpeakerAec(this, settings.speakerAecEnabled, settings.micDeviceId)
+        btnStageSpeakerAec.text = when {
+            !settings.speakerAecEnabled -> "Speaker Echo-Guard: OFF"
+            effectiveAecNow -> "Speaker Echo-Guard: ON (Active)"
+            else -> "Speaker Echo-Guard: ON (Paused — Earphones)"
+        }
+        styleToggleBtn(btnStageSpeakerAec, isOn = effectiveAecNow)
 
         btnExtraSafeguards.text =
             "Scene Auto-Mute Mic: ${onOff(settings.brbMuteMicToo)} | Low-Lat Wi-Fi Lock: ${onOff(settings.wifiLowLatencyLock)}"
@@ -1965,7 +2090,14 @@ class MainActivity : AppCompatActivity() {
         btnPlayMicTest.isEnabled = !isLive
         btnRecordMicTest.text = if (isLive) "10s Test Locked (Live)" else "Record 10s Test"
 
-        // Card 5: Go Live / Stop Live Stream + Saved Clips Count
+        // Card 5: Go Live / Reports (with 60s Checkpoint Indicator) / Saved Clips
+        val hasRecoveredCheckpoint = !isLive && DiagnosticsLogger.hasUnfinishedLiveCheckpoint(this)
+        btnReportsQuick.text = if (hasRecoveredCheckpoint) {
+            "Session Reports (⚡ Recovered 60s)"
+        } else {
+            "Session Reports & History"
+        }
+
         val clipsCount = DiagnosticsLogger.getClipHighlightCount()
         btnSavedClipsQuick.text = if (clipsCount > 0) {
             "★ Saved Clips & AI Highlights ($clipsCount)"
@@ -1986,6 +2118,8 @@ class MainActivity : AppCompatActivity() {
         } else {
             "Benchmark Other App"
         }
+
+        refreshAccordionHeaders()
     }
 
     private fun formatBitrateMbps(kbps: Int): String {
@@ -2031,11 +2165,6 @@ class MainActivity : AppCompatActivity() {
     }
 
     // === PLATFORM, SIMULCAST & VIDEO PILL HANDLERS ===
-    /**
-     * Selecting Twitch auto-configures 1080p60 • H.264 • 6 Mbps • 160k AAC;
-     * selecting Kick auto-configures 1080p60 • H.264 • 8 Mbps • 160k AAC;
-     * switching back to YouTube restores the active Device Tier's YouTube resolution/bitrate/codec if it was clamped!
-     */
     private fun selectPlatformPreset(platformKey: String) {
         val p = platformKey.uppercase(Locale.US)
         val prevPlat = settings.platformPreset.uppercase(Locale.US)
@@ -2120,7 +2249,7 @@ class MainActivity : AppCompatActivity() {
     private fun toggleDualFormatCompanion() {
         val nextState = !settings.dualFormatCompanionEnabled
         if (nextState) {
-            if (!scanSummary.supportsDualFormatCompanion()) {
+            if (!scanSummary.supportsDualFormatCompanion(primaryCodec = settings.codec)) {
                 Toast.makeText(
                     this,
                     "Dual-Format Simultaneous Companion requires a Flagship/Ultra chip with 2+ concurrent hardware encoder instances.",
@@ -2233,10 +2362,22 @@ class MainActivity : AppCompatActivity() {
         updateSetting(settings.copy(colorTempFilter = next))
     }
 
-    private fun cycleOverlayPosition() {
+    /**
+     * Unified Logo Overlay cycler synced 1:1 with the Floating Pill:
+     * OFF -> FULL -> TOP_LEFT -> TOP_RIGHT -> BOTTOM_LEFT -> BOTTOM_RIGHT -> OFF.
+     */
+    private fun cycleUnifiedOverlayLogo() {
         val order = SolStreamService.OVERLAY_POSITION_ORDER
-        val next = order[(order.indexOf(settings.overlayPosition) + 1) % order.size]
-        updateSetting(settings.copy(overlayPosition = next))
+        if (!settings.overlayImageEnabled) {
+            updateSetting(settings.copy(overlayImageEnabled = true, overlayPosition = order.first()))
+            return
+        }
+        val idx = order.indexOf(settings.overlayPosition)
+        if (idx in 0 until order.size - 1) {
+            updateSetting(settings.copy(overlayImageEnabled = true, overlayPosition = order[idx + 1]))
+        } else {
+            updateSetting(settings.copy(overlayImageEnabled = false, overlayPosition = order.first()))
+        }
     }
 
     private fun cycleShortsBackdrop() {
@@ -2332,8 +2473,15 @@ class MainActivity : AppCompatActivity() {
 
     private fun cycleHpf() {
         val order = MicDspProcessor.HPF_CUTOFF_STEPS
-        val next = order[(order.indexOf(settings.hpfCutoffHz) + 1) % order.size]
-        updateSetting(settings.copy(hpfCutoffHz = next))
+        val curIdx = order.indexOf(settings.hpfCutoffHz)
+        val next = order[(curIdx + 1) % order.size]
+        val profileDefault = KeystoreVault.resolveDefaultHpfForProfile(settings.voiceGenderProfile)
+        updateSetting(
+            settings.copy(
+                hpfCutoffHz = next,
+                hpfAutoMode = (next == profileDefault)
+            )
+        )
     }
 
     private fun cycleMicGain() {
@@ -2369,7 +2517,7 @@ class MainActivity : AppCompatActivity() {
         updateSetting(settings.copy(brbMuteMicToo = brbMute, wifiLowLatencyLock = wifiLow))
     }
 
-    // === CLIPBOARD HELPER (Ensures Samsung Keyboard Clipboard History Always Shows Copied Items) ===
+    // === CLIPBOARD HELPER ===
     private fun copyPlainTextToClipboard(label: String, text: String) {
         val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
         val clip = ClipData.newPlainText(label, text)
@@ -2384,7 +2532,7 @@ class MainActivity : AppCompatActivity() {
         cm.setPrimaryClip(clip)
     }
 
-    // === PRESET SHARE, SMART HARDWARE CLAMPING & COMPLETE GUIDE / PRIVACY POLICY / LICENSES ===
+    // === PRESET SHARE & SMART HARDWARE CLAMPING ===
     private fun copyPresetToClipboard() {
         val json = KeystoreVault.exportPresetJson(settings)
         copyPlainTextToClipboard("SolStream Ultra Preset", json)
@@ -2395,11 +2543,6 @@ class MainActivity : AppCompatActivity() {
         ).show()
     }
 
-    /**
-     * Smart Cross-Phone Preset Clamping (#4):
-     * Validates imported JSON presets against the receiving phone's hardware scan and adapts
-     * unsupported resolutions/codecs cleanly.
-     */
     private fun importPresetFromClipboard() {
         val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
         val raw = cm.primaryClip?.getItemAt(0)?.coerceToText(this)?.toString()?.trim()
@@ -2422,92 +2565,159 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /**
-     * Comprehensive, Easy-to-Read In-App Studio Guide + Google Play Privacy Policy + Open-Source Licenses.
-     */
-    private fun showPlainEnglishGlossaryDialog() {
-        val guide = """
-            === SOLSTREAM STUDIO ULTRA v$appVersionName (SolApex™ HyperStream) — COMPLETE USER GUIDE, PRIVACY POLICY & LICENSES ===
-
-            ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-            PART 1 — QUICK-START STUDIO GUIDE (PLAIN ENGLISH)
-            ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-            1. SMART DEVICE TIERS & HERO BAR (Top & Card 0)
-            • 3-Tile Hero Bar: Tap Resolution, Frame Rate, or Bitrate at the very top anytime for 1-tap switching.
-            • 5 Smart Tiers (Lite / Balanced / High / Flagship / Ultra): Auto-configures the best resolution, bitrate, and 13-Stage SolLuxe™ 2.0 voice studio for your phone while respecting your selected Platform (YouTube vs Twitch 6M vs Kick 8M).
-
-            2. PLATFORMS, 9:16 SHORTS & MULTI-PLATFORM SIMULCAST (Card 2)
-            • YouTube: Supports 360p to 4K60 in HEVC, H.264, or AV1 up to 50+ Mbps.
-            • Twitch (6 Mbps H.264 Cap) & Kick (8 Mbps H.264 Cap): 1 tap auto-configures 1080p60 H.264 + 160k AAC so Twitch/Kick never reject your stream.
-            • YouTube 9:16 Shorts Tip: In YouTube Studio, keep 'Turn on manual settings' OFF so your single Default Stream Key works automatically for both 16:9 Landscape and 9:16 Vertical Shorts!
-            • Simulcast Modes: Choose Single-Encode Cool Mode (0% extra encoder heat) or Split-Encode Dual HW Quality (sends 1440p HEVC to YouTube + 1080p H.264 to Twitch/Kick simultaneously on Flagship/Ultra chips).
-
-            3. SOLCORE ULTRA™ VIDEO, STRETCH FRAMING & DUAL PRIVACY BLUR (Card 3)
-            • STRETCH (16:9 Full): Maps all 4 corners of your phone screen to all 4 corners of the stream—zero black bars and 100% of your game HUD visible!
-            • SMART + Zoom (100%–250%): Zooms smoothly into your center crosshair in both 16:9 Landscape and 9:16 Shorts.
-            • Dual-Layer Privacy Blur Shield:
-              - Auto-Blur Keyboard: Automatically blurs the bottom 54% of the stream the instant your keyboard opens (protecting passwords, chats & keyboard photos) while keeping your Minimap Blur active!
-              - 8 Screen Zones: Blur Top-Right (Small Room Code / Med Minimap / Large HUD), Center Box, Keyboard, or any corner.
-
-            4. SOLLUXE™ 2.0 13-STAGE VOICE STUDIO & 3D GAME SOUNDSTAGE (Card 4)
-            • Automatic 12-Mode Hardware Matrix (4 Gear Modes × 3 Gender Profiles):
-              - Wearing Bluetooth Earphones (Auto Mode): Your earphones stay 100% in crisp HD Stereo (A2DP) for footsteps while your voice is captured from the phone's 48 kHz studio mic.
-              - Plugging in a Wired 3.5mm or USB-C Mic: Automatically switches from Far-Field Hand-Grip tuning to Close-Talk Broadcast tuning!
-            • Male (50Hz HPF) / Neutral (65Hz HPF) / Female (85Hz HPF):
-              - Stage 1–4: 64-Bit HPF + Spark/Grip Blanker + Native C 48kHz Xiph RNNoise + 0-ms Breath Gate.
-              - Stage 5 (Dynamic Hard-Breath Plosive Guard): Automatically ducks <115 Hz wind blasts when you exhale or blow air out hard, restoring 100% of your baritone chest warmth in 0 ms when you speak.
-              - Stage 6–9 (Clean, Intimate & Sexy Vocal Polish): Tight Cardioid Proximity Chest Contour (95/130/175 Hz) + Pure Analog Cubic Sub-Warmth + Deeper -3.5 dB Boxy Mud Scoop (315–365 Hz) + 920 Hz Sweet Velvet Anti-Nasal Dip + Upper-Harmonic "Aphex Silk Air" Exciter (restores 5–10 kHz studio sparkle even during 16 kHz in-game match locks!).
-              - Stage 10–13: AI Tone Balancer + High-Pass Sidechain 3:1 Leveler & Slow AGC + Post-Comp Split-Band De-Esser + Post-DSP Mic Boost (50%–250%).
-            • 3D Game Soundstage: Cinema 3D Wide, Theater Sub-Punch (62 Hz grenade thump that ducks to 0 dB when you speak), Footstep Focus (250 Hz + 2,450 Hz + Sonar Lift), and Blast Tamer.
-
-            5. FLOATING IN-GAME PILL & LIVE RESOURCE SPLIT (Card 5)
-            • Double-tap or hold the compact in-game pill to expand 3 tabs (🎙️ Audio, 🎬 Video, 📡 Bitrate/Net).
-            • Tab 3 (📡 Bitrate/Net) shows live App vs. Game Heat/CPU Split and App vs. Game RAM Split so you can see exactly how little power SolStream uses compared to your game!
-
-            ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-            PART 2 — OFFICIAL PRIVACY POLICY & GOOGLE PLAY DATA SAFETY
-            ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-            • Zero Data Collection & Zero Server Storage: SolStream Studio processes all screen video and microphone audio locally in real time on your device and transmits the encoded stream solely to the RTMP/RTMPS ingest URL you configure. SolStream Studio has no developer servers, no user accounts, no advertising SDKs, and no analytics trackers.
-            • Hardware Keystore Encryption: Your RTMP/RTMPS stream keys are encrypted locally on your device using the Android Hardware Keystore (AES-256-GCM / StrongBox / TEE) and are automatically redacted ([REDACTED_KEY]) from diagnostic logs.
-            • AccessibilityService Disclosure & Strict Privacy Limits: SolStream Studio optionally uses the Android AccessibilityService API solely to:
-              1) Display the assistive in-game floating broadcast dock (TYPE_ACCESSIBILITY_OVERLAY) for one-tap mic mute, privacy blur, scenes, and clip markers over full-screen games, and
-              2) Maintain continuous microphone audio routing alongside internal game audio when multiplayer games activate squad voice chat.
-              SolStream Studio sets android:canRetrieveWindowContent="false", android:canPerformGestures="false", and android:isAccessibilityTool="false". It CANNOT read screen text, passwords, messages, or personal data. You may decline or disable Accessibility at any time and stream using standard foreground microphone capture.
-
-            ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-            PART 3 — OPEN-SOURCE CREDITS & LICENSES
-            ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-            1. RootEncoder (com.github.pedroSG94.RootEncoder)
-               • Copyright (c) 2024 Pedro Sánchez (pedroSG94)
-               • Licensed under the Apache License, Version 2.0.
-            2. Xiph RNNoise (xiph/rnnoise v0.1.1 — 48 kHz Recurrent Neural Denoiser)
-               • Copyright (c) 2017–2024 Xiph.Org Foundation and Jean-Marc Valin
-               • Licensed under the BSD 3-Clause License.
-            3. AndroidX Core, AppCompat, Material Components & Kotlin Coroutines
-               • Copyright (c) Google LLC & JetBrains s.r.o.
-               • Licensed under the Apache License, Version 2.0.
-        """.trimIndent()
-
-        val tv = TextView(this).apply {
-            text = guide
-            setTextColor(Color.parseColor("#ECEFF1"))
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f)
+    // === VISUAL NUMBERED CARD IN-APP USER GUIDE, ANTI-KILL CHECKLIST & PRIVACY / LICENSES ===
+    private fun makeGuideCard(
+        badgeText: String,
+        titleText: String,
+        bodyContent: String,
+        accentHex: String
+    ): LinearLayout {
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = cardDrawable("#0B1324", accentHex)
             setPadding(dp(14), dp(12), dp(14), dp(12))
-            setTextIsSelectable(true)
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { bottomMargin = dp(10) }
+
+            val badge = TextView(this@MainActivity).apply {
+                text = badgeText
+                setTextColor(Color.parseColor(accentHex))
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 9.5f)
+                typeface = Typeface.DEFAULT_BOLD
+                letterSpacing = 0.08f
+            }
+            val title = TextView(this@MainActivity).apply {
+                text = titleText
+                setTextColor(Color.parseColor("#F8FAFC"))
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 13.5f)
+                typeface = Typeface.DEFAULT_BOLD
+                setPadding(0, dp(2), 0, dp(5))
+            }
+            val body = TextView(this@MainActivity).apply {
+                text = bodyContent
+                setTextColor(Color.parseColor("#CBD5E1"))
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.4f)
+                setLineSpacing(dp(2).toFloat(), 1.0f)
+                setTextIsSelectable(true)
+            }
+            addView(badge)
+            addView(title)
+            addView(body)
         }
+    }
+
+    private fun showPlainEnglishGlossaryDialog() {
+        val mfr = "${Build.MANUFACTURER} ${Build.BRAND}".lowercase(Locale.US)
+        val detectedAntiKillBlock = when {
+            mfr.contains("samsung") ->
+                "★ YOUR DEVICE: SAMSUNG (${Build.MODEL})\n" +
+                    "1. App Info → Battery → Unrestricted.\n" +
+                    "2. Device Care → Memory → Excluded apps → add BOTH SolStream Studio and your game.\n" +
+                    "3. Device Care → Memory → RAM Plus → OFF (prevents background disk-swap freezes on 8 GB phones).\n" +
+                    "4. Game Booster → Enable 'Pause USB PD charging when gaming' with a 25W+ PPS charger for 2–4°C cooler sessions."
+            mfr.contains("xiaomi") || mfr.contains("redmi") || mfr.contains("poco") ->
+                "★ YOUR DEVICE: XIAOMI / POCO / REDMI (${Build.MODEL})\n" +
+                    "1. App Info → Battery Saver → No restrictions.\n" +
+                    "2. Enable Autostart and Lock SolStream Studio in Recents.\n" +
+                    "3. Sideloaded APK Unlock: Scroll to bottom of App Info → 'Allow restricted settings'."
+            mfr.contains("vivo") || mfr.contains("iqoo") ->
+                "★ YOUR DEVICE: VIVO / iQOO (${Build.MODEL})\n" +
+                    "1. Enable High Background Power Consumption & lock SolStream in Recents.\n" +
+                    "2. Ultra Game Mode: Keep 'Game Frame Interpolation' OFF (use Native 90/120 FPS) for smooth 60 FPS capture."
+            mfr.contains("oneplus") || mfr.contains("oppo") || mfr.contains("realme") ->
+                "★ YOUR DEVICE: ONEPLUS / OPPO / REALME (${Build.MODEL})\n" +
+                    "1. App Info → Battery Usage → turn ON 'Allow background activity'.\n" +
+                    "2. Lock SolStream Studio in Recents so memory cleaner skips it."
+            else ->
+                "★ YOUR DEVICE: ${Build.MANUFACTURER.uppercase(Locale.US)} ${Build.MODEL}\n" +
+                    "1. App Info → Battery → Unrestricted (keeps 3+ hour streams uninterrupted)."
+        }
+
+        val guideContainer = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(Color.parseColor("#050A14"))
+            setPadding(dp(12), dp(12), dp(12), dp(12))
+        }
+
+        guideContainer.addView(
+            makeGuideCard(
+                badgeText = "CARD 1 • 3-STEP QUICK START",
+                titleText = "Go Live in Under 60 Seconds",
+                bodyContent = "1. Paste your YouTube, Twitch, or Kick Stream Key in Card 2 (AES-256 Hardware Keystore encrypted).\n" +
+                    "2. Pick your Device Tier (Card 0) and Gender Voice Profile (Card 4) — HPF, bitrate, and codecs auto-sync.\n" +
+                    "3. Tap GO LIVE. In YouTube Studio, keep 'Turn on manual settings' OFF so one key works for both 16:9 and 9:16 Shorts.",
+                accentHex = "#00E5FF"
+            )
+        )
+
+        guideContainer.addView(
+            makeGuideCard(
+                badgeText = "CARD 2 • SOLLUXE™ 3.0 PURE AUDIO",
+                titleText = "Voice Presets at a Glance",
+                bodyContent = "• SOL_LUXE: Full 6-stage pure condenser chain — deep chest warmth, surgical mud cleanup, silky 4.5–5.1 kHz presence, clean 8.5/9.0 kHz air shelf & smooth VAD leveling.\n" +
+                    "• RADIO STUDIO: Shifts presence to 2.9–3.5 kHz (+1.6 dB) with tighter 3.2:1 leveling to cut through intense gunfights.\n" +
+                    "• VELVET: Warm natural tone with subtle low-band warmth and gentle 2.0:1 leveling.\n" +
+                    "• CLEAN / NEURAL: Noise removal + HPF + smooth leveling with zero EQ coloration.\n" +
+                    "• RAW: Dry uncolored mic bypass (only Mute, Mic Boost & 4× True-Peak safety limiter).\n\n" +
+                    "Bluetooth Earphones stay in HD Stereo (A2DP) for footsteps while SolStream captures your phone's 48 kHz studio mic.",
+                accentHex = "#8B5CF6"
+            )
+        )
+
+        val antiKillCard = makeGuideCard(
+            badgeText = "CARD 3 • PREVENT 3-HOUR STREAM CUTS",
+            titleText = "Long-Stream Anti-Kill Checklist",
+            bodyContent = "$detectedAntiKillBlock\n\n" +
+                "• 60-Second Auto-Checkpoint: Even if Android forcefully kills the process, your live telemetry and ★ Saved Clips are safely checkpointed every 60 seconds without overwriting past report history.",
+            accentHex = "#10B981"
+        )
+        antiKillCard.addView(
+            actionButton("Open Battery / App Info Settings", "#0D3652") {
+                openBatteryUnrestricted()
+            }
+        )
+        guideContainer.addView(antiKillCard)
+
+        guideContainer.addView(
+            makeGuideCard(
+                badgeText = "CARD 4 • CONTROLS & VIDEO",
+                titleText = "Floating Pill, Notification Bar & Privacy",
+                bodyContent = "• Floating Pill: Double-tap or hold the compact pill to open 3 tabs (Audio, Video, Bitrate/Net). Tap Logo:OFF to cycle OFF → FULL → TL → TR → BL → BR.\n" +
+                    "• Safe Notification Shade: Exactly 3 quick actions (Mute Mic, Scene/BRB, ★ Clip) — Stop is safely locked inside the app & Floating Pill with 2-tap confirm.\n" +
+                    "• Framing & Privacy: Use STRETCH (16:9) for zero black bars + 100% HUD. Auto-Blur Keyboard protects passwords automatically when typing.",
+                accentHex = "#38BDF8"
+            )
+        )
+
+        guideContainer.addView(
+            makeGuideCard(
+                badgeText = "CARD 5 • PRIVACY POLICY & OPEN-SOURCE LICENSES",
+                titleText = "Data Safety, Accessibility & Credits",
+                bodyContent = "• Zero Data Collection: All video/audio processing runs locally on-device and streams solely to your configured RTMP/RTMPS ingest. Zero developer servers, zero analytics, zero ads.\n" +
+                    "• Hardware Keystore: Stream keys are encrypted via Android Keystore (AES-256-GCM) and auto-redacted ([REDACTED_KEY]) from logs.\n" +
+                    "• AccessibilityService Policy: Used optionally for the assistive floating dock and continuous mic routing alongside game voice chat. Strictly sets canRetrieveWindowContent=\"false\" and canPerformGestures=\"false\" — cannot read screen text or passwords.\n\n" +
+                    "Open-Source Credits:\n" +
+                    "1. RootEncoder (Pedro Sánchez / pedroSG94) — Apache-2.0\n" +
+                    "2. Xiph RNNoise v0.1.1 (Xiph.Org & Jean-Marc Valin) — BSD 3-Clause\n" +
+                    "3. AndroidX, Material & Kotlin Coroutines — Apache-2.0",
+                accentHex = "#64748B"
+            )
+        )
+
         val scroll = ScrollView(this).apply {
-            setBackgroundColor(Color.parseColor("#050914"))
-            addView(tv)
+            setBackgroundColor(Color.parseColor("#050A14"))
+            addView(guideContainer)
         }
         AlertDialog.Builder(this)
-            .setTitle("📖 SolStream v$appVersionName Guide, Privacy & Licenses")
+            .setTitle("📖 SolStream Studio v$appVersionName Guide")
             .setView(scroll)
             .setPositiveButton("Got It", null)
             .show()
     }
 
-    // === VAULT & KEY VISIBILITY ACTIONS (WITH SMART CLIPBOARD PASTE GUARD) ===
+    // === VAULT & KEY VISIBILITY ACTIONS ===
     private fun saveVaultInputs(showToast: Boolean): Boolean {
         val rawUrl = etRtmpsUrl.text?.toString() ?: KeystoreVault.DEFAULT_YOUTUBE_RTMPS
         val normalizedUrl = KeystoreVault.normalizeIngestUrl(rawUrl)
@@ -2571,11 +2781,6 @@ class MainActivity : AppCompatActivity() {
         Toast.makeText(this, "Primary Stream Key cleared.", Toast.LENGTH_SHORT).show()
     }
 
-    /**
-     * Smart Clipboard Paste Guard (#17):
-     * Strips invisible trailing spaces/newlines, and if the user accidentally copied an rtmp:// or
-     * rtmps:// Server URL and tapped "Paste Key", routes it into the Ingest Server URL box automatically!
-     */
     private fun pasteStreamKeyFromClipboard() {
         val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
         val rawClip = cm.primaryClip?.getItemAt(0)?.coerceToText(this)?.toString()?.trim()
@@ -2654,10 +2859,6 @@ class MainActivity : AppCompatActivity() {
     }
 
     // === GOOGLE PLAY PROMINENT DISCLOSURE & DIRECT PERMISSION TELEPORTERS ===
-    /**
-     * Mandatory Google Play Prominent Disclosure Dialog before launching Settings.ACTION_ACCESSIBILITY_SETTINGS.
-     * Ensures human reviewers see the clear Accept / Decline disclosure whether they tap Card 1 or GO LIVE.
-     */
     private fun showPlayStoreCompliantAccessibilityDisclosure(allowSkipToStream: Boolean) {
         if (isAccessibilityServiceEnabled()) {
             openAccessibilitySettingsDirect()
@@ -2706,13 +2907,8 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun openAppInfoForRestrictedSettings() {
+    private fun openAppInfoSettings() {
         try {
-            Toast.makeText(
-                this,
-                "Tap ⋮ at top-right (or scroll to the bottom of App Info on Xiaomi/POCO/Vivo) -> tap 'Allow restricted settings'!",
-                Toast.LENGTH_LONG
-            ).show()
             startActivity(
                 Intent(
                     Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
@@ -2720,8 +2916,20 @@ class MainActivity : AppCompatActivity() {
                 )
             )
         } catch (_: Exception) {
-            startActivity(Intent(Settings.ACTION_SETTINGS))
+            try {
+                startActivity(Intent(Settings.ACTION_SETTINGS))
+            } catch (_: Exception) {
+            }
         }
+    }
+
+    private fun openAppInfoForRestrictedSettings() {
+        Toast.makeText(
+            this,
+            "Tap ⋮ at top-right (or scroll to bottom of App Info on Xiaomi/POCO/Vivo) -> tap 'Allow restricted settings'!",
+            Toast.LENGTH_LONG
+        ).show()
+        openAppInfoSettings()
     }
 
     private fun onGoLiveClicked() {
@@ -2793,10 +3001,6 @@ class MainActivity : AppCompatActivity() {
         requestScreenCaptureAndGoLive()
     }
 
-    /**
-     * Reserves isBroadcastStartingOrLive = true immediately and waits up to 5.0 seconds
-     * (5000 ms) if an initial startup hardware scan is still running on a slow phone (0.05s if already done).
-     */
     private fun requestScreenCaptureAndGoLive() {
         CodecCapabilityProbe.isBroadcastStartingOrLive = true
         if (CodecCapabilityProbe.isHardwareProbeCurrentlyRunning()) {
@@ -2904,7 +3108,7 @@ class MainActivity : AppCompatActivity() {
             .show()
     }
 
-    // === 5-METRIC PRO NETWORK ANALYZER (DOWNLOAD + UPLOAD + TCP HANDSHAKE RTT + JITTER + BUFFERBLOAT) ===
+    // === 5-METRIC PRO NETWORK ANALYZER ===
     private fun parseIngestHostPort(rawUrl: String): Triple<Boolean, String, Int> {
         val clean = KeystoreVault.normalizeIngestUrl(rawUrl)
         return try {
@@ -2989,7 +3193,6 @@ class MainActivity : AppCompatActivity() {
                     }
                 }
 
-                // Step 2: Measure Cloudflare Download Speed (2.5 MB burst)
                 var downloadMbps = -1.0
                 var downConn: HttpsURLConnection? = null
                 try {
@@ -3026,7 +3229,6 @@ class MainActivity : AppCompatActivity() {
                     }
                 }
 
-                // Step 3: Measure Sustained Upload Speed + Loaded TCP Handshake Bufferbloat
                 var uploadMbps = -1.0
                 var loadedRttMs = -1L
                 val probeDone = AtomicBoolean(false)
@@ -3090,7 +3292,6 @@ class MainActivity : AppCompatActivity() {
                     else -> "+${bloatDeltaMs}ms (⚠️ Router Bufferbloat — Keep ABR ON)"
                 }
 
-                // Step 4: Platform-Aware Safe Bitrate Recommendation (60% safe upload rule + Twitch/Kick caps)
                 val rawSafeMbps = if (uploadMbps > 0.0) (uploadMbps * 0.60).roundToInt().coerceIn(1, 50) else 16
                 val platformCappedMbps = when {
                     activePlat == "TWITCH" || (settings.simulcastTwitchEnabled && !settings.simulcastSplitEncode) -> min(rawSafeMbps, 6)
@@ -3154,7 +3355,7 @@ class MainActivity : AppCompatActivity() {
             setTextIsSelectable(true)
         }
         val scroll = ScrollView(this).apply {
-            setBackgroundColor(Color.parseColor("#050914"))
+            setBackgroundColor(Color.parseColor("#050A14"))
             addView(tv)
         }
         val builder = AlertDialog.Builder(this)
@@ -3191,10 +3392,15 @@ class MainActivity : AppCompatActivity() {
         } else {
             DiagnosticsLogger.buildShareableReport(this)
         }
+        val checkpointHint = if (!showingArchived && !SolStreamService.isBroadcastLive && DiagnosticsLogger.hasUnfinishedLiveCheckpoint(this)) {
+            " • Recovered 60s"
+        } else {
+            ""
+        }
         val dialogTitle = if (showingArchived) {
             "Archived Past Reports ($archivedCount Saved)"
         } else {
-            "Current Session Report (History: $archivedCount)"
+            "Current Session Report (History: $archivedCount$checkpointHint)"
         }
 
         val tv = TextView(this).apply {
@@ -3206,7 +3412,7 @@ class MainActivity : AppCompatActivity() {
             setTextIsSelectable(true)
         }
         val scroll = ScrollView(this).apply {
-            setBackgroundColor(Color.parseColor("#050914"))
+            setBackgroundColor(Color.parseColor("#050A14"))
             addView(tv)
         }
         AlertDialog.Builder(this)
@@ -3234,16 +3440,14 @@ class MainActivity : AppCompatActivity() {
                     showDiagnosticsDialog(showingArchived = true)
                 } else if (showingArchived && archivedCount > 0) {
                     SolStreamService.clearLocalReportArchive(this)
+                    DiagnosticsLogger.clearLiveCheckpoint(this)
+                    refreshAllUi()
                     Toast.makeText(this, "Archived session history deleted.", Toast.LENGTH_SHORT).show()
                 }
             }
             .show()
     }
 
-    /**
-     * Numerical Semantic Version Parser ([1, 3, 0] vs [1, 2, 1])
-     * so future releases never fail alphabetical string comparison.
-     */
     private fun isRemoteVersionNewer(remoteRaw: String, localRaw: String): Boolean {
         val rParts = remoteRaw.trim().removePrefix("v").substringBefore('-').split('.').map { it.toIntOrNull() ?: 0 }
         val lParts = localRaw.trim().removePrefix("v").substringBefore('-').split('.').map { it.toIntOrNull() ?: 0 }
@@ -3324,61 +3528,56 @@ class MainActivity : AppCompatActivity() {
         }, "SolUpdateCheck").start()
     }
 
-    /**
-     * All-Brand Phone Setup, Earphones & Cool-Stream Guide (#14):
-     * Auto-detects Build.MANUFACTURER so the user's own phone brand appears right at the top,
-     * including iQOO/Vivo Q1/Q2 Frame Interpolation tips and OEM background power settings!
-     */
     private fun showAllBrandSetupGuide() {
         val mfr = Build.MANUFACTURER.lowercase(Locale.US)
         val detectedBrandTip = when {
             mfr.contains("samsung") ->
                 "★ DETECTED PHONE: SAMSUNG ONE UI (${Build.MODEL})\n" +
-                    "• Game Booster: Open Gaming Hub -> Game Booster -> set Performance to 'Standard/Balanced' (or enable 'Pause USB PD charging when gaming' with a 25W+ PPS charger for 4°C cooler sessions).\n" +
-                    "• Optional Audio Isolation: Settings -> Sounds and vibration -> Separate app sound -> route your game to Bluetooth."
+                    "• Memory Exclusion (Prevents 2–3h Kills): Settings → Device Care → Memory → Excluded apps → add BOTH SolStream Studio and your game.\n" +
+                    "• RAM Plus: Keep Device Care → Memory → RAM Plus OFF on 8 GB phones to prevent background disk-swap freezes.\n" +
+                    "• Game Booster: Enable 'Pause USB PD charging when gaming' with a 25W+ PPS charger for 2–4°C cooler sessions."
             mfr.contains("xiaomi") || mfr.contains("redmi") || mfr.contains("poco") ->
                 "★ DETECTED PHONE: XIAOMI / REDMI / POCO (HyperOS / MIUI)\n" +
-                    "• Unlocking Restricted Settings: Open App Info -> scroll to the VERY BOTTOM of the screen -> tap 'Allow restricted settings'.\n" +
+                    "• Unlocking Restricted Settings: Open App Info → scroll to the VERY BOTTOM → tap 'Allow restricted settings'.\n" +
                     "• Background Lock: Set Battery Saver to 'No restrictions', enable Autostart, and lock SolStream Studio in Recents."
             mfr.contains("vivo") || mfr.contains("iqoo") ->
                 "★ DETECTED PHONE: VIVO / iQOO (FuntouchOS / OriginOS)\n" +
-                    "• Q1/Q2 Supercomputing Chip Tip: In Ultra Game Mode, keep 'Game Frame Interpolation' OFF (use Native 90/120 FPS) while streaming so SurfaceFlinger never drops capture cadence to 45 FPS.\n" +
-                    "• Background Lock: Enable 'High Background Power Consumption' for SolStream Studio."
+                    "• Q1/Q2 Chip Tip: In Ultra Game Mode, keep 'Game Frame Interpolation' OFF (use Native 90/120 FPS) while streaming.\n" +
+                    "• Background Lock: Enable 'High Background Power Consumption' and lock SolStream in Recents."
             mfr.contains("oneplus") || mfr.contains("realme") || mfr.contains("oppo") ->
                 "★ DETECTED PHONE: ONEPLUS / REALME / OPPO (OxygenOS / ColorOS / Realme UI)\n" +
-                    "• Battery Lock: App Info -> Battery Usage -> turn ON 'Allow background activity'.\n" +
-                    "• HyperBoost Game Engine: Keep Championship/Pro Gamer mode in Balanced thermal mode for 3+ hour streams."
+                    "• Battery Lock: App Info → Battery Usage → turn ON 'Allow background activity' and lock SolStream in Recents.\n" +
+                    "• HyperBoost: Keep Balanced thermal mode for 3+ hour streams."
             else ->
                 "★ DETECTED PHONE: ${Build.MANUFACTURER.uppercase(Locale.US)} ${Build.MODEL}\n" +
-                    "• Keep Battery set to 'Unrestricted' in Step 2 so Android never pauses your background broadcast."
+                    "• Set Battery to 'Unrestricted' in App Info so Android never pauses your background broadcast."
         }
 
         val msg = """
             $detectedBrandTip
 
-            1. ENABLE ACCESSIBILITY DOCK (Play Store & Sideloaded APK):
-            • If installed from Google Play Store: Tap 'Step 3: Accessibility' and switch SolStream Studio ON in 1 tap!
-            • If sideloaded via GitHub APK on Android 13–18:
-              a) Tap 'Step 3: Accessibility' -> Installed apps -> tap greyed-out SolStream Studio once & press OK.
-              b) Tap 'Step 4: App Info (⋮)' -> tap ⋮ at top-right (or scroll to bottom of App Info on Xiaomi/POCO/Vivo) -> 'Allow restricted settings', then switch SolStream Studio ON!
+            1. LONG-STREAM BATTERY PROTECTION (Zero Extra Permissions):
+            • Tap 'Battery / App Info' below → Battery → select 'Unrestricted'.
 
-            2. BLUETOOTH NECKBAND / AIRPODS / WIRED & USB-C MICS (12-MODE MATRIX):
-            • In 'Auto (Phone Studio Mic Locked)' mode, SolStream keeps your Bluetooth earphones in 100% Stereo Game Mode (A2DP) while capturing your voice from the phone's 48 kHz studio microphone.
-            • Plugging in a Wired 3.5mm Headset or USB-C Mic automatically switches SolLuxe™ 2.0 from Far-Field Hand-Grip tuning to Close-Talk Broadcast tuning!
+            2. ENABLE ACCESSIBILITY DOCK (Play Store & Sideloaded APK):
+            • Play Store install: Tap 'Step 3: Accessibility' and switch SolStream Studio ON in 1 tap.
+            • Sideloaded GitHub APK (Android 13–18):
+              a) Tap 'Step 3: Accessibility' → Installed apps → tap greyed-out SolStream Studio once & press OK.
+              b) Tap 'Step 4: App Info (⋮)' → tap ⋮ at top-right → 'Allow restricted settings', then switch ON.
 
-            3. STRETCH (16:9 FULL) & PRIVACY KEYBOARD BLUR:
-            • Select 'STRETCH (16:9)' in Card 3 to fill 100% of 1080p/1440p/4K screens with zero black bars and 100% HUD visibility.
-            • Keep 'Auto-Blur Keyboard: ON' so whenever you open your keyboard to type a password or message, viewers only see a smooth frosted blur!
+            3. EARPHONES, WIRED & USB-C MICS (SolLuxe™ 3.0 Pure 4×3 Matrix):
+            • Bluetooth Earphones stay in 100% HD Stereo (A2DP) for footsteps while SolStream captures your phone's 48 kHz studio mic.
+            • Plugging in a Wired 3.5mm or USB-C mic auto-switches from Far-Field to Close-Talk tuning and forces hardware Speaker AEC OFF.
         """.trimIndent()
 
         AlertDialog.Builder(this)
-            .setTitle("All-Brand Phone, Earphones & Cool-Stream Guide")
+            .setTitle("🛡️ All-Brand Anti-Kill & Setup Guide")
             .setMessage(msg)
-            .setPositiveButton("Step 3: Accessibility") { _, _ ->
-                showPlayStoreCompliantAccessibilityDisclosure(allowSkipToStream = false)
+            .setPositiveButton("Battery / App Info") { _, _ ->
+                openBatteryUnrestricted()
             }
-            .setNeutralButton("Step 4: App Info (⋮)") { _, _ ->
-                openAppInfoForRestrictedSettings()
+            .setNeutralButton("Step 3: Accessibility") { _, _ ->
+                showPlayStoreCompliantAccessibilityDisclosure(allowSkipToStream = false)
             }
             .setNegativeButton("Got It", null)
             .show()
@@ -3392,14 +3591,34 @@ class MainActivity : AppCompatActivity() {
         permissionLauncher.launch(perms.toTypedArray())
     }
 
+    /**
+     * 100% Play-Store-Safe Battery Unrestricted Guide (Zero REQUEST_IGNORE_BATTERY_OPTIMIZATIONS permission):
+     * - If still restricted: opens standard App Info (Battery -> Unrestricted) with clear instructions.
+     * - If already Unrestricted: opens OEM background guard on Vivo/iQOO/Xiaomi/OnePlus or confirms ready.
+     */
     private fun openBatteryUnrestricted() {
         try {
             val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
             if (!pm.isIgnoringBatteryOptimizations(packageName)) {
-                startActivity(Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:$packageName")))
+                Toast.makeText(
+                    this,
+                    "Tap Battery → select 'Unrestricted' so Android never kills long streams!",
+                    Toast.LENGTH_LONG
+                ).show()
+                val openedAppInfo = runCatching {
+                    startActivity(
+                        Intent(
+                            Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                            Uri.parse("package:$packageName")
+                        )
+                    )
+                }.isSuccess
+                if (!openedAppInfo) {
+                    startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
+                }
                 return
             }
-            // If standard Android battery exemption is already granted, offer OEM background settings on Vivo/iQOO/Xiaomi/OnePlus or confirm ready
+
             val brand = "${Build.MANUFACTURER} ${Build.BRAND}".lowercase(Locale.US)
             val oemIntents = mutableListOf<Intent>()
             when {
@@ -3416,13 +3635,25 @@ class MainActivity : AppCompatActivity() {
             }
             for (intent in oemIntents) {
                 if (runCatching { startActivity(intent) }.isSuccess) {
-                    Toast.makeText(this, "Battery is Unrestricted! Opened OEM Background Autostart guard.", Toast.LENGTH_LONG).show()
+                    Toast.makeText(this, "Battery is Unrestricted ✓ Opened OEM Background Autostart guard.", Toast.LENGTH_LONG).show()
                     return
                 }
             }
-            Toast.makeText(this, "Battery is already Unrestricted!", Toast.LENGTH_SHORT).show()
+            if (brand.contains("samsung")) {
+                Toast.makeText(
+                    this,
+                    "Battery is Unrestricted ✓ Also add SolStream & your game in Device Care → Memory → Excluded apps!",
+                    Toast.LENGTH_LONG
+                ).show()
+            } else {
+                Toast.makeText(this, "Battery is already Unrestricted ✓", Toast.LENGTH_SHORT).show()
+            }
         } catch (_: Exception) {
-            startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
+            try {
+                startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
+            } catch (_: Exception) {
+                openAppInfoSettings()
+            }
         }
     }
 
@@ -3433,7 +3664,7 @@ class MainActivity : AppCompatActivity() {
             enabled.contains("$packageName/.SolStreamService")
     }
 
-    // === SOLAPEX™ UI CARD & BUTTON HELPERS ===
+    // === OBSIDIAN-GLASS UI CARD & BUTTON HELPERS ===
     private fun sectionCard(
         heading: String,
         engineBadge: String = "",
@@ -3443,27 +3674,27 @@ class MainActivity : AppCompatActivity() {
             orientation = LinearLayout.VERTICAL
             background = GradientDrawable(
                 GradientDrawable.Orientation.TOP_BOTTOM,
-                intArrayOf(Color.parseColor("#0D1628"), Color.parseColor("#09101E"))
+                intArrayOf(Color.parseColor("#0D1526"), Color.parseColor("#0A111F"))
             ).apply {
-                cornerRadius = dp(14).toFloat()
-                setStroke(dp(1), Color.parseColor("#1E3454"))
+                cornerRadius = dp(16).toFloat()
+                setStroke(dp(1), Color.parseColor("#1B2B44"))
             }
-            setPadding(dp(12), dp(11), dp(12), dp(12))
+            setPadding(dp(16), dp(14), dp(16), dp(16))
             val lp = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT
-            ).apply { topMargin = dp(11) }
+            ).apply { topMargin = dp(14) }
             layoutParams = lp
 
             val hdrRow = LinearLayout(this@MainActivity).apply {
                 orientation = LinearLayout.HORIZONTAL
                 gravity = Gravity.CENTER_VERTICAL
-                setPadding(0, 0, 0, dp(6))
+                setPadding(0, 0, 0, dp(8))
             }
             val titleTv = TextView(this@MainActivity).apply {
                 text = heading
-                setTextColor(Color.parseColor("#00E5FF"))
-                setTextSize(TypedValue.COMPLEX_UNIT_SP, 13.2f)
+                setTextColor(Color.parseColor("#F1F5F9"))
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 14.0f)
                 typeface = Typeface.DEFAULT_BOLD
                 layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
             }
@@ -3475,9 +3706,9 @@ class MainActivity : AppCompatActivity() {
                     setTextColor(Color.parseColor(badgeHex))
                     setTextSize(TypedValue.COMPLEX_UNIT_SP, 9.0f)
                     typeface = Typeface.DEFAULT_BOLD
-                    letterSpacing = 0.05f
-                    setPadding(dp(7), dp(2), dp(7), dp(2))
-                    background = roundedDrawable("#0A192F", badgeHex)
+                    letterSpacing = 0.06f
+                    setPadding(dp(8), dp(3), dp(8), dp(3))
+                    background = roundedDrawable("#081629", badgeHex)
                 }
                 hdrRow.addView(badgeTv)
             }
@@ -3488,16 +3719,17 @@ class MainActivity : AppCompatActivity() {
     private fun labelText(txt: String): TextView = TextView(this).apply {
         text = txt
         setTextColor(Color.parseColor("#94A3B8"))
-        setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+        setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.2f)
         typeface = Typeface.DEFAULT_BOLD
-        setPadding(0, dp(6), 0, dp(2))
+        setPadding(0, dp(8), 0, dp(3))
     }
 
     private fun bodyText(txt: String): TextView = TextView(this).apply {
         text = txt
         setTextColor(Color.parseColor("#CBD5E1"))
         setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f)
-        setPadding(0, dp(3), 0, dp(5))
+        setLineSpacing(dp(1).toFloat(), 1.0f)
+        setPadding(0, dp(3), 0, dp(6))
     }
 
     private fun styledEditText(initial: String, isPassword: Boolean): EditText = EditText(this).apply {
@@ -3506,8 +3738,8 @@ class MainActivity : AppCompatActivity() {
         setHintTextColor(Color.parseColor("#64748B"))
         setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f)
         isSingleLine = true
-        background = cardDrawable("#060B16", "#294066")
-        setPadding(dp(10), dp(8), dp(10), dp(8))
+        background = cardDrawable("#060B16", "#23395B")
+        setPadding(dp(12), dp(10), dp(12), dp(10))
         if (isPassword) {
             inputType = InputType.TYPE_CLASS_TEXT or
                 InputType.TYPE_TEXT_VARIATION_PASSWORD or
@@ -3530,14 +3762,14 @@ class MainActivity : AppCompatActivity() {
             "#153969", "#13284A" -> "#38BDF8"
             "#4C1D95", "#2E1065" -> "#8B5CF6"
             "#B71C1C", "#D50000", "#881337" -> "#FF1744"
-            else -> "#293B56"
+            else -> "#23344E"
         }
         background = roundedDrawable(bgHex, strokeHex)
-        setPadding(dp(8), dp(5), dp(8), dp(5))
+        setPadding(dp(10), dp(7), dp(10), dp(7))
         val lp = LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT,
             LinearLayout.LayoutParams.WRAP_CONTENT
-        ).apply { topMargin = dp(5) }
+        ).apply { topMargin = dp(6) }
         layoutParams = lp
         setOnClickListener { onClick() }
     }
@@ -3549,12 +3781,12 @@ class MainActivity : AppCompatActivity() {
             val lp = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT
-            ).apply { topMargin = dp(5) }
+            ).apply { topMargin = dp(6) }
             layoutParams = lp
         }
         buttons.forEachIndexed { idx, btn ->
             val lp = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
-                if (idx > 0) marginStart = dp(5)
+                if (idx > 0) marginStart = dp(6)
             }
             btn.layoutParams = lp
             row.addView(btn)
@@ -3564,13 +3796,13 @@ class MainActivity : AppCompatActivity() {
 
     private fun cardDrawable(fillHex: String, strokeHex: String): GradientDrawable = GradientDrawable().apply {
         setColor(Color.parseColor(fillHex))
-        cornerRadius = dp(12).toFloat()
+        cornerRadius = dp(14).toFloat()
         setStroke(dp(1), Color.parseColor(strokeHex))
     }
 
     private fun roundedDrawable(fillHex: String, strokeHex: String): GradientDrawable = GradientDrawable().apply {
         setColor(Color.parseColor(fillHex))
-        cornerRadius = dp(8).toFloat()
+        cornerRadius = dp(9).toFloat()
         setStroke(dp(1), Color.parseColor(strokeHex))
     }
 
