@@ -87,6 +87,8 @@ data class BenchmarkSnapshot(
 
 object DiagnosticsLogger {
 
+    const val ENGINE_VERSION = "v1.4.0"
+
     private const val MAX_EVENTS = 160
     private const val MAX_CLIPS = 60
     private const val PREFS_BENCH = "solstream_benchmarks"
@@ -94,6 +96,12 @@ object DiagnosticsLogger {
     private const val KEY_LAST_GLIP_BENCH = "last_glip_bench_json"
     private const val KEY_LAST_CRASH = "last_uncaught_exception"
     private const val KEY_SAVED_CLIPS_JSON = "saved_stream_clips_json"
+
+    // Dedicated single-slot 60-second storage checkpoint (never pollutes the 9-slot session history)
+    private const val KEY_LIVE_CHECKPOINT_ACTIVE = "live_checkpoint_active"
+    private const val KEY_LIVE_CHECKPOINT_REPORT = "live_checkpoint_report_text"
+    private const val KEY_LIVE_CHECKPOINT_LABEL = "live_checkpoint_label"
+    private const val KEY_LIVE_CHECKPOINT_SAVED_MS = "live_checkpoint_saved_ms"
 
     private val events = ArrayDeque<SessionEvent>(MAX_EVENTS)
     private val clipHighlights = ArrayList<String>(MAX_CLIPS)
@@ -110,7 +118,7 @@ object DiagnosticsLogger {
 
     @Volatile var sessionStartMs: Long = 0L
     @Volatile var activePipelineDesc: String = "Idle (Not Streaming)"
-    @Volatile var activeAudioDspDesc: String = "SolLuxe™ 2.0 32-Bit Float + Native C RNNoise"
+    @Volatile var activeAudioDspDesc: String = "SolLuxe™ 3.0 Pure 32-Bit Float + Native C RNNoise"
     @Volatile var activeSimulcastDesc: String = "Primary Only"
     @Volatile var startTempC: Float = 0f
     @Volatile var peakTempC: Float = 0f
@@ -317,6 +325,77 @@ object DiagnosticsLogger {
         }
     }
 
+    // === 60-SECOND SINGLE-SLOT STORAGE AUTO-CHECKPOINT (SURVIVES SUDDEN OS MEMORY/THERMAL KILLS) ===
+
+    @Synchronized
+    fun saveLiveCheckpoint(context: Context) {
+        if (sessionStartMs <= 0L) return
+        try {
+            persistSavedClips(context)
+            val durMin = max(1, ((System.currentTimeMillis() - sessionStartMs) / 60_000L).toInt())
+            val label = String.format(
+                Locale.US,
+                "SolStream (%dm • Peak %.1f°C • LIVE / INCOMPLETE)",
+                durMin,
+                peakTempC
+            )
+            val reportText = buildShareableReportInternal(context, isLiveCheckpoint = true)
+            context.applicationContext.getSharedPreferences(PREFS_BENCH, Context.MODE_PRIVATE)
+                .edit()
+                .putBoolean(KEY_LIVE_CHECKPOINT_ACTIVE, true)
+                .putString(KEY_LIVE_CHECKPOINT_LABEL, label)
+                .putString(KEY_LIVE_CHECKPOINT_REPORT, reportText)
+                .putLong(KEY_LIVE_CHECKPOINT_SAVED_MS, System.currentTimeMillis())
+                .apply()
+        } catch (_: Exception) {
+        }
+    }
+
+    @Synchronized
+    fun clearLiveCheckpoint(context: Context) {
+        try {
+            context.applicationContext.getSharedPreferences(PREFS_BENCH, Context.MODE_PRIVATE)
+                .edit()
+                .putBoolean(KEY_LIVE_CHECKPOINT_ACTIVE, false)
+                .remove(KEY_LIVE_CHECKPOINT_LABEL)
+                .remove(KEY_LIVE_CHECKPOINT_REPORT)
+                .remove(KEY_LIVE_CHECKPOINT_SAVED_MS)
+                .apply()
+        } catch (_: Exception) {
+        }
+    }
+
+    fun hasUnfinishedLiveCheckpoint(context: Context): Boolean {
+        return try {
+            val prefs = context.applicationContext.getSharedPreferences(PREFS_BENCH, Context.MODE_PRIVATE)
+            prefs.getBoolean(KEY_LIVE_CHECKPOINT_ACTIVE, false) &&
+                !prefs.getString(KEY_LIVE_CHECKPOINT_REPORT, null).isNullOrBlank()
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    fun getRecoveredLiveCheckpointSummaryLabel(context: Context): String? {
+        return try {
+            val prefs = context.applicationContext.getSharedPreferences(PREFS_BENCH, Context.MODE_PRIVATE)
+            if (!prefs.getBoolean(KEY_LIVE_CHECKPOINT_ACTIVE, false)) return null
+            prefs.getString(KEY_LIVE_CHECKPOINT_LABEL, null)?.takeIf { it.isNotBlank() }
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    fun getRecoveredLiveCheckpointReport(context: Context): String? {
+        return try {
+            val prefs = context.applicationContext.getSharedPreferences(PREFS_BENCH, Context.MODE_PRIVATE)
+            if (!prefs.getBoolean(KEY_LIVE_CHECKPOINT_ACTIVE, false)) return null
+            val raw = prefs.getString(KEY_LIVE_CHECKPOINT_REPORT, null)?.takeIf { it.isNotBlank() } ?: return null
+            "=== RECOVERED 60s LIVE CHECKPOINT (Session Ended Unexpectedly by OS) ===\n$raw"
+        } catch (_: Exception) {
+            null
+        }
+    }
+
     @Synchronized
     fun startNewSession(context: Context, modeTitle: String, pipelineDesc: String) {
         events.clear()
@@ -363,6 +442,7 @@ object DiagnosticsLogger {
             "$modeTitle started ($pipelineDesc).",
             "startTemp=${String.format(Locale.US, "%.1f", temp)}°C batt=${lastBatteryPercent}% power=$startPowerSourceLabel thermal=${thermalStatusName(worstThermalState)}"
         )
+        saveLiveCheckpoint(context)
     }
 
     @Synchronized
@@ -467,6 +547,7 @@ object DiagnosticsLogger {
         prefs.edit()
             .putString(if (isGlipBaseline) KEY_LAST_GLIP_BENCH else KEY_LAST_SOL_BENCH, snap.toJson().toString())
             .apply()
+        clearLiveCheckpoint(context)
         return snap
     }
 
@@ -569,6 +650,13 @@ object DiagnosticsLogger {
 
     @Synchronized
     fun buildShareableReport(context: Context): String {
+        if (!SolStreamService.isBroadcastLive && events.isEmpty()) {
+            getRecoveredLiveCheckpointReport(context)?.let { return it }
+        }
+        return buildShareableReportInternal(context, isLiveCheckpoint = false)
+    }
+
+    private fun buildShareableReportInternal(context: Context, isLiveCheckpoint: Boolean): String {
         sampleDeviceHealth(context)
         loadPersistedClipsIfEmpty(context)
         val scan = CodecCapabilityProbe.peekCachedOrPlaceholder(context)
@@ -587,8 +675,11 @@ object DiagnosticsLogger {
         }
 
         val sb = StringBuilder()
-        sb.appendLine("=== SOLSTREAM STUDIO ULTRA v1.3.0 (SolApex™ HyperStream Engine) — AUTOMATIC SESSION REPORT ===")
-        sb.appendLine("Engine Architecture: SolApex™ HyperStream (Video: SolCore Ultra | Audio: SolLuxe 2.0 | Broadcast: SolRelay Omega | Silicon: SolCodec)")
+        sb.appendLine("=== SOLSTREAM STUDIO ULTRA $ENGINE_VERSION (SolApex™ HyperStream Engine) — AUTOMATIC SESSION REPORT ===")
+        if (isLiveCheckpoint) {
+            sb.appendLine("Checkpoint Status: LIVE / INCOMPLETE (Auto-saved at ${formatWallClockNow()} — survives sudden OS memory/thermal kills)")
+        }
+        sb.appendLine("Engine Architecture: SolApex™ HyperStream (Video: SolCore Ultra | Audio: SolLuxe™ 3.0 Pure | Broadcast: SolRelay Omega | Silicon: SolCodec)")
         sb.appendLine("Privacy Guarantee: Stream keys, notifications, and voice audio are NEVER included.")
         sb.appendLine(
             "Device: ${scan.friendlyHardwareLine()} | RAM: ${scan.totalRamGb}GB | Display: ${scan.maxDisplayHz}Hz | GL: ${scan.maxGlEsVersion}"
