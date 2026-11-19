@@ -12,21 +12,21 @@
             android:height="108dp"
             android:viewportWidth="108"
             android:viewportHeight="108">
-            <!-- Deep Midnight-Navy Studio Canvas (Full-Bleed, Zero Clipped Outer Rings) -->
+            <!-- Full-Bleed Deep Space-Navy Canvas -->
             <path
-                android:fillColor="#040812"
+                android:fillColor="#050B18"
                 android:pathData="M0,0h108v108h-108z" />
-            <!-- Subtle Upper-Left Royal Indigo Studio Sheen -->
+            <!-- Subtle Upper-Left Midnight Depth Sweep -->
             <path
-                android:fillColor="#070E1E"
-                android:pathData="M0,0 L108,0 L108,56 L0,92 Z" />
-            <!-- Centered Ambient Energy Core Glow (Strictly Inside Adaptive Safe Zone) -->
+                android:fillColor="#081329"
+                android:pathData="M0,0 L108,0 L108,52 L0,94 Z" />
+            <!-- Soft Centered Cosmic Eclipse Ambient Halo -->
             <path
-                android:fillColor="#0A162C"
-                android:pathData="M54,22 A32,32 0 1,1 53.99,22 Z" />
+                android:fillColor="#0B1C3A"
+                android:pathData="M54,16 A38,38 0 1,1 54,92 A38,38 0 1,1 54,16 Z" />
             <path
-                android:fillColor="#0E2040"
-                android:pathData="M54,29 A25,25 0 1,1 53.99,29 Z" />
+                android:fillColor="#0F2852"
+                android:pathData="M54,22 A32,32 0 1,1 54,86 A32,32 0 1,1 54,22 Z" />
         </vector>
     </background>
 
@@ -37,83 +37,78 @@
             android:viewportWidth="108"
             android:viewportHeight="108">
 
-            <!-- Safe-Zone Orbital Squircle Frame (26..82 — Never Clipped by Any Launcher Mask) -->
-            <path
-                android:fillColor="#081224"
-                android:pathData="M39,26.5 L69,26.5 C75.9,26.5 81.5,32.1 81.5,39 L81.5,69 C81.5,75.9 75.9,81.5 69,81.5 L39,81.5 C32.1,81.5 26.5,75.9 26.5,69 L26.5,39 C26.5,32.1 32.1,26.5 39,26.5 Z"
-                android:strokeWidth="2.2"
-                android:strokeColor="#2979FF" />
-
-            <!-- Top-Left Electric Cyan Orbital Rim Highlight -->
+            <!-- Outer Solar Corona Soft Glow (Centered at 54,54 | Strictly Inside 21..87 Safe Zone) -->
             <path
                 android:fillColor="#00000000"
-                android:pathData="M26.5,58 L26.5,39 C26.5,32.1 32.1,26.5 39,26.5 L64,26.5"
-                android:strokeWidth="2.4"
-                android:strokeColor="#00E5FF"
+                android:pathData="M25.81,64.26 A30,30 0 0,1 71.21,29.42"
+                android:strokeWidth="6.0"
+                android:strokeColor="#2E00E5FF"
                 android:strokeLineCap="round" />
 
-            <!-- Bottom-Right Royal Violet Orbital Rim Highlight -->
+            <!-- Eclipsed Dark Core Disc for High Monogram Contrast -->
+            <path
+                android:fillColor="#060E1F"
+                android:pathData="M54,25.4 A28.6,28.6 0 1,1 54,82.6 A28.6,28.6 0 1,1 54,25.4 Z" />
+
+            <!-- Subtle Full Orbital Eclipse Ring -->
             <path
                 android:fillColor="#00000000"
-                android:pathData="M81.5,50 L81.5,69 C81.5,75.9 75.9,81.5 69,81.5 L44,81.5"
+                android:pathData="M54,24 A30,30 0 1,1 54,84 A30,30 0 1,1 54,24 Z"
+                android:strokeWidth="1.5"
+                android:strokeColor="#1D4E89" />
+
+            <!-- Bottom-Right Royal Cobalt Eclipse Counter-Rim -->
+            <path
+                android:fillColor="#00000000"
+                android:pathData="M82.98,46.24 A30,30 0 0,1 36.79,78.58"
                 android:strokeWidth="2.2"
-                android:strokeColor="#7C3AED"
+                android:strokeColor="#2979FF"
                 android:strokeLineCap="round" />
 
-            <!-- Soft Inner Ambient Cyan & Violet Glow Behind the 'S' Signal Core -->
+            <!-- Upper-Left Electric Cyan Solar Eclipse Corona Arc -->
             <path
-                android:fillColor="#1800E5FF"
-                android:pathData="M51,32 A18,18 0 1,1 50.99,32 Z" />
-            <path
-                android:fillColor="#187C3AED"
-                android:pathData="M57,42 A18,18 0 1,1 56.99,42 Z" />
+                android:fillColor="#00000000"
+                android:pathData="M25.81,64.26 A30,30 0 0,1 71.21,29.42"
+                android:strokeWidth="2.8"
+                android:strokeColor="#00F0FF"
+                android:strokeLineCap="round" />
 
-            <!-- 3D Deep Shadow Base Under the Dual-Ribbon 'S' (33..75 Safe Zone) -->
+            <!-- Ice-White Peak Solar Flare Highlight -->
             <path
-                android:fillColor="#03060E"
-                android:pathData="M65.5,34.5 L45.5,34.5 C38.0,34.5 33.5,39.0 33.5,45.2 C33.5,50.8 37.4,54.2 44.8,56.2 L59.0,59.8 C61.2,60.4 62.5,61.6 62.5,63.5 C62.5,65.5 60.8,66.8 57.6,66.8 L37.8,66.8 L34.8,74.5 L58.2,74.5 C66.5,74.5 71.5,69.8 71.5,63.0 C71.5,56.8 67.4,53.2 59.5,51.2 L45.2,47.6 C42.8,47.0 41.6,45.8 41.6,44.0 C41.6,42.2 43.2,41.0 46.4,41.0 L62.8,41.0 Z" />
+                android:fillColor="#00000000"
+                android:pathData="M25.02,46.24 A30,30 0 0,1 56.62,24.11"
+                android:strokeWidth="1.3"
+                android:strokeColor="#E6FFFFFF"
+                android:strokeLineCap="round" />
 
-            <!-- Lower Signal Ribbon: Royal Blue (#2979FF) + Hyper-Violet (#651FFF) -->
+            <!-- Soft Inner Cyan/Cobalt Ambient Core Behind 'S' -->
             <path
-                android:fillColor="#651FFF"
-                android:pathData="M38.5,54.2 L59.2,59.4 C67.0,61.4 71.0,64.8 71.0,70.2 C71.0,73.5 66.4,74.0 58.0,74.0 L35.2,74.0 L38.2,66.2 L57.5,66.2 C60.6,66.2 62.2,65.0 62.2,63.0 C62.2,61.2 60.8,60.0 58.5,59.4 L41.5,55.0 Z" />
+                android:fillColor="#1600E5FF"
+                android:pathData="M51,38 A15,15 0 1,1 51,68 A15,15 0 1,1 51,38 Z" />
             <path
-                android:fillColor="#2979FF"
-                android:pathData="M43.2,47.4 L59.6,51.4 C67.2,53.3 71.2,56.8 71.2,62.6 C71.2,69.4 66.2,73.6 58.0,73.6 L35.6,73.6 L38.5,66.4 L57.5,66.4 C60.8,66.4 62.4,65.1 62.4,63.0 C62.4,61.0 61.0,59.8 58.6,59.2 L41.8,54.9 C37.2,53.7 34.4,51.0 34.0,47.4 Z" />
+                android:fillColor="#162979FF"
+                android:pathData="M57,41 A15,15 0 1,1 57,71 A15,15 0 1,1 57,41 Z" />
 
-            <!-- Lower Ribbon Specular Sky-Blue Edge Highlight -->
+            <!-- Lower Interlocking Blade: Deep Royal Cobalt (#2979FF) -->
             <path
-                android:fillColor="#B382B1FF"
-                android:pathData="M38.0,71.5 L58.0,71.5 C63.2,71.5 66.6,69.4 67.8,65.8 C66.0,68.4 62.5,69.6 57.6,69.6 L38.8,69.6 Z" />
+                android:fillColor="#1E5BFF"
+                android:pathData="M40.5,71.0 L60.5,71.0 C66.8,71.0 70.0,67.4 70.0,62.2 C70.0,57.2 66.8,54.2 60.5,52.7 L50.5,50.06 L48.0,55.66 L60.0,58.54 C62.6,59.2 63.6,60.3 63.6,62.0 C63.6,63.7 62.4,64.8 60.2,64.8 L43.0,64.8 Z" />
+            <path
+                android:fillColor="#38BDF8"
+                android:pathData="M42.2,69.0 L60.3,69.0 C64.2,69.0 66.8,67.4 67.8,64.6 C66.2,66.4 63.6,67.3 60.1,67.3 L42.9,67.3 Z" />
 
-            <!-- Upper Signal Ribbon: Deep Azure (#0091EA) + Electric Cyan (#00F5FF) -->
+            <!-- Upper Interlocking Blade: Electric Cyan (#00F0FF) -->
             <path
-                android:fillColor="#0091EA"
-                android:pathData="M65.8,33.2 L45.2,33.2 C37.6,33.2 33.2,37.8 33.2,44.4 C33.2,50.5 37.2,54.0 44.8,55.8 L58.8,59.2 L61.8,52.0 L45.5,47.8 C42.8,47.1 41.5,45.8 41.5,43.8 C41.5,41.8 43.0,40.6 46.4,40.6 L62.8,40.6 Z" />
+                android:fillColor="#00C4FF"
+                android:pathData="M67.5,37.0 L47.5,37.0 C41.2,37.0 38.0,40.6 38.0,45.8 C38.0,50.8 41.2,53.8 47.5,55.3 L57.5,57.94 L60.0,52.34 L48.0,49.46 C45.4,48.8 44.4,47.7 44.4,46.0 C44.4,44.3 45.6,43.2 47.8,43.2 L65.0,43.2 Z" />
             <path
-                android:fillColor="#00F5FF"
-                android:pathData="M65.2,33.8 L45.5,33.8 C38.0,33.8 33.8,38.0 33.8,44.2 C33.8,50.0 37.6,53.3 45.0,55.2 L58.2,58.4 L61.0,51.8 L45.2,47.8 C42.5,47.1 41.2,45.8 41.2,43.8 C41.2,41.6 42.8,40.2 46.4,40.2 L62.4,40.2 Z" />
+                android:fillColor="#00F0FF"
+                android:pathData="M67.2,37.3 L47.7,37.3 C41.6,37.3 38.6,40.7 38.6,45.6 C38.6,50.3 41.6,53.2 47.7,54.7 L57.2,57.2 L59.4,52.4 L47.9,49.6 C45.2,48.9 44.1,47.8 44.1,46.0 C44.1,44.1 45.4,42.9 47.8,42.9 L64.8,42.9 Z" />
 
-            <!-- Upper Ribbon Ice-White Specular Blade -->
+            <!-- Upper Blade Ice-White Specular Edge -->
             <path
                 android:fillColor="#E6FFFFFF"
-                android:pathData="M63.8,35.4 L45.8,35.4 C40.4,35.4 36.8,37.8 35.5,41.4 C37.3,38.6 40.8,37.2 45.8,37.2 L63.0,37.2 Z" />
-
-            <!-- Subtle Forward-Facing '▶' Broadcast Play Core Inside the 'S' Negative Space -->
-            <path
-                android:fillColor="#E600E5FF"
-                android:pathData="M50.2,50.2 L57.4,54.0 L50.2,57.8 Z" />
-
-            <!-- Upper-Right Signal Red LIVE Status Indicator (Strictly Inside Safe Zone) -->
-            <path
-                android:fillColor="#45FF1744"
-                android:pathData="M69.5,31.2 A6.0,6.0 0 1,1 69.49,31.2 Z" />
-            <path
-                android:fillColor="#FF1744"
-                android:pathData="M69.5,33.4 A3.8,3.8 0 1,1 69.49,33.4 Z" />
-            <path
-                android:fillColor="#FFFFFFFF"
-                android:pathData="M68.4,34.6 A1.2,1.2 0 1,1 68.39,34.6 Z" />
+                android:pathData="M65.8,38.9 L47.8,38.9 C43.8,38.9 41.2,40.5 40.2,43.3 C41.8,41.4 44.4,40.5 47.9,40.5 L65.1,40.5 Z" />
         </vector>
     </foreground>
 
@@ -125,18 +120,15 @@
             android:viewportHeight="108">
             <path
                 android:fillColor="#00000000"
-                android:pathData="M39,26.5 L69,26.5 C75.9,26.5 81.5,32.1 81.5,39 L81.5,69 C81.5,75.9 75.9,81.5 69,81.5 L39,81.5 C32.1,81.5 26.5,75.9 26.5,69 L26.5,39 C26.5,32.1 32.1,26.5 39,26.5 Z"
-                android:strokeWidth="2.2"
+                android:pathData="M54,24 A30,30 0 1,1 54,84 A30,30 0 1,1 54,24 Z"
+                android:strokeWidth="2.4"
                 android:strokeColor="#FFFFFFFF" />
             <path
                 android:fillColor="#FFFFFFFF"
-                android:pathData="M65.2,33.8 L45.5,33.8 C38.0,33.8 33.8,38.0 33.8,44.2 C33.8,50.0 37.6,53.3 45.0,55.2 L58.2,58.4 L61.0,51.8 L45.2,47.8 C42.5,47.1 41.2,45.8 41.2,43.8 C41.2,41.6 42.8,40.2 46.4,40.2 L62.4,40.2 Z" />
+                android:pathData="M67.5,37.0 L47.5,37.0 C41.2,37.0 38.0,40.6 38.0,45.8 C38.0,50.8 41.2,53.8 47.5,55.3 L57.5,57.94 L60.0,52.34 L48.0,49.46 C45.4,48.8 44.4,47.7 44.4,46.0 C44.4,44.3 45.6,43.2 47.8,43.2 L65.0,43.2 Z" />
             <path
                 android:fillColor="#FFFFFFFF"
-                android:pathData="M43.2,47.4 L59.6,51.4 C67.2,53.3 71.2,56.8 71.2,62.6 C71.2,69.4 66.2,73.6 58.0,73.6 L35.6,73.6 L38.5,66.4 L57.5,66.4 C60.8,66.4 62.4,65.1 62.4,63.0 C62.4,61.0 61.0,59.8 58.6,59.2 L41.8,54.9 C37.2,53.7 34.4,51.0 34.0,47.4 Z" />
-            <path
-                android:fillColor="#FFFFFFFF"
-                android:pathData="M69.5,33.4 A3.8,3.8 0 1,1 69.49,33.4 Z" />
+                android:pathData="M40.5,71.0 L60.5,71.0 C66.8,71.0 70.0,67.4 70.0,62.2 C70.0,57.2 66.8,54.2 60.5,52.7 L50.5,50.06 L48.0,55.66 L60.0,58.54 C62.6,59.2 63.6,60.3 63.6,62.0 C63.6,63.7 62.4,64.8 60.2,64.8 L43.0,64.8 Z" />
         </vector>
     </monochrome>
 
