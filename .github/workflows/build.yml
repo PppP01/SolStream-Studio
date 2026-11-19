@@ -24,9 +24,10 @@ jobs:
           distribution: 'temurin'
           java-version: '21'
 
-      - name: Configure Pre-Installed Android SDK, NDK r28+ & CMake
+      - name: Configure Pinned Android SDK, NDK 28.2.13676358 & CMake
         run: |
           SDK_ROOT="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          PINNED_NDK="28.2.13676358"
           echo "ANDROID_HOME=$SDK_ROOT" >> "$GITHUB_ENV"
           echo "ANDROID_SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
           SDKMANAGER="$(ls -d "$SDK_ROOT"/cmdline-tools/*/bin | sort -V | tail -1)/sdkmanager"
@@ -37,34 +38,37 @@ jobs:
             ln -s "$SDK_ROOT/platforms/android-37.0" "$SDK_ROOT/platforms/android-37"
             sed -i 's/AndroidVersion.ApiLevel=37.0/AndroidVersion.ApiLevel=37/' "$SDK_ROOT/platforms/android-37.0/source.properties" || true
           fi
-          NDK_VER=""
-          if [ -d "$SDK_ROOT/ndk" ]; then
-            NDK_VER="$(ls -1 "$SDK_ROOT/ndk" | grep -E '^(28|29|30)\.' | sort -V | tail -1 || true)"
+          if [ ! -d "$SDK_ROOT/ndk/$PINNED_NDK" ]; then
+            "$SDKMANAGER" --install "ndk;$PINNED_NDK" > /dev/null
           fi
-          if [ -z "$NDK_VER" ]; then
-            "$SDKMANAGER" --install "ndk;28.2.13676358" > /dev/null
-            NDK_VER="28.2.13676358"
-          fi
-          echo "Detected NDK version: $NDK_VER"
-          echo "SOL_NDK_VERSION=$NDK_VER" >> "$GITHUB_ENV"
+          echo "Using pinned NDK version: $PINNED_NDK"
+          echo "SOL_NDK_VERSION=$PINNED_NDK" >> "$GITHUB_ENV"
           yes | "$SDKMANAGER" --licenses > /dev/null || true
 
-      - name: Fetch & Verify Official Xiph RNNoise v0.1.1 C Sources (Pinned SHA-256 + Strict Neural Check)
+      - name: Fetch & Verify Pinned Xiph RNNoise v0.1.1 Commit (Strict Neural Check)
         run: |
+          PINNED_COMMIT="6cbfd53eb348a8d394e0757b4025c6ded34eb2b6"
+          rm -rf app/src/main/cpp/rnnoise
           mkdir -p app/src/main/cpp/rnnoise
-          TAR_PATH="/tmp/rnnoise-v0.1.1.tar.gz"
-          curl -fsSL "https://github.com/xiph/rnnoise/archive/refs/tags/v0.1.1.tar.gz" -o "$TAR_PATH" \
-            || curl -fsSL "https://gitlab.xiph.org/xiph/rnnoise/-/archive/v0.1.1/rnnoise-v0.1.1.tar.gz" -o "$TAR_PATH"
-          ACTUAL_SHA256="$(sha256sum "$TAR_PATH" | awk '{print $1}')"
-          echo "Xiph RNNoise v0.1.1 archive SHA-256: $ACTUAL_SHA256"
-          tar -xzf "$TAR_PATH" --strip-components=1 -C app/src/main/cpp/rnnoise
+          cd app/src/main/cpp/rnnoise
+          git init -q
+          git fetch --depth 1 https://github.com/xiph/rnnoise.git "$PINNED_COMMIT" \
+            || git fetch --depth 1 https://gitlab.xiph.org/xiph/rnnoise.git "$PINNED_COMMIT"
+          git checkout -q --detach FETCH_HEAD
+          ACTUAL_COMMIT="$(git rev-parse HEAD)"
+          if [ "$ACTUAL_COMMIT" != "$PINNED_COMMIT" ]; then
+            echo "::error::RNNoise commit mismatch! Expected $PINNED_COMMIT but got $ACTUAL_COMMIT"
+            exit 1
+          fi
+          rm -rf .git
+          cd - > /dev/null
           for REQ_FILE in "src/denoise.c" "src/rnn.c" "src/rnn_data.c" "src/pitch.c" "src/kiss_fft.c" "include/rnnoise.h"; do
             if [ ! -s "app/src/main/cpp/rnnoise/$REQ_FILE" ]; then
               echo "::error::Missing required official Xiph RNNoise source file: $REQ_FILE"
               exit 1
             fi
           done
-          echo "✅ Verified official Xiph RNNoise v0.1.1 neural C sources (SOL_USE_XIPH_RNNOISE=1)."
+          echo "✅ Verified pinned Xiph RNNoise v0.1.1 commit $ACTUAL_COMMIT (SOL_USE_XIPH_RNNOISE=1)."
 
       - name: Set up Official Gradle 8.14
         uses: gradle/actions/setup-gradle@v6
@@ -80,14 +84,16 @@ jobs:
         run: |
           gradle testDebugUnitTest lintDebug assembleDebug assembleRelease bundleRelease --rerun-tasks -Pandroid.suppressUnsupportedCompileSdk=36,37,37.0,38,38.0 --no-daemon --stacktrace
 
-      - name: Verify Release Signature, All-*.so 16 KB ELF Alignment (arm64 + x86_64) & Stage APK/AAB Names
+      - name: Verify Release Signature, 16 KB APK Zipalign, All-*.so ELF Alignment & Stage Artifacts
         env:
           HAS_RELEASE_SECRET: ${{ secrets.SIGNING_KEY_BASE64 != '' }}
         run: |
           SDK_ROOT="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
-          APKSIGNER="$(ls "$SDK_ROOT"/build-tools/*/apksigner | sort -V | tail -1)"
+          BUILD_TOOLS_DIR="$(ls -d "$SDK_ROOT"/build-tools/* | sort -V | tail -1)"
+          APKSIGNER="$BUILD_TOOLS_DIR/apksigner"
+          ZIPALIGN="$BUILD_TOOLS_DIR/zipalign"
           APP_VER="$(grep 'versionName =' app/build.gradle.kts | head -1 | cut -d'"' -f2)"
-          APP_VER="${APP_VER:-1.3.0}"
+          APP_VER="${APP_VER:-1.4.0}"
           REL_APK="$(ls app/build/outputs/apk/release/*.apk | head -1)"
           CERT_INFO="$("$APKSIGNER" verify --verbose --print-certs "$REL_APK")"
           echo "$CERT_INFO"
@@ -95,6 +101,8 @@ jobs:
             echo "::error::Release APK was signed with a Debug key! Check GitHub Secrets."
             exit 1
           fi
+          echo "=== Verifying 16 KB APK Zip Alignment ==="
+          "$ZIPALIGN" -c -P 16 -v 4 "$REL_APK" | tail -n 15
           rm -rf /tmp/apk_so_check && mkdir -p /tmp/apk_so_check
           unzip -q "$REL_APK" "lib/*" -d /tmp/apk_so_check
           for ABI in arm64-v8a x86_64; do
