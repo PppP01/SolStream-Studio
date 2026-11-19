@@ -230,7 +230,7 @@ class MicDspProcessor(private val sampleRate: Int = 48000) {
     // Audio-thread-exclusive 64-bit filter bank (NEVER mutated from UI thread after init)
     private val hpfFilter = Biquad64()              // Stage 1: 2nd-Order Butterworth HPF (55/68/85 Hz + HW shield)
     private val speechBandFilter = Biquad64()       // Stage 3: 200-2500 Hz 16kHz-safe Hybrid VAD energy monitor
-    private val vocalCoreFilter = Biquad64()        // Stage 4 & 6: 200-1200 Hz vocal-core detector (Plosive Guard & De-Esser ratio)
+    private val vocalCoreFilter = Biquad64()        // Stage 4 & 6: 420 Hz Q=1.05 core vowel-formant detector (clean <115 Hz rejection)
     private val eqLowWarmth = Biquad64()            // Stage 5 Band 1: Chest Warmth (Q=0.85 M/N, Q=1.0 F)
     private val eqMudCut = Biquad64()               // Stage 5 Band 2: Surgical Mud Cleanup (Q=2.0)
     private val eqAntiNasal = Biquad64()            // Stage 5 Band 3: Anti-Nasal Dip (Q=1.8)
@@ -243,7 +243,7 @@ class MicDspProcessor(private val sampleRate: Int = 48000) {
 
     // Exact sample-rate-calibrated time constants (at 48 kHz: 8ms=0.00260, 220ms=0.000095, 10ms=0.00208, 130ms=0.000160)
     private val rms20msAlpha = timeConstAlpha(0.020)
-    private val maxImpulseSamples = max(1, (sampleRate * 0.0006).toInt())   // <0.6 ms (29 samples @ 48 kHz)
+    private val maxImpulseSamples = max(1, (sampleRate * 0.0006).toInt())      // <0.6 ms (29 samples @ 48 kHz)
     private val impulseRecoverySamples = max(8, (sampleRate * 0.0020).toInt()) // 2.0 ms (96 samples @ 48 kHz)
     private val expAttackAlpha = timeConstAlpha(0.008)      // 8.0 ms smooth expander attack
     private val expReleaseAlpha = timeConstAlpha(0.220)     // 220 ms smooth expander release
@@ -283,8 +283,9 @@ class MicDspProcessor(private val sampleRate: Int = 48000) {
     private var suppressSmoothGain = 1.0f
     private var lpNoiseState = 0.0f
 
-    // Stage 4 (Split-Band Dynamic Plosive Guard <115 Hz vs 200-1200 Hz) state
+    // Stage 4 (Split-Band Dynamic Plosive Guard <115 Hz vs core vocal harmonics) state
     private var plosiveLpState = 0.0f
+    private var plosiveLp2State = 0.0f
     private var windLowEnv = 0.0005f
     private var vocalCoreEnv = 0.0015f
     private var plosiveDuckSmooth = 0.0f
@@ -316,8 +317,8 @@ class MicDspProcessor(private val sampleRate: Int = 48000) {
     init {
         // 200-2500 Hz speech band: f0 = sqrt(200 * 2500) = 707.1 Hz, Q = 707.1 / 2300 = 0.3074
         configureBandPass(speechBandFilter, 707.1, 0.3074)
-        // 200-1200 Hz vocal core: f0 = sqrt(200 * 1200) = 489.9 Hz, Q = 489.9 / 1000 = 0.4899
-        configureBandPass(vocalCoreFilter, 489.9, 0.4899)
+        // Core vowel-formant detector (265-665 Hz -3 dB passband): strong 245-1000 Hz response, -15.2 dB rejection at 75 Hz
+        configureBandPass(vocalCoreFilter, 420.0, 1.05)
         val initial = config
         syncAudioThreadFilters(initial)
         refreshDenoiserSummary(initial)
@@ -1040,8 +1041,9 @@ class MicDspProcessor(private val sampleRate: Int = 48000) {
                 expanderGain += expAttackAlpha * (1.0f - expanderGain)
             }
 
-            // Stage 4: Split-Band Dynamic Plosive Guard (<115 Hz wind vs 200-1200 Hz vocal core)
-            // Ducks ONLY the <115 Hz band up to -9 dB (0.645 subtraction) before Stage 5 Chest Warmth
+            // Stage 4: Split-Band Dynamic Plosive Guard (<115 Hz wind vs 420 Hz core vocal harmonics)
+            // 2-stage cascaded <115 Hz subtraction delivers a true -8 to -9 dB cut on 75 Hz wind blasts
+            // while remaining at 0.0 dB on deep vocal fundamentals with normal vocal-core harmonics.
             plosiveLpState += plosiveLp115Alpha * (s - plosiveLpState)
             val absWind = abs(plosiveLpState)
             windLowEnv += (if (absWind > windLowEnv) 0.08f else 0.005f) * (absWind - windLowEnv)
@@ -1050,16 +1052,19 @@ class MicDspProcessor(private val sampleRate: Int = 48000) {
             val absVocalCore = abs(vocalCoreSample)
             vocalCoreEnv += (if (absVocalCore > vocalCoreEnv) 0.06f else 0.004f) * (absVocalCore - vocalCoreEnv)
 
-            val targetPlosiveDuck = if (windLowEnv > 0.0045f && windLowEnv > (vocalCoreEnv * 2.5f + 0.0015f)) {
-                val excess = ((windLowEnv - vocalCoreEnv * 2.5f) / max(windLowEnv, 0.001f)).coerceIn(0.0f, 1.0f)
-                (0.645f * excess).coerceIn(0.0f, 0.645f) // Up to -9 dB on <115 Hz band only
+            val windToVocalRatio = windLowEnv / max(vocalCoreEnv, 0.0005f)
+            val targetPlosiveDuck = if (windLowEnv > 0.0045f && windToVocalRatio > 2.5f) {
+                val excess = ((windToVocalRatio - 2.5f) / 1.5f).coerceIn(0.0f, 1.0f)
+                (0.62f * excess).coerceIn(0.0f, 0.62f)
             } else {
                 0.0f
             }
             plosiveDuckSmooth += (if (targetPlosiveDuck > plosiveDuckSmooth) 0.08f else 0.015f) *
                 (targetPlosiveDuck - plosiveDuckSmooth)
+            val deWind1 = s - (plosiveLpState * plosiveDuckSmooth)
+            plosiveLp2State += plosiveLp115Alpha * (deWind1 - plosiveLp2State)
             if (plosiveDuckSmooth > 0.001f) {
-                s -= plosiveLpState * plosiveDuckSmooth
+                s = deWind1 - (plosiveLp2State * plosiveDuckSmooth)
             }
 
             // Stage 5: 4-Gear × 3-Gender Condenser EQ + Low-Band Analog Warmth Shaper
