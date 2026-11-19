@@ -19,7 +19,7 @@ val keystoreBase64 = System.getenv("SIGNING_KEY_BASE64")?.trim()
 val keystoreStorePass = System.getenv("SIGNING_STORE_PASSWORD")?.trim()
 val keystoreKeyAlias = System.getenv("SIGNING_KEY_ALIAS")?.trim()
 val keystoreKeyPass = System.getenv("SIGNING_KEY_PASSWORD")?.trim()
-val requestedNdkVersion = System.getenv("SOL_NDK_VERSION")?.trim()
+val requestedNdkVersion = System.getenv("SOL_NDK_VERSION")?.trim().orEmpty().ifBlank { "28.2.13676358" }
 val isPullRequestEvent = System.getenv("GITHUB_EVENT_NAME")?.trim() == "pull_request"
 
 val hasReleaseKeystore = !keystoreBase64.isNullOrBlank() &&
@@ -45,16 +45,14 @@ gradle.taskGraph.whenReady {
 android {
     namespace = "com.solgaming.solstreamstudio"
     compileSdk = 37
-    if (!requestedNdkVersion.isNullOrBlank()) {
-        ndkVersion = requestedNdkVersion
-    }
+    ndkVersion = requestedNdkVersion
 
     defaultConfig {
         applicationId = "com.solgaming.solstreamstudio"
         minSdk = 29
         targetSdk = 36
-        versionCode = 10
-        versionName = "1.3.0"
+        versionCode = 11
+        versionName = "1.4.0"
 
         ndk {
             abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64")
