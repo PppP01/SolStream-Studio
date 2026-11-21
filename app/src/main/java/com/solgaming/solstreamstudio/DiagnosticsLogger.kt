@@ -87,7 +87,7 @@ data class BenchmarkSnapshot(
 
 object DiagnosticsLogger {
 
-    const val ENGINE_VERSION = "v1.4.0"
+    const val ENGINE_VERSION = "v1.5.0"
 
     private const val MAX_EVENTS = 160
     private const val MAX_CLIPS = 60
@@ -117,9 +117,12 @@ object DiagnosticsLogger {
     @Volatile private var finalMicStatusSnapshot: String = ""
 
     @Volatile var sessionStartMs: Long = 0L
+    @Volatile var sessionEndMs: Long = 0L
+    @Volatile var isSessionFinalized: Boolean = false
     @Volatile var activePipelineDesc: String = "Idle (Not Streaming)"
     @Volatile var activeAudioDspDesc: String = "SolLuxe™ 3.0 Pure 32-Bit Float + Native C RNNoise"
     @Volatile var activeSimulcastDesc: String = "Primary Only"
+    @Volatile var activeOverlaysDesc: String = "None"
     @Volatile var startTempC: Float = 0f
     @Volatile var peakTempC: Float = 0f
     @Volatile var peakSocTempC: Float = -1f
@@ -155,6 +158,24 @@ object DiagnosticsLogger {
         synchronized(timeFmtLock) {
             return timeFmt.format(Date())
         }
+    }
+
+    /**
+     * Prevents idle post-stop report views from overwriting locked end-of-stream power,
+     * thermal headroom, battery %, and heap metrics.
+     */
+    internal fun shouldSampleHealthOnReport(isLive: Boolean): Boolean {
+        return isLive || sessionStartMs == 0L || !isSessionFinalized
+    }
+
+    @Synchronized
+    internal fun resetSessionLifecycleForTests() {
+        sessionStartMs = 0L
+        sessionEndMs = 0L
+        isSessionFinalized = false
+        activeOverlaysDesc = "None"
+        events.clear()
+        clipHighlights.clear()
     }
 
     fun installPrivacySafeCrashHandler(context: Context) {
@@ -328,8 +349,8 @@ object DiagnosticsLogger {
     // === 60-SECOND SINGLE-SLOT STORAGE AUTO-CHECKPOINT (SURVIVES SUDDEN OS MEMORY/THERMAL KILLS) ===
 
     @Synchronized
-    fun saveLiveCheckpoint(context: Context) {
-        if (sessionStartMs <= 0L) return
+    fun saveLiveCheckpoint(context: Context, skipHealthResample: Boolean = false) {
+        if (sessionStartMs <= 0L || isSessionFinalized) return
         try {
             persistSavedClips(context)
             val durMin = max(1, ((System.currentTimeMillis() - sessionStartMs) / 60_000L).toInt())
@@ -339,7 +360,11 @@ object DiagnosticsLogger {
                 durMin,
                 peakTempC
             )
-            val reportText = buildShareableReportInternal(context, isLiveCheckpoint = true)
+            val reportText = buildShareableReportInternal(
+                context = context,
+                isLiveCheckpoint = true,
+                skipHealthResample = skipHealthResample
+            )
             context.applicationContext.getSharedPreferences(PREFS_BENCH, Context.MODE_PRIVATE)
                 .edit()
                 .putBoolean(KEY_LIVE_CHECKPOINT_ACTIVE, true)
@@ -405,7 +430,10 @@ object DiagnosticsLogger {
         lastAiClutchRealtimeMs = 0L
         lastPssSampleRealtimeMs = 0L
         sessionStartMs = System.currentTimeMillis()
+        sessionEndMs = 0L
+        isSessionFinalized = false
         activePipelineDesc = pipelineDesc
+        activeOverlaysDesc = "None"
 
         val liveHealth = CodecCapabilityProbe.readLiveHardwareHealth(context)
         val temp = liveHealth.batteryTempC
@@ -442,7 +470,7 @@ object DiagnosticsLogger {
             "$modeTitle started ($pipelineDesc).",
             "startTemp=${String.format(Locale.US, "%.1f", temp)}°C batt=${lastBatteryPercent}% power=$startPowerSourceLabel thermal=${thermalStatusName(worstThermalState)}"
         )
-        saveLiveCheckpoint(context)
+        saveLiveCheckpoint(context, skipHealthResample = true)
     }
 
     @Synchronized
@@ -525,11 +553,17 @@ object DiagnosticsLogger {
         }
     }
 
+    @Synchronized
     fun finishAndSaveBenchmark(context: Context, isGlipBaseline: Boolean): BenchmarkSnapshot {
+        // Capture exact end-of-stream health BEFORE freezing session telemetry
         sampleDeviceHealth(context)
+        val nowMs = System.currentTimeMillis()
+        sessionEndMs = nowMs
+        isSessionFinalized = true
         persistSavedClips(context)
+
         val durMin = if (sessionStartMs > 0L) {
-            max(1, ((System.currentTimeMillis() - sessionStartMs) / 60_000L).toInt())
+            max(1, ((nowMs - sessionStartMs) / 60_000L).toInt())
         } else {
             1
         }
@@ -653,11 +687,17 @@ object DiagnosticsLogger {
         if (!SolStreamService.isBroadcastLive && events.isEmpty()) {
             getRecoveredLiveCheckpointReport(context)?.let { return it }
         }
-        return buildShareableReportInternal(context, isLiveCheckpoint = false)
+        return buildShareableReportInternal(context, isLiveCheckpoint = false, skipHealthResample = false)
     }
 
-    private fun buildShareableReportInternal(context: Context, isLiveCheckpoint: Boolean): String {
-        sampleDeviceHealth(context)
+    private fun buildShareableReportInternal(
+        context: Context,
+        isLiveCheckpoint: Boolean,
+        skipHealthResample: Boolean
+    ): String {
+        if (!skipHealthResample && shouldSampleHealthOnReport(SolStreamService.isBroadcastLive)) {
+            sampleDeviceHealth(context)
+        }
         loadPersistedClipsIfEmpty(context)
         val scan = CodecCapabilityProbe.peekCachedOrPlaceholder(context)
         val prefs = context.getSharedPreferences(PREFS_BENCH, Context.MODE_PRIVATE)
@@ -674,6 +714,21 @@ object DiagnosticsLogger {
             micStatusLabel
         }
 
+        val durationSuffix = if (sessionStartMs > 0L) {
+            val endMs = if (isSessionFinalized && sessionEndMs >= sessionStartMs) {
+                sessionEndMs
+            } else {
+                System.currentTimeMillis()
+            }
+            val totalSec = max(0L, (endMs - sessionStartMs) / 1000L)
+            val hh = totalSec / 3600L
+            val mm = (totalSec % 3600L) / 60L
+            val ss = totalSec % 60L
+            String.format(Locale.US, " | Duration: %02d:%02d:%02d", hh, mm, ss)
+        } else {
+            ""
+        }
+
         val sb = StringBuilder()
         sb.appendLine("=== SOLSTREAM STUDIO ULTRA $ENGINE_VERSION (SolApex™ HyperStream Engine) — AUTOMATIC SESSION REPORT ===")
         if (isLiveCheckpoint) {
@@ -685,9 +740,9 @@ object DiagnosticsLogger {
             "Device: ${scan.friendlyHardwareLine()} | RAM: ${scan.totalRamGb}GB | Display: ${scan.maxDisplayHz}Hz | GL: ${scan.maxGlEsVersion}"
         )
         sb.appendLine(
-            "Vault Security: ${KeystoreVault.getKeySecurityDescription()} | Targets: $activeSimulcastDesc | Power: $startPowerSourceLabel -> $lastPowerSourceLabel"
+            "Vault Security: ${KeystoreVault.getKeySecurityDescription()} | Targets: $activeSimulcastDesc | Power: $startPowerSourceLabel -> $lastPowerSourceLabel$durationSuffix"
         )
-        sb.appendLine("Active Pipeline: $activePipelineDesc | Audio DSP: $activeAudioDspDesc")
+        sb.appendLine("Active Pipeline: $activePipelineDesc | Audio DSP: $activeAudioDspDesc | Overlays: $activeOverlaysDesc")
 
         val latestMbps = String.format(Locale.US, "%.2f Mbps", lastBitrateKbps / 1000.0)
         val avgMbps = String.format(Locale.US, "%.2f Mbps", getSessionAverageBitrateKbps() / 1000.0)
