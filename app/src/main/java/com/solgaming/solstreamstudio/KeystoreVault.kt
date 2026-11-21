@@ -108,7 +108,24 @@ data class StreamSettings(
     val wifiLowLatencyLock: Boolean = true,
     val overlayPosition: String = "FULL",         // "FULL", "TOP_LEFT", "TOP_RIGHT", "BOTTOM_LEFT", "BOTTOM_RIGHT"
     val autoBlurKeyboard: Boolean = true,         // Automatically blurs bottom half of stream when IME keyboard opens
-    val simulcastSplitEncode: Boolean = false     // Mode 2: Uses secondary HW encoder for 1080p H.264 simulcast on Flagship/Ultra
+    val simulcastSplitEncode: Boolean = false,    // Mode 2: Uses secondary HW encoder for 1080p H.264 simulcast on Flagship/Ultra
+
+    // === Phase 1 (v1.5.0) Pro Broadcast Overlays (Strictly Opt-In, 0 MB VRAM When OFF) ===
+    val hudTelemetryEnabled: Boolean = false,     // SolHUD™ Live GPU FPS • °C • Mbps badge (visible in Single-App Capture)
+    val hudTelemetryCorner: String = "TOP_LEFT",  // "TOP_LEFT", "TOP_RIGHT", "BOTTOM_LEFT", "BOTTOM_RIGHT"
+    val qrOverlayEnabled: Boolean = false,        // Pure-Kotlin offline Corner QR (UPI / YouTube / Discord)
+    val qrOverlayText: String = "",               // Max 200 chars (QR Version 1..10 Level M safe)
+    val qrOverlayCorner: String = "BOTTOM_RIGHT", // "TOP_LEFT", "TOP_RIGHT", "BOTTOM_LEFT", "BOTTOM_RIGHT"
+    val pngTuberEnabled: Boolean = false,         // Zero-Camera 2-PNG voice-reactive avatar (uses existing vadSpeechActive)
+    val pngTuberCorner: String = "BOTTOM_LEFT",   // "TOP_LEFT", "TOP_RIGHT", "BOTTOM_LEFT", "BOTTOM_RIGHT"
+    val pngTuberSizePercent: Int = 18             // 12..30% of output frame height
+)
+
+data class StudioProfile(
+    val slotIndex: Int,
+    val name: String,
+    val settings: StreamSettings,
+    val isUserCustomized: Boolean = false
 )
 
 object KeystoreVault {
@@ -117,6 +134,8 @@ object KeystoreVault {
     const val DEFAULT_YOUTUBE_RTMPS = "rtmps://a.rtmps.youtube.com:443/live2"
     const val DEFAULT_TWITCH_RTMPS = "rtmps://ingest.global-contribute.live-video.net:443/app"
     const val DEFAULT_KICK_RTMPS = "rtmps://fa723fc1b171.global-contribute.live-video.net:443/app"
+    const val STUDIO_PROFILE_COUNT = 4
+    const val MAX_QR_OVERLAY_CHARS = 200
 
     private const val ANDROID_KEYSTORE = "AndroidKeyStore"
     private const val MASTER_KEY_ALIAS = "solstream_vault_aes256_v1"
@@ -131,10 +150,25 @@ object KeystoreVault {
     private const val KEY_ENC_KICK_KEY = "enc_kick_stream_key"
     private const val KEY_SETTINGS_JSON = "stream_settings_json"
     private const val KEY_AUTO_SCAN_DONE = "initial_auto_hw_scan_done"
+    private const val KEY_PROFILE_SLOT_PREFIX = "studio_profile_slot_v1_"
 
     private val invisibleWhitespaceRegex = Regex("[\\s\\u200B\\u200C\\u200D\\uFEFF]+")
+    private val validOverlayCorners = setOf("TOP_LEFT", "TOP_RIGHT", "BOTTOM_LEFT", "BOTTOM_RIGHT")
 
     @Volatile private var cachedSecurityLabel: String? = null
+
+    fun sanitizeOverlayCorner(rawCorner: String?, fallback: String): String {
+        val norm = rawCorner?.trim()?.uppercase(Locale.US) ?: ""
+        return if (norm in validOverlayCorners) norm else fallback
+    }
+
+    private fun resolveDeviceTier(tierId: String): DeviceTier = when (tierId.uppercase(Locale.US)) {
+        "LITE" -> DeviceTier.LITE
+        "BALANCED" -> DeviceTier.BALANCED
+        "HIGH" -> DeviceTier.HIGH
+        "ULTRA" -> DeviceTier.ULTRA
+        else -> DeviceTier.FLAGSHIP
+    }
 
     /**
      * Single shared coordinator for gender-matched High-Pass Filter cutoffs (SolLuxe™ 3.0 Pure):
@@ -296,7 +330,8 @@ object KeystoreVault {
 
     fun getTwitchUrl(context: Context): String {
         val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        return prefs.getString(KEY_TWITCH_URL, DEFAULT_TWITCH_RTMPS) ?: DEFAULT_TWITCH_RTMPS
+        val raw = prefs.getString(KEY_TWITCH_URL, DEFAULT_TWITCH_RTMPS) ?: DEFAULT_TWITCH_RTMPS
+        return normalizeIngestUrl(raw)
     }
 
     fun getTwitchStreamKey(context: Context): String {
@@ -320,7 +355,8 @@ object KeystoreVault {
 
     fun getKickUrl(context: Context): String {
         val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        return prefs.getString(KEY_KICK_URL, DEFAULT_KICK_RTMPS) ?: DEFAULT_KICK_RTMPS
+        val raw = prefs.getString(KEY_KICK_URL, DEFAULT_KICK_RTMPS) ?: DEFAULT_KICK_RTMPS
+        return normalizeIngestUrl(raw)
     }
 
     fun getKickStreamKey(context: Context): String {
@@ -454,14 +490,14 @@ object KeystoreVault {
                 DeviceTier.FLAGSHIP -> {
                     resolvedW = if (can1440p60) 2560 else 1920
                     resolvedH = if (can1440p60) 1440 else 1080
-                    resolvedFps = 60
+                    resolvedFps = if (can1440p60 || can1080p60) 60 else 30
                     resolvedBitrateKbps = 20000
                     resolvedAudioKbps = 256
                 }
                 DeviceTier.ULTRA -> {
                     resolvedW = if (can1440p60) 2560 else 1920
                     resolvedH = if (can1440p60) 1440 else 1080
-                    resolvedFps = 60
+                    resolvedFps = if (can1440p60 || can1080p60) 60 else 30
                     resolvedBitrateKbps = 20000
                     resolvedAudioKbps = 320
                 }
@@ -570,6 +606,167 @@ object KeystoreVault {
             hdr10Enabled = hdrOk,
             dualFormatCompanionEnabled = dualOk
         ) to changed
+    }
+
+    // === 4 ONE-TAP HARDWARE-ADAPTED STUDIO PROFILES (SECRET-FREE: NEVER STORES STREAM KEYS) ===
+
+    fun buildDefaultStudioProfile(
+        slotIndex: Int,
+        current: StreamSettings,
+        scan: DeviceScanSummary?
+    ): StudioProfile {
+        val safeSlot = slotIndex.coerceIn(0, STUDIO_PROFILE_COUNT - 1)
+        val tier = resolveDeviceTier(current.deviceTier)
+        val baseLandscape = applyPlatformAndVoiceAwareTierPreset(
+            current = current.copy(isVertical = false, useShortsKeySlot = false),
+            tier = tier,
+            scan = scan
+        )
+
+        val (defaultName, rawSettings) = when (safeSlot) {
+            0 -> "Wi-Fi Max" to baseLandscape
+            1 -> "Mobile Data" to baseLandscape.copy(
+                width = 1280,
+                height = 720,
+                fps = 30,
+                targetBitrateKbps = 4500,
+                useVbr = false,
+                adaptiveBitrate = true,
+                audioBitrateKbps = 128,
+                dualFormatCompanionEnabled = false
+            )
+            2 -> {
+                val shortsW = if (tier == DeviceTier.LITE) 1280 else 1920
+                val shortsH = if (tier == DeviceTier.LITE) 720 else 1080
+                val shortsFps = if (tier == DeviceTier.LITE) 30 else 60
+                val shortsKbps = when (tier) {
+                    DeviceTier.LITE -> 5000
+                    DeviceTier.BALANCED, DeviceTier.HIGH -> 10000
+                    DeviceTier.FLAGSHIP, DeviceTier.ULTRA -> 12000
+                }
+                "Shorts 9:16" to baseLandscape.copy(
+                    width = shortsW,
+                    height = shortsH,
+                    fps = shortsFps,
+                    isVertical = true,
+                    useShortsKeySlot = true,
+                    shortsBackdropMode = "BLUR",
+                    targetBitrateKbps = shortsKbps,
+                    dualFormatCompanionEnabled = false
+                )
+            }
+            else -> "Custom" to current
+        }
+
+        val finalSettings = if (scan != null) {
+            clampImportedSettingsToHardware(rawSettings, scan).first
+        } else {
+            rawSettings
+        }
+        return StudioProfile(
+            slotIndex = safeSlot,
+            name = defaultName,
+            settings = finalSettings,
+            isUserCustomized = false
+        )
+    }
+
+    fun exportStudioProfileJson(profile: StudioProfile): String {
+        val cleanName = profile.name.trim().ifBlank { "Profile ${profile.slotIndex + 1}" }.take(20)
+        return JSONObject().apply {
+            put("slotIndex", profile.slotIndex.coerceIn(0, STUDIO_PROFILE_COUNT - 1))
+            put("name", cleanName)
+            put("settings", JSONObject(exportPresetJson(profile.settings)))
+        }.toString()
+    }
+
+    fun importStudioProfileJson(
+        slotIndex: Int,
+        rawJson: String,
+        fallback: StreamSettings = StreamSettings()
+    ): StudioProfile? {
+        return try {
+            val j = JSONObject(rawJson.trim())
+            val settingsObj = j.optJSONObject("settings") ?: return null
+            val parsed = importPresetJson(settingsObj.toString(), fallback) ?: return null
+            val safeSlot = slotIndex.coerceIn(0, STUDIO_PROFILE_COUNT - 1)
+            val cleanName = j.optString("name", "Profile ${safeSlot + 1}")
+                .trim()
+                .ifBlank { "Profile ${safeSlot + 1}" }
+                .take(20)
+            StudioProfile(
+                slotIndex = safeSlot,
+                name = cleanName,
+                settings = parsed,
+                isUserCustomized = true
+            )
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    fun saveStudioProfile(
+        context: Context,
+        slotIndex: Int,
+        name: String,
+        settings: StreamSettings
+    ): Boolean {
+        val safeSlot = slotIndex.coerceIn(0, STUDIO_PROFILE_COUNT - 1)
+        val profile = StudioProfile(
+            slotIndex = safeSlot,
+            name = name.trim().ifBlank { "Profile ${safeSlot + 1}" }.take(20),
+            settings = settings,
+            isUserCustomized = true
+        )
+        return try {
+            context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                .edit()
+                .putString("$KEY_PROFILE_SLOT_PREFIX$safeSlot", exportStudioProfileJson(profile))
+                .commit()
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    fun loadStudioProfile(
+        context: Context,
+        slotIndex: Int,
+        current: StreamSettings,
+        scan: DeviceScanSummary?
+    ): StudioProfile {
+        val safeSlot = slotIndex.coerceIn(0, STUDIO_PROFILE_COUNT - 1)
+        val raw = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .getString("$KEY_PROFILE_SLOT_PREFIX$safeSlot", null)
+        if (!raw.isNullOrBlank()) {
+            val imported = importStudioProfileJson(safeSlot, raw, current)
+            if (imported != null) {
+                val clamped = if (scan != null) {
+                    clampImportedSettingsToHardware(imported.settings, scan).first
+                } else {
+                    imported.settings
+                }
+                return imported.copy(settings = clamped)
+            }
+        }
+        return buildDefaultStudioProfile(safeSlot, current, scan)
+    }
+
+    fun loadAllStudioProfiles(
+        context: Context,
+        current: StreamSettings,
+        scan: DeviceScanSummary?
+    ): List<StudioProfile> {
+        return List(STUDIO_PROFILE_COUNT) { idx ->
+            loadStudioProfile(context, idx, current, scan)
+        }
+    }
+
+    fun resetStudioProfile(context: Context, slotIndex: Int) {
+        val safeSlot = slotIndex.coerceIn(0, STUDIO_PROFILE_COUNT - 1)
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .remove("$KEY_PROFILE_SLOT_PREFIX$safeSlot")
+            .apply()
     }
 
     // === HARDWARE KEYSTORE AES-256-GCM ===
@@ -693,7 +890,8 @@ object KeystoreVault {
                     val ks = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
                     ks.deleteEntry(MASTER_KEY_ALIAS)
                     cachedSecurityLabel = null
-                } catch (_: Exception) {}
+                } catch (_: Exception) {
+                }
             }
             ""
         }
@@ -713,7 +911,7 @@ object KeystoreVault {
 
     fun exportPresetJson(s: StreamSettings): String {
         return JSONObject().apply {
-            put("solPresetSchema", 4)
+            put("solPresetSchema", 5)
             put("deviceTier", s.deviceTier)
             put("platformPreset", s.platformPreset)
             put("useShortsKeySlot", s.useShortsKeySlot)
@@ -800,6 +998,16 @@ object KeystoreVault {
             put("overlayPosition", s.overlayPosition)
             put("autoBlurKeyboard", s.autoBlurKeyboard)
             put("simulcastSplitEncode", s.simulcastSplitEncode)
+
+            // Phase 1 (v1.5.0) Pro Broadcast Overlays
+            put("hudTelemetryEnabled", s.hudTelemetryEnabled)
+            put("hudTelemetryCorner", sanitizeOverlayCorner(s.hudTelemetryCorner, "TOP_LEFT"))
+            put("qrOverlayEnabled", s.qrOverlayEnabled)
+            put("qrOverlayText", s.qrOverlayText.trim().take(MAX_QR_OVERLAY_CHARS))
+            put("qrOverlayCorner", sanitizeOverlayCorner(s.qrOverlayCorner, "BOTTOM_RIGHT"))
+            put("pngTuberEnabled", s.pngTuberEnabled)
+            put("pngTuberCorner", sanitizeOverlayCorner(s.pngTuberCorner, "BOTTOM_LEFT"))
+            put("pngTuberSizePercent", s.pngTuberSizePercent.coerceIn(12, 30))
         }.toString()
     }
 
@@ -819,7 +1027,7 @@ object KeystoreVault {
             } else if (!j.has("hpfCutoffHz")) {
                 true
             } else {
-                rawHpf == legacyDefaultHpf
+                rawHpf == legacyDefaultHpf || rawHpf == defaultHpf
             }
             val resolvedHpf = if (inferredAutoHpf) defaultHpf else rawHpf
 
@@ -910,7 +1118,25 @@ object KeystoreVault {
                 wifiLowLatencyLock = j.optBoolean("wifiLowLatencyLock", fallback.wifiLowLatencyLock),
                 overlayPosition = j.optString("overlayPosition", fallback.overlayPosition),
                 autoBlurKeyboard = j.optBoolean("autoBlurKeyboard", fallback.autoBlurKeyboard),
-                simulcastSplitEncode = j.optBoolean("simulcastSplitEncode", fallback.simulcastSplitEncode)
+                simulcastSplitEncode = j.optBoolean("simulcastSplitEncode", fallback.simulcastSplitEncode),
+
+                hudTelemetryEnabled = j.optBoolean("hudTelemetryEnabled", fallback.hudTelemetryEnabled),
+                hudTelemetryCorner = sanitizeOverlayCorner(
+                    j.optString("hudTelemetryCorner", fallback.hudTelemetryCorner),
+                    fallback.hudTelemetryCorner
+                ),
+                qrOverlayEnabled = j.optBoolean("qrOverlayEnabled", fallback.qrOverlayEnabled),
+                qrOverlayText = j.optString("qrOverlayText", fallback.qrOverlayText).trim().take(MAX_QR_OVERLAY_CHARS),
+                qrOverlayCorner = sanitizeOverlayCorner(
+                    j.optString("qrOverlayCorner", fallback.qrOverlayCorner),
+                    fallback.qrOverlayCorner
+                ),
+                pngTuberEnabled = j.optBoolean("pngTuberEnabled", fallback.pngTuberEnabled),
+                pngTuberCorner = sanitizeOverlayCorner(
+                    j.optString("pngTuberCorner", fallback.pngTuberCorner),
+                    fallback.pngTuberCorner
+                ),
+                pngTuberSizePercent = j.optInt("pngTuberSizePercent", fallback.pngTuberSizePercent).coerceIn(12, 30)
             )
         } catch (_: Exception) {
             null
