@@ -33,10 +33,12 @@ import android.os.Handler
 import android.os.HandlerThread
 import android.os.PerformanceHintManager
 import android.os.Process
+import android.os.SystemClock
 import android.util.DisplayMetrics
 import android.view.Display
 import android.view.Surface
 import android.view.WindowManager
+import com.solgaming.solstreamstudio.recorder.SolHudAndQrRenderer
 import java.io.ByteArrayOutputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -44,6 +46,7 @@ import java.nio.FloatBuffer
 import java.util.Locale
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.math.abs
 import kotlin.math.max
@@ -116,6 +119,19 @@ class SolVideoPipeline(private val context: Context) {
     @Volatile var liveMinimapShieldCorner = "TOP_RIGHT"
     @Volatile var liveRoiMode = "AUTO"
 
+    // Phase 1 (v1.5.0) Pro Broadcast Overlays (strictly opt-in, 0 MB VRAM when OFF)
+    @Volatile var liveHudTelemetryEnabled = false
+    @Volatile var liveHudTelemetryCorner = "TOP_LEFT"
+    @Volatile var liveHudTempC = 0f
+    @Volatile var liveQrOverlayEnabled = false
+    @Volatile var liveQrOverlayText = ""
+    @Volatile var liveQrOverlayCorner = "BOTTOM_RIGHT"
+    @Volatile var livePngTuberEnabled = false
+    @Volatile var livePngTuberCorner = "BOTTOM_LEFT"
+    @Volatile var livePngTuberSizePercent = 18
+    @Volatile var liveVoiceGenderProfile = "NEUTRAL"
+    @Volatile var liveVoiceSpeaking = false
+
     /**
      * Independent Dual-Layer Keyboard Privacy Blur:
      * Blurs the bottom half of the stream when the keyboard opens (or when manually toggled in the
@@ -154,6 +170,11 @@ class SolVideoPipeline(private val context: Context) {
     @Volatile private var pendingCaptureWidth = 0
     @Volatile private var pendingCaptureHeight = 0
     @Volatile private var capturedContentVisible = true
+
+    // Async 1-Tap Clean Screenshot guard (3-second cooldown, max 1 in-flight offscreen FBO capture)
+    private val screenshotInFlight = AtomicBoolean(false)
+    private val pendingScreenshotCallback = AtomicReference<((Result<String>) -> Unit)?>(null)
+    @Volatile private var lastScreenshotAcceptedMs = 0L
 
     private val codecReleaseLock = Any()
     private val projectionCallbackLock = Any()
@@ -202,6 +223,39 @@ class SolVideoPipeline(private val context: Context) {
         liveMinimapShieldEnabled = s.minimapShieldEnabled
         liveMinimapShieldCorner = s.minimapShieldCorner.uppercase(Locale.US)
         liveRoiMode = s.roiMode.uppercase(Locale.US)
+
+        // Phase 1 (v1.5.0) Pro Broadcast Overlays
+        liveHudTelemetryEnabled = s.hudTelemetryEnabled
+        liveHudTelemetryCorner = KeystoreVault.sanitizeOverlayCorner(s.hudTelemetryCorner, "TOP_LEFT")
+        liveQrOverlayEnabled = s.qrOverlayEnabled
+        liveQrOverlayText = s.qrOverlayText.trim().take(KeystoreVault.MAX_QR_OVERLAY_CHARS)
+        liveQrOverlayCorner = KeystoreVault.sanitizeOverlayCorner(s.qrOverlayCorner, "BOTTOM_RIGHT")
+        livePngTuberEnabled = s.pngTuberEnabled
+        livePngTuberCorner = KeystoreVault.sanitizeOverlayCorner(s.pngTuberCorner, "BOTTOM_LEFT")
+        livePngTuberSizePercent = s.pngTuberSizePercent.coerceIn(12, 30)
+        liveVoiceGenderProfile = s.voiceGenderProfile.uppercase(Locale.US)
+    }
+
+    /**
+     * Triggers an async 1-Tap Clean Screenshot (pill-free YouTube thumbnail <=1080p) using a
+     * temporary offscreen RGBA8 OpenGL FBO so MediaCodec's write-only encoder surface never returns black.
+     * Enforces a 3-second cooldown and max 1 in-flight capture to keep RAM flat.
+     */
+    fun requestCleanScreenshot(onComplete: (Result<String>) -> Unit): Boolean {
+        if (!isRunning) {
+            onComplete(Result.failure(IllegalStateException("Stream is not active.")))
+            return false
+        }
+        val nowMs = SystemClock.elapsedRealtime()
+        if (nowMs - lastScreenshotAcceptedMs < SCREENSHOT_COOLDOWN_MS) {
+            return false
+        }
+        if (!screenshotInFlight.compareAndSet(false, true)) {
+            return false
+        }
+        lastScreenshotAcceptedMs = nowMs
+        pendingScreenshotCallback.set(onComplete)
+        return true
     }
 
     fun setBitrateOnFly(newBitrateBps: Int) {
@@ -242,6 +296,10 @@ class SolVideoPipeline(private val context: Context) {
      */
     fun prepareForImmediateStop() {
         isRunning = false
+        pendingScreenshotCallback.getAndSet(null)?.let { cb ->
+            screenshotInFlight.set(false)
+            try { cb(Result.failure(IllegalStateException("Stream stopped before screenshot completed."))) } catch (_: Exception) {}
+        }
         unregisterProjectionCallbackImmediately()
     }
 
@@ -318,6 +376,9 @@ class SolVideoPipeline(private val context: Context) {
         thermalModerateCoolerActive = false
         companionPausedByThermal = false
         capturedContentVisible = true
+        liveVoiceSpeaking = false
+        screenshotInFlight.set(false)
+        pendingScreenshotCallback.set(null)
         lastSentVideoPtsUs = -1L
         actualEncodedFps = 0
         actualEncodedBitrateBps = 0
@@ -447,9 +508,8 @@ class SolVideoPipeline(private val context: Context) {
         val encoderInputSurface = finalConfigured.inputSurface
         videoCodecInstance = codec
 
-        // Secondary Hardware Encoder setup (v1.4.0 Fix):
-        // Selects ONLY from codecs that passed the simultaneous-instance requirement in CodecCapabilityProbe,
-        // trying eligible alternatives in priority order (e.g., HEVC if >=2 instances, else H.264).
+        // Secondary Hardware Encoder setup:
+        // Selects ONLY from codecs that passed the simultaneous-instance requirement in CodecCapabilityProbe.
         var compConfigured: ConfiguredEncoder? = null
         var selectedCompReport: HardwareEncoderReport? = null
         var compAlignedW = if (companionIsLandscapeH264) 1920 else 1080
@@ -1177,6 +1237,22 @@ class SolVideoPipeline(private val context: Context) {
         var loadedBannerSig = ""
         var seenAssetRevision = -1
 
+        // Phase 1 (v1.5.0) opt-in GPU overlays (0 MB VRAM when OFF)
+        var hudTexId = 0
+        var hudScratchBitmap: Bitmap? = null
+        var lastHudUpdateMs = 0L
+
+        var qrTexId = 0
+        var loadedQrSig = ""
+
+        var pngTuberIdleTexId = 0
+        var pngTuberTalkTexId = 0
+        var pngTuberBmpW = 512
+        var pngTuberBmpH = 512
+        var loadedPngTuberGender = ""
+        var lastVoiceActiveMs = 0L
+        var pngTuberBounceFrac = 0f
+
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
                 try {
@@ -1448,6 +1524,7 @@ class SolVideoPipeline(private val context: Context) {
                 }
 
                 val nowMs = System.currentTimeMillis()
+                val monoMs = SystemClock.elapsedRealtime()
                 val elapsedMs = nowMs - freshWindowStartMs
                 if (elapsedMs >= 1000L) {
                     actualFreshCaptureFps = ((freshFramesInWindow * 1000L) / elapsedMs).toInt()
@@ -1490,6 +1567,15 @@ class SolVideoPipeline(private val context: Context) {
                         GlShaderBank.deleteTexture2d(posterTexId)
                         posterTexId = 0
                     }
+                    if (pngTuberIdleTexId != 0) {
+                        GlShaderBank.deleteTexture2d(pngTuberIdleTexId)
+                        pngTuberIdleTexId = 0
+                    }
+                    if (pngTuberTalkTexId != 0) {
+                        GlShaderBank.deleteTexture2d(pngTuberTalkTexId)
+                        pngTuberTalkTexId = 0
+                    }
+                    loadedPngTuberGender = ""
                 }
 
                 if (sceneNow != "LIVE") {
@@ -1554,6 +1640,112 @@ class SolVideoPipeline(private val context: Context) {
                     loadedBannerSig = ""
                 }
 
+                // === Phase 1 (v1.5.0) Zero-Allocation SolHUD™ Live GPU Telemetry Texture ===
+                if (liveHudTelemetryEnabled) {
+                    if (hudTexId == 0 || monoMs - lastHudUpdateMs >= HUD_REFRESH_INTERVAL_MS) {
+                        lastHudUpdateMs = monoMs
+                        val scratch = hudScratchBitmap ?: SolHudAndQrRenderer.createHudScratchBitmap().also {
+                            hudScratchBitmap = it
+                        }
+                        val shownFps = if (actualEncodedFps > 0) actualEncodedFps else effectiveFps
+                        val shownMbps = if (actualEncodedBitrateBps > 0) {
+                            actualEncodedBitrateBps / 1_000_000f
+                        } else {
+                            currentBitrateBps / 1_000_000f
+                        }
+                        SolHudAndQrRenderer.renderHudIntoBitmap(
+                            target = scratch,
+                            fps = shownFps,
+                            tempC = liveHudTempC,
+                            bitrateMbps = shownMbps,
+                            isThrottled30 = thermalThrottle30Fps
+                        )
+                        if (hudTexId == 0) {
+                            hudTexId = GlShaderBank.uploadBitmapTexture2d(scratch)
+                        } else {
+                            GlShaderBank.updateBitmapTexture2d(hudTexId, scratch)
+                        }
+                    }
+                } else {
+                    if (hudTexId != 0) {
+                        GlShaderBank.deleteTexture2d(hudTexId)
+                        hudTexId = 0
+                    }
+                    hudScratchBitmap?.let { bmp ->
+                        if (!bmp.isRecycled) bmp.recycle()
+                        hudScratchBitmap = null
+                    }
+                    lastHudUpdateMs = 0L
+                }
+
+                // === Phase 1 (v1.5.0) Corner QR Code Overlay (GL_NEAREST for razor-sharp camera scanning) ===
+                val wantQr = liveQrOverlayEnabled && liveQrOverlayText.isNotBlank()
+                val curQrSig = if (wantQr) liveQrOverlayText.trim() else ""
+                if (wantQr && (qrTexId == 0 || curQrSig != loadedQrSig)) {
+                    if (qrTexId != 0) GlShaderBank.deleteTexture2d(qrTexId)
+                    val qrBmp = SolHudAndQrRenderer.generateQrOverlayBitmap(curQrSig)
+                    qrTexId = if (qrBmp != null) {
+                        val id = GlShaderBank.uploadBitmapTexture2d(qrBmp, nearestFilter = true)
+                        qrBmp.recycle()
+                        id
+                    } else 0
+                    loadedQrSig = curQrSig
+                } else if (!wantQr && qrTexId != 0) {
+                    GlShaderBank.deleteTexture2d(qrTexId)
+                    qrTexId = 0
+                    loadedQrSig = ""
+                }
+
+                // === Phase 1 (v1.5.0) Zero-Camera 2-PNG PNGTuber Avatar (140ms hangover + smooth talk-hop) ===
+                if (livePngTuberEnabled) {
+                    val genderNow = liveVoiceGenderProfile
+                    if (pngTuberIdleTexId == 0 || loadedPngTuberGender != genderNow) {
+                        if (pngTuberIdleTexId != 0) {
+                            GlShaderBank.deleteTexture2d(pngTuberIdleTexId)
+                            pngTuberIdleTexId = 0
+                        }
+                        if (pngTuberTalkTexId != 0) {
+                            GlShaderBank.deleteTexture2d(pngTuberTalkTexId)
+                            pngTuberTalkTexId = 0
+                        }
+                        val (idleBmp, talkBmp) = SolSceneAssetStore.loadPngTuberPairForGl(context, genderNow)
+                        pngTuberBmpW = max(1, idleBmp.width)
+                        pngTuberBmpH = max(1, idleBmp.height)
+                        pngTuberIdleTexId = GlShaderBank.uploadBitmapTexture2d(idleBmp)
+                        idleBmp.recycle()
+                        if (talkBmp != null) {
+                            pngTuberTalkTexId = GlShaderBank.uploadBitmapTexture2d(talkBmp)
+                            talkBmp.recycle()
+                        }
+                        loadedPngTuberGender = genderNow
+                    }
+                    if (liveVoiceSpeaking) {
+                        lastVoiceActiveMs = monoMs
+                    }
+                    val talkingNow = liveVoiceSpeaking || (monoMs - lastVoiceActiveMs < PNGTUBER_TALK_HOLD_MS)
+                    val targetBounce = if (talkingNow) 1.0f else 0.0f
+                    pngTuberBounceFrac += (targetBounce - pngTuberBounceFrac) * 0.35f
+                } else {
+                    if (pngTuberIdleTexId != 0) {
+                        GlShaderBank.deleteTexture2d(pngTuberIdleTexId)
+                        pngTuberIdleTexId = 0
+                    }
+                    if (pngTuberTalkTexId != 0) {
+                        GlShaderBank.deleteTexture2d(pngTuberTalkTexId)
+                        pngTuberTalkTexId = 0
+                    }
+                    loadedPngTuberGender = ""
+                    pngTuberBounceFrac = 0f
+                }
+
+                val activePngTuberTexId = if (!livePngTuberEnabled || pngTuberIdleTexId == 0) {
+                    0
+                } else if ((liveVoiceSpeaking || (monoMs - lastVoiceActiveMs < PNGTUBER_TALK_HOLD_MS)) && pngTuberTalkTexId != 0) {
+                    pngTuberTalkTexId
+                } else {
+                    pngTuberIdleTexId
+                }
+
                 val ptsNs = max(1_000L, System.nanoTime() - originTimeNs)
 
                 val primaryCurrentOk = EGL14.eglMakeCurrent(eglDisplay, eglSurface, eglSurface, eglContext)
@@ -1575,6 +1767,12 @@ class SolVideoPipeline(private val context: Context) {
                     overlayTexId = overlayTexId,
                     overlayBmpW = overlayBitmapW,
                     overlayBmpH = overlayBitmapH,
+                    hudTexId = hudTexId,
+                    qrTexId = qrTexId,
+                    pngTuberTexId = activePngTuberTexId,
+                    pngTuberBmpW = pngTuberBmpW,
+                    pngTuberBmpH = pngTuberBmpH,
+                    pngTuberBounceFrac = pngTuberBounceFrac,
                     bannerTexId = bannerTexId,
                     hasFirstFrame = hasFirstFrame,
                     isFreshGameFrame = isFreshGameFrame,
@@ -1604,6 +1802,44 @@ class SolVideoPipeline(private val context: Context) {
                     consecutivePrimaryEglErrors = 0
                 }
 
+                // Async 1-Tap Clean Screenshot (runs AFTER eglSwapBuffers via temporary offscreen RGBA8 FBO)
+                val shotCallback = pendingScreenshotCallback.getAndSet(null)
+                if (shotCallback != null) {
+                    captureCleanFboScreenshot(
+                        oesHandles = oesHandles,
+                        rgbaHandles = rgbaHandles,
+                        oesTexId = oesTexId,
+                        sceneNow = sceneNow,
+                        sceneTexId = sceneTexId,
+                        posterTexId = posterTexId,
+                        overlayTexId = overlayTexId,
+                        overlayBmpW = overlayBitmapW,
+                        overlayBmpH = overlayBitmapH,
+                        hudTexId = hudTexId,
+                        qrTexId = qrTexId,
+                        pngTuberTexId = activePngTuberTexId,
+                        pngTuberBmpW = pngTuberBmpW,
+                        pngTuberBmpH = pngTuberBmpH,
+                        pngTuberBounceFrac = pngTuberBounceFrac,
+                        bannerTexId = bannerTexId,
+                        hasFirstFrame = hasFirstFrame,
+                        srcW = activeCapW,
+                        srcH = activeCapH,
+                        primaryW = outWidth,
+                        primaryH = outHeight,
+                        fullQuadVerts = fullQuadVerts,
+                        bannerTopVerts = bannerTopVerts,
+                        bannerBottomVerts = bannerBottomVerts,
+                        oesTexCoords = oesTexCoords,
+                        bitmapTexCoords = bitmapTexCoords,
+                        stMatrix = stMatrix,
+                        mvpMatrix = mvpMatrix,
+                        overlayMvpMatrix = overlayMvpMatrix,
+                        identityMvp = identityMvp,
+                        onComplete = shotCallback
+                    )
+                }
+
                 if (companionEglSurface != EGL14.EGL_NO_SURFACE && !companionPausedByThermal) {
                     val compCurrentOk = EGL14.eglMakeCurrent(eglDisplay, companionEglSurface, companionEglSurface, eglContext)
                     if (!compCurrentOk) {
@@ -1622,6 +1858,12 @@ class SolVideoPipeline(private val context: Context) {
                             overlayTexId = overlayTexId,
                             overlayBmpW = overlayBitmapW,
                             overlayBmpH = overlayBitmapH,
+                            hudTexId = hudTexId,
+                            qrTexId = qrTexId,
+                            pngTuberTexId = activePngTuberTexId,
+                            pngTuberBmpW = pngTuberBmpW,
+                            pngTuberBmpH = pngTuberBmpH,
+                            pngTuberBounceFrac = pngTuberBounceFrac,
                             bannerTexId = bannerTexId,
                             hasFirstFrame = hasFirstFrame,
                             isFreshGameFrame = isFreshGameFrame,
@@ -1689,6 +1931,13 @@ class SolVideoPipeline(private val context: Context) {
             GlShaderBank.deleteTexture2d(overlayTexId)
             GlShaderBank.deleteTexture2d(posterTexId)
             GlShaderBank.deleteTexture2d(bannerTexId)
+            GlShaderBank.deleteTexture2d(hudTexId)
+            GlShaderBank.deleteTexture2d(qrTexId)
+            GlShaderBank.deleteTexture2d(pngTuberIdleTexId)
+            GlShaderBank.deleteTexture2d(pngTuberTalkTexId)
+            hudScratchBitmap?.let { bmp ->
+                try { if (!bmp.isRecycled) bmp.recycle() } catch (_: Exception) {}
+            }
             if (oesTexId != 0) {
                 try { GLES20.glDeleteTextures(1, intArrayOf(oesTexId), 0) } catch (_: Exception) {}
             }
@@ -1710,6 +1959,171 @@ class SolVideoPipeline(private val context: Context) {
         }
     }
 
+    /**
+     * Renders a clean, pill-free RGBA8 frame into a temporary offscreen FBO (clamped <=1080p,
+     * max 7.91 MiB), reads back pixels, destroys the FBO immediately (0 MB retained VRAM),
+     * and dispatches vertical-flip + JPEG save to a background thread.
+     */
+    private fun captureCleanFboScreenshot(
+        oesHandles: GlShaderBank.OesHandles,
+        rgbaHandles: GlShaderBank.Rgba2dHandles,
+        oesTexId: Int,
+        sceneNow: String,
+        sceneTexId: Int,
+        posterTexId: Int,
+        overlayTexId: Int,
+        overlayBmpW: Int,
+        overlayBmpH: Int,
+        hudTexId: Int,
+        qrTexId: Int,
+        pngTuberTexId: Int,
+        pngTuberBmpW: Int,
+        pngTuberBmpH: Int,
+        pngTuberBounceFrac: Float,
+        bannerTexId: Int,
+        hasFirstFrame: Boolean,
+        srcW: Int,
+        srcH: Int,
+        primaryW: Int,
+        primaryH: Int,
+        fullQuadVerts: FloatBuffer,
+        bannerTopVerts: FloatBuffer,
+        bannerBottomVerts: FloatBuffer,
+        oesTexCoords: FloatBuffer,
+        bitmapTexCoords: FloatBuffer,
+        stMatrix: FloatArray,
+        mvpMatrix: FloatArray,
+        overlayMvpMatrix: FloatArray,
+        identityMvp: FloatArray,
+        onComplete: (Result<String>) -> Unit
+    ) {
+        val (shotW, shotH) = computeScreenshotDimensions(primaryW, primaryH)
+        val fboIds = IntArray(1)
+        val texIds = IntArray(1)
+        var rgbaBytes: ByteArray? = null
+        var captureError: Throwable? = null
+
+        try {
+            GLES20.glGenFramebuffers(1, fboIds, 0)
+            GLES20.glGenTextures(1, texIds, 0)
+            val fboId = fboIds[0]
+            val texId = texIds[0]
+            if (fboId == 0 || texId == 0) {
+                throw IllegalStateException("Could not allocate screenshot FBO.")
+            }
+
+            GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, texId)
+            GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
+            GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
+            GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
+            GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
+            GLES20.glTexImage2D(
+                GLES20.GL_TEXTURE_2D,
+                0,
+                GLES20.GL_RGBA,
+                shotW,
+                shotH,
+                0,
+                GLES20.GL_RGBA,
+                GLES20.GL_UNSIGNED_BYTE,
+                null
+            )
+
+            GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, fboId)
+            GLES20.glFramebufferTexture2D(
+                GLES20.GL_FRAMEBUFFER,
+                GLES20.GL_COLOR_ATTACHMENT0,
+                GLES20.GL_TEXTURE_2D,
+                texId,
+                0
+            )
+            val status = GLES20.glCheckFramebufferStatus(GLES20.GL_FRAMEBUFFER)
+            if (status != GLES20.GL_FRAMEBUFFER_COMPLETE) {
+                throw IllegalStateException("Screenshot FBO incomplete (status=0x${Integer.toHexString(status)})")
+            }
+
+            renderCompositePass(
+                oesHandles = oesHandles,
+                rgbaHandles = rgbaHandles,
+                oesTexId = oesTexId,
+                sceneNow = sceneNow,
+                sceneTexId = sceneTexId,
+                posterTexId = posterTexId,
+                overlayTexId = overlayTexId,
+                overlayBmpW = overlayBmpW,
+                overlayBmpH = overlayBmpH,
+                hudTexId = hudTexId,
+                qrTexId = qrTexId,
+                pngTuberTexId = pngTuberTexId,
+                pngTuberBmpW = pngTuberBmpW,
+                pngTuberBmpH = pngTuberBmpH,
+                pngTuberBounceFrac = pngTuberBounceFrac,
+                bannerTexId = bannerTexId,
+                hasFirstFrame = hasFirstFrame,
+                isFreshGameFrame = true,
+                srcW = srcW,
+                srcH = srcH,
+                dstW = shotW,
+                dstH = shotH,
+                isHdr10Surface = false,
+                fullQuadVerts = fullQuadVerts,
+                bannerTopVerts = bannerTopVerts,
+                bannerBottomVerts = bannerBottomVerts,
+                oesTexCoords = oesTexCoords,
+                bitmapTexCoords = bitmapTexCoords,
+                stMatrix = stMatrix,
+                mvpMatrix = mvpMatrix,
+                overlayMvpMatrix = overlayMvpMatrix,
+                identityMvp = identityMvp
+            )
+
+            val readBuf = ByteBuffer.allocateDirect(shotW * shotH * 4).order(ByteOrder.nativeOrder())
+            GLES20.glPixelStorei(GLES20.GL_PACK_ALIGNMENT, 4)
+            GLES20.glReadPixels(0, 0, shotW, shotH, GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, readBuf)
+            readBuf.rewind()
+            val bytes = ByteArray(shotW * shotH * 4)
+            readBuf.get(bytes)
+            rgbaBytes = bytes
+        } catch (t: Throwable) {
+            captureError = t
+        } finally {
+            try { GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0) } catch (_: Exception) {}
+            try { GLES20.glViewport(0, 0, primaryW, primaryH) } catch (_: Exception) {}
+            if (texIds[0] != 0) {
+                try { GLES20.glDeleteTextures(1, texIds, 0) } catch (_: Exception) {}
+            }
+            if (fboIds[0] != 0) {
+                try { GLES20.glDeleteFramebuffers(1, fboIds, 0) } catch (_: Exception) {}
+            }
+        }
+
+        val capturedBytes = rgbaBytes
+        if (capturedBytes == null || captureError != null) {
+            screenshotInFlight.set(false)
+            val err = captureError ?: IllegalStateException("Screenshot capture failed.")
+            DiagnosticsLogger.log("SHOT_ERR", "Clean screenshot failed: ${err.message}")
+            try { onComplete(Result.failure(err)) } catch (_: Exception) {}
+            return
+        }
+
+        val appCtx = context.applicationContext
+        Thread({
+            val res = try {
+                SolHudAndQrRenderer.saveRgbaScreenshotToMediaStore(appCtx, capturedBytes, shotW, shotH)
+            } catch (t: Throwable) {
+                Result.failure(t)
+            } finally {
+                screenshotInFlight.set(false)
+            }
+            res.onSuccess { fileName ->
+                DiagnosticsLogger.log("SCREENSHOT", "Saved clean YouTube thumbnail to Pictures/SolStream/$fileName (${shotW}x${shotH}).")
+            }.onFailure { err ->
+                DiagnosticsLogger.log("SHOT_ERR", "Could not save clean screenshot: ${err.message}")
+            }
+            try { onComplete(res) } catch (_: Exception) {}
+        }, "SolScreenshotSave").start()
+    }
+
     private fun renderCompositePass(
         oesHandles: GlShaderBank.OesHandles,
         rgbaHandles: GlShaderBank.Rgba2dHandles,
@@ -1720,6 +2134,12 @@ class SolVideoPipeline(private val context: Context) {
         overlayTexId: Int,
         overlayBmpW: Int,
         overlayBmpH: Int,
+        hudTexId: Int,
+        qrTexId: Int,
+        pngTuberTexId: Int,
+        pngTuberBmpW: Int,
+        pngTuberBmpH: Int,
+        pngTuberBounceFrac: Float,
         bannerTexId: Int,
         hasFirstFrame: Boolean,
         isFreshGameFrame: Boolean,
@@ -1821,6 +2241,7 @@ class SolVideoPipeline(private val context: Context) {
             }
         }
 
+        // 1. Game Frame + Color Filters
         computeFramingMatrix(
             mvp = mvpMatrix,
             srcW = srcW,
@@ -1845,6 +2266,7 @@ class SolVideoPipeline(private val context: Context) {
             isHdr10 = isHdr10Surface
         )
 
+        // 2. Privacy Blur (Minimap Shield + Independent Keyboard Blur)
         if (liveMinimapShieldEnabled) {
             val (scX, scY, boxW, boxH) = resolvePrivacyBlurRect(dstW, dstH, liveMinimapShieldCorner)
             GLES20.glEnable(GLES20.GL_SCISSOR_TEST)
@@ -1885,79 +2307,81 @@ class SolVideoPipeline(private val context: Context) {
             GLES20.glDisable(GLES20.GL_SCISSOR_TEST)
         }
 
+        // 3. .PNG Stream Frame / Logo Overlay
         if (overlayTexId != 0) {
             val posMode = liveOverlayPosition
             if (posMode == "FULL") {
                 drawRgbaQuad(rgbaHandles, overlayTexId, identityMvp, fullQuadVerts, bitmapTexCoords, enableBlend = true)
             } else {
-                computeCornerOverlayMatrix(
+                SolHudAndQrRenderer.computeCornerQuadMvp(
                     mvp = overlayMvpMatrix,
-                    logoW = overlayBmpW,
-                    logoH = overlayBmpH,
+                    bmpW = overlayBmpW,
+                    bmpH = overlayBmpH,
                     dstW = dstW,
                     dstH = dstH,
-                    position = posMode
+                    corner = posMode,
+                    maxHeightFrac = 0.18f,
+                    maxWidthFrac = 0.22f
                 )
                 drawRgbaQuad(rgbaHandles, overlayTexId, overlayMvpMatrix, fullQuadVerts, bitmapTexCoords, enableBlend = true)
             }
         }
+
+        // 4. Phase 1 (v1.5.0) Pro Broadcast Overlays (drawn ABOVE Privacy Blur so HUD/QR/Avatar stay crisp)
+        if (hudTexId != 0) {
+            val maxH = if (dstIsVertical) 0.042f else 0.062f
+            val maxW = if (dstIsVertical) 0.52f else 0.30f
+            SolHudAndQrRenderer.computeCornerQuadMvp(
+                mvp = overlayMvpMatrix,
+                bmpW = SolHudAndQrRenderer.HUD_WIDTH_PX,
+                bmpH = SolHudAndQrRenderer.HUD_HEIGHT_PX,
+                dstW = dstW,
+                dstH = dstH,
+                corner = liveHudTelemetryCorner,
+                maxHeightFrac = maxH,
+                maxWidthFrac = maxW
+            )
+            drawRgbaQuad(rgbaHandles, hudTexId, overlayMvpMatrix, fullQuadVerts, bitmapTexCoords, enableBlend = true)
+        }
+
+        if (qrTexId != 0) {
+            val qrMaxH = if (dstIsVertical) 0.13f else 0.18f
+            val qrMaxW = if (dstIsVertical) 0.24f else 0.14f
+            SolHudAndQrRenderer.computeCornerQuadMvp(
+                mvp = overlayMvpMatrix,
+                bmpW = SolHudAndQrRenderer.QR_SIZE_PX,
+                bmpH = SolHudAndQrRenderer.QR_SIZE_PX,
+                dstW = dstW,
+                dstH = dstH,
+                corner = liveQrOverlayCorner,
+                maxHeightFrac = qrMaxH,
+                maxWidthFrac = qrMaxW
+            )
+            drawRgbaQuad(rgbaHandles, qrTexId, overlayMvpMatrix, fullQuadVerts, bitmapTexCoords, enableBlend = true)
+        }
+
+        if (pngTuberTexId != 0) {
+            val sizeFrac = (livePngTuberSizePercent.coerceIn(12, 30) / 100.0f) * (if (dstIsVertical) 0.78f else 1.0f)
+            val hopNdcY = pngTuberBounceFrac * 0.032f
+            SolHudAndQrRenderer.computeCornerQuadMvp(
+                mvp = overlayMvpMatrix,
+                bmpW = pngTuberBmpW,
+                bmpH = pngTuberBmpH,
+                dstW = dstW,
+                dstH = dstH,
+                corner = livePngTuberCorner,
+                maxHeightFrac = sizeFrac,
+                maxWidthFrac = if (dstIsVertical) 0.34f else 0.24f,
+                extraOffsetY = hopNdcY
+            )
+            drawRgbaQuad(rgbaHandles, pngTuberTexId, overlayMvpMatrix, fullQuadVerts, bitmapTexCoords, enableBlend = true)
+        }
+
+        // 5. Live Text Banner (topmost layer)
         if (bannerTexId != 0) {
             val bannerVerts = if (liveBannerPosition == "BOTTOM") bannerBottomVerts else bannerTopVerts
             drawRgbaQuad(rgbaHandles, bannerTexId, identityMvp, bannerVerts, bitmapTexCoords, enableBlend = true)
         }
-    }
-
-    private fun computeCornerOverlayMatrix(
-        mvp: FloatArray,
-        logoW: Int,
-        logoH: Int,
-        dstW: Int,
-        dstH: Int,
-        position: String
-    ) {
-        val maxBoxH = dstH * 0.18f
-        val maxBoxW = dstW * 0.22f
-        val aspect = logoW.toFloat() / max(1, logoH).toFloat()
-
-        val drawW: Float
-        val drawH: Float
-        if (maxBoxH * aspect <= maxBoxW) {
-            drawH = maxBoxH
-            drawW = maxBoxH * aspect
-        } else {
-            drawW = maxBoxW
-            drawH = maxBoxW / max(0.05f, aspect)
-        }
-
-        val scaleX = (drawW / max(1, dstW).toFloat()).coerceIn(0.04f, 0.90f)
-        val scaleY = (drawH / max(1, dstH).toFloat()).coerceIn(0.04f, 0.90f)
-        val marginX = 0.05f
-        val marginY = 0.06f
-
-        val tx: Float
-        val ty: Float
-        when (position.uppercase(Locale.US)) {
-            "TOP_LEFT" -> {
-                tx = -1.0f + marginX + scaleX
-                ty = 1.0f - marginY - scaleY
-            }
-            "BOTTOM_LEFT" -> {
-                tx = -1.0f + marginX + scaleX
-                ty = -1.0f + marginY + scaleY
-            }
-            "BOTTOM_RIGHT" -> {
-                tx = 1.0f - marginX - scaleX
-                ty = -1.0f + marginY + scaleY
-            }
-            else -> {
-                tx = 1.0f - marginX - scaleX
-                ty = 1.0f - marginY - scaleY
-            }
-        }
-
-        Matrix.setIdentityM(mvp, 0)
-        Matrix.translateM(mvp, 0, tx, ty, 0f)
-        Matrix.scaleM(mvp, 0, scaleX, scaleY, 1f)
     }
 
     private fun drawOesGameplayQuad(
@@ -1980,7 +2404,7 @@ class SolVideoPipeline(private val context: Context) {
 
         GLES20.glUniformMatrix4fv(h.uMvpLoc, 1, false, mvp, 0)
         GLES20.glUniformMatrix4fv(h.uTexMatLoc, 1, false, texMatrix, 0)
-        GLES20.glUniform2f(h.uTexelStepLoc, 1.0f / srcW.toFloat(), 1.0f / srcH.toFloat())
+        GLES20.glUniform2f(h.uTexelStepLoc, 1.0f / max(1, srcW).toFloat(), 1.0f / max(1, srcH).toFloat())
 
         val rawUpscalerVal = when (liveUpscalerMode) {
             "BILINEAR" -> 0.0f
@@ -2082,8 +2506,8 @@ class SolVideoPipeline(private val context: Context) {
         smartZoomPct: Int,
         flipDeg: Int
     ) {
-        val srcAspect = srcW.toFloat() / srcH.toFloat()
-        val dstAspect = dstW.toFloat() / dstH.toFloat()
+        val srcAspect = max(1, srcW).toFloat() / max(1, srcH).toFloat()
+        val dstAspect = max(1, dstW).toFloat() / max(1, dstH).toFloat()
         val sameOrientation = (srcW >= srcH) == (dstW >= dstH)
 
         var scaleX = 1.0f
@@ -2479,6 +2903,24 @@ class SolVideoPipeline(private val context: Context) {
     }
 
     companion object {
+        private const val SCREENSHOT_COOLDOWN_MS = 3_000L
+        private const val HUD_REFRESH_INTERVAL_MS = 2_000L
+        private const val PNGTUBER_TALK_HOLD_MS = 140L
+
+        /**
+         * Clamps clean screenshot dimensions to <=1920 on the longest side (max 1920x1080 = 7.91 MiB RGBA8)
+         * while preserving exact aspect ratio for both 16:9 landscape and 9:16 Shorts streams.
+         */
+        internal fun computeScreenshotDimensions(primaryW: Int, primaryH: Int): Pair<Int, Int> {
+            val safeW = max(2, primaryW)
+            val safeH = max(2, primaryH)
+            val longSide = max(safeW, safeH)
+            val scale = if (longSide > 1920) 1920f / longSide.toFloat() else 1.0f
+            val w = max(2, (safeW * scale).roundToInt()).let { if (it % 2 == 0) it else it - 1 }
+            val h = max(2, (safeH * scale).roundToInt()).let { if (it % 2 == 0) it else it - 1 }
+            return w to h
+        }
+
         /**
          * Resolves the exact OpenGL glScissor rectangle for all 8 Privacy Blur Shield zones
          * across any landscape (16:9) or vertical (9:16) output resolution.
@@ -2925,18 +3367,25 @@ class SolVideoPipeline(private val context: Context) {
             return shader
         }
 
-        fun uploadBitmapTexture2d(bitmap: Bitmap): Int {
+        fun uploadBitmapTexture2d(bitmap: Bitmap, nearestFilter: Boolean = false): Int {
             val ids = IntArray(1)
             GLES20.glGenTextures(1, ids, 0)
             val texId = ids[0]
             if (texId == 0) return 0
+            val filter = if (nearestFilter) GLES20.GL_NEAREST else GLES20.GL_LINEAR
             GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, texId)
-            GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
-            GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
+            GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, filter)
+            GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, filter)
             GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
             GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
             GLUtils.texImage2D(GLES20.GL_TEXTURE_2D, 0, bitmap, 0)
             return texId
+        }
+
+        fun updateBitmapTexture2d(texId: Int, bitmap: Bitmap) {
+            if (texId == 0) return
+            GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, texId)
+            GLUtils.texSubImage2D(GLES20.GL_TEXTURE_2D, 0, 0, 0, bitmap)
         }
 
         fun deleteTexture2d(texId: Int) {
