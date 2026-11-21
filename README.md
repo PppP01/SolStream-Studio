@@ -1,8 +1,8 @@
-# SolStream Studio • ULTRA (`v1.4.0`)
+# SolStream Studio • ULTRA (`v1.5.0`)
 
-**SolStream Studio Ultra** (`com.solgaming.solstreamstudio`) is a standalone, ultra-lightweight (`~3.7 MB` Signed Release APK & Google Play `.aab` / `~6.1 MB` Debug APK), **100% NO-ROOT**, zero-ad Android live-streaming broadcast studio powered by the proprietary **`SolApex™ HyperStream Engine`** (**`SolCore Ultra™ Video Engine`** • **`SolLuxe™ 3.0 Pure Audio Engine`** • **`SolRelay Omega™ Broadcast Engine`** • **`SolCodec™ Hardware Silicon Layer`**). It is purpose-built for **90–185 Hz competitive mobile gaming** (*Call of Duty: Mobile, BGMI, Valorant Mobile*, etc.) while streaming crisp **`360p` to `4K60` (`0.5–100 Mbps`)** hardware-encoded video, **isolated 6-stage 32-bit float / 64-bit double pure condenser vocal commentary with a 12-Mode Hardware Acoustic Matrix**, and **stackable 3D stereo game soundstage** to **YouTube Live (Landscape `16:9` & Vertical `9:16` Shorts Feed), Twitch, Kick, and Custom RTMP/RTMPS servers**.
+**SolStream Studio Ultra** (`com.solgaming.solstreamstudio`) is a standalone, ultra-lightweight (`~3.8 MB` Signed Release APK & Google Play `.aab` / `~6.1 MB` Debug APK), **100% NO-ROOT**, zero-ad Android live-streaming broadcast studio powered by the proprietary **`SolApex™ HyperStream Engine`** (**`SolCore Ultra™ Video Engine`** • **`SolLuxe™ 3.0 Pure Audio Engine`** • **`SolRelay Omega™ Broadcast Engine`** • **`SolCodec™ Hardware Silicon Layer`**). It is purpose-built for **90–185 Hz competitive mobile gaming** (*Call of Duty: Mobile, BGMI, Valorant Mobile*, etc.) while streaming crisp **`360p` to `4K60` (`0.5–100 Mbps`)** hardware-encoded video, **isolated 6-stage 32-bit float / 64-bit double pure condenser vocal commentary with a 12-Mode Hardware Acoustic Matrix**, **zero-camera GPU broadcast overlays (`SolHUD™`, Offline Corner QR, 2-PNG PNGTuber & 1-Tap Clean Thumbnails)**, and **stackable 3D stereo game soundstage** to **YouTube Live (Landscape `16:9` & Vertical `9:16` Shorts Feed), Twitch, Kick, and Custom RTMP/RTMPS servers**.
 
-> **100% Unrooted Stock Android (Android 10–18 Ready & Google Play Compliant):** Works on normal, unrooted Android 10–18+ phones and tablets/foldables (`minSdk 29`, `targetSdk 36`, `compileSdk 37`) right out of the box—from budget `Lite` phones on 4G/5G mobile data to `Ultra` flagship gaming phones on 100+ Mbps Fiber. Root access is **never** required or used, and zero restricted battery-exemption permissions are declared. See our [**Official Privacy Policy (`PRIVACY_POLICY.md`)**](./PRIVACY_POLICY.md).
+> **100% Unrooted Stock Android (Android 10–18 Ready & Google Play Compliant):** Works on normal, unrooted Android 10–18+ phones and tablets/foldables (`minSdk 29`, `targetSdk 36`, `compileSdk 37`) right out of the box—from budget `Lite` phones on 4G/5G mobile data to `Ultra` flagship gaming phones on 100+ Mbps Fiber. Root access is **never** required or used, and zero restricted battery, camera, or broad storage permissions are declared. See our [**Official Privacy Policy (`PRIVACY_POLICY.md`)**](./PRIVACY_POLICY.md).
 
 ---
 
@@ -12,7 +12,7 @@
 >
 > I (`PppP01` / **Sol Gaming CODM** — [`@Sol_CODM`](https://youtube.com/@Sol_CODM)) know **nothing about programming, Kotlin, C, OpenGL, or Android Studio**. My role was defining real-world competitive gaming requirements, refusing compromises on 120+ FPS gameplay, phone thermals, touch response, and voice clarity, questioning every edge case, and testing marathon builds live on real hardware.
 >
-> **Original Custom Architecture (`SolApex™ HyperStream Engine v1.4.0`):** SolStream Studio Ultra is **not** a reskin or wrapper around a generic camera app. Its zero-copy OpenGL ES 3.0 (`Fast-FP16`) / ES 2.0 Direct-TBDR frame pacer (`SolCore Ultra™`), Hardware TMU-assisted 5-tap Bicubic/Lanczos upscaler with gated cardinal neighbor texture fetches (`14.74 million` fewer texture reads/frame at `1440p60`), Android 11–18 `Surface.setFrameRate()` hardware capture cooler, Vulkan `gralloc` PSS memory guard (`~205–258 MB` flat PSS across multi-hour streams), `40%` cooler `glScissor` `9:16 BLUR` backdrop, `STRETCH (Full 16:9 Zero-Bars)` aspect scaler, 5-position aspect-preserving `.PNG` corner logo compositor (`Logo:OFF → FULL → TL → TR → BL → BR`), Dual-Layer Privacy Blur Shield (8 HUD zones + automatic `Auto-Blur Keyboard`), Adaptive Dark-Corner Clarifier, isolated **`SolLuxe™ 3.0 Pure` 6-stage vocal & game soundstage DSP** (thread-safe atomic frame-boundary coefficient updates, automatic **4-Hardware × 3-Gender `12-Mode` Acoustic Matrix**, **`55 / 68 / 85 Hz` Auto/Manual 64-Bit Butterworth HPF**, **`<0.6 ms` Raised-Cosine Micro-Impulse Clamper**, `16 KB`-aligned Native C `48 kHz` Xiph `RNNoise` with hardware Flush-to-Zero `FZ` register guards + **`16 kHz`-safe Hybrid Neural-VAD Smooth Expander**, **Split-Band Dynamic Plosive Guard**, **zero-overlap Condenser EQ + Low-Band Analog Warmth Shaper**, real **`5.2 kHz` Bluetooth SCO Hiss LPF**, **Gender-Sidechain Soft-Knee Broadcast Leveler with continuous VAD-synced quiet-speech lift**, **Post-Comp Dynamic Sibilance-Ratio De-Esser**, and **`4×` Catmull-Rom Inter-Sample True-Peak Limiter at `-1.16 dBTP`**), universal 4-tier microphone capture fallback (`48 kHz PCM_FLOAT → 48 kHz/44.1 kHz/16 kHz PCM_16BIT` linearly resampled to `48 kHz`), headphone-aware effective Speaker AEC guard, exact-launched 2-worker audio cleanup barrier, drift-locked stereo game circular buffer (`±12 ms`), simultaneous-instance-verified companion encoder selection (`SolCodec™`), smart thermal bitrate governor, AES-256 Keystore non-destructive vault, Pedro `RootEncoder` $\mu\text{s} \rightarrow \text{ms}$ RTT conversion, `setCheckServerAlive(false)` + **Network-Adaptive RTMP Write Chunking (`65,535 B` Wi-Fi / `4,096 B` Mobile Data & Custom)**, bounded leased-slot `ArrayBlockingQueue<PacketSlot>` simulcast pool with per-client callback identity guards, off-main-thread `5s` teardown barrier, **60-second single-slot storage auto-checkpointing**, Instant `Wi-Fi ↔ 5G` Multipath Failover (`SolRelay Omega™`), and 0-Hz sleeping 3-tab Accessibility Ghost Pill with live **App vs. Game Heat/CPU & RAM Split** are custom-engineered specifically for mobile esports.
+> **Original Custom Architecture (`SolApex™ HyperStream Engine v1.5.0`):** SolStream Studio Ultra is **not** a reskin or wrapper around a generic camera app. Its zero-copy OpenGL ES 3.0 (`Fast-FP16`) / ES 2.0 Direct-TBDR frame pacer (`SolCore Ultra™`), gated 5-tap Bicubic/Lanczos upscaler (`14.74M` fewer texture reads/frame at `1440p60`), Android 11–18 `Surface.setFrameRate()` hardware capture cooler, Vulkan `gralloc` PSS memory guard (`~199–258 MB` flat PSS across multi-hour streams), **`SolHUD™` zero-allocation live GPU telemetry badge** (visible to viewers even in Android 14+ Single-App Capture), **pure-Kotlin ISO/IEC 18004 offline Corner QR generator (`GL_NEAREST`)**, **zero-camera 2-PNG PNGTuber avatar** with gender-matched Cyber Visor fallback, **temporary offscreen RGBA8 FBO 1-Tap Clean Screenshot** (`Pictures/SolStream/` via `MediaStore`), **4 hardware-clamped One-Tap Studio Profiles**, Dual-Layer Privacy Blur Shield (8 HUD zones + `Auto-Blur Keyboard`), isolated **`SolLuxe™ 3.0 Pure` 6-stage vocal & game soundstage DSP** (thread-safe atomic frame-boundary snapshots, 12-Mode Acoustic Matrix, `55/68/85 Hz` Auto/Manual Butterworth HPF, `<0.6 ms` Raised-Cosine Micro-Impulse Clamper, `16 KB`-aligned Native C `48 kHz` Xiph `RNNoise` with hardware `FZ` guards + `16 kHz`-safe Hybrid Neural-VAD Smooth Expander, Split-Band Dynamic Plosive Guard, Condenser EQ + Low-Band Analog Warmth Shaper, Gender-Sidechain Soft-Knee Leveler, Post-Comp Dynamic De-Esser, and `4×` Catmull-Rom True-Peak Limiter at `-1.16 dBTP`), universal 4-tier mic capture fallback, exact-launched 2-worker `AudioWorkerBarrier`, simultaneous-instance-verified companion encoder selection (`SolCodec™`), smart thermal governor with `SEVERE` override protection, AES-256 Hardware Keystore vault, Network-Adaptive RTMP Write Chunking (`65,535 B` Wi-Fi / `4,096 B` Cellular & Custom), 60-second single-slot auto-checkpointing, Instant `Wi-Fi ↔ 5G` Multipath Failover (`SolRelay Omega™`), and 0-Hz sleeping 3-tab Accessibility Ghost Pill with live **App vs. Game Heat/CPU & RAM Split** are custom-engineered specifically for mobile esports.
 >
 > **How to Suggest Fixes or Improvements:**
 > * Please do **NOT** open GitHub Issues asking me coding questions—if you explain code to me, I have no idea what it means and will literally copy-paste your message straight back to Gemini, ChatGPT, and Claude!
@@ -22,183 +22,134 @@
 
 ## Table of Contents
 
-1. [Download & Install Signed Release APK or Play Store Bundle (`v1.4.0`)](#1-download--install-signed-release-apk-or-play-store-bundle-v140)
-2. [How Human + Multi-AI Built This App](#2-how-human--multi-ai-built-this-app)
-3. [For Casual Readers & Gamers: What Does SolStream Studio Ultra Actually Do?](#3-for-casual-readers--gamers-what-does-solstream-studio-ultra-actually-do)
-4. [The 10 Custom `SolApex™ v1.4.0` Engineering Innovations](#4-the-10-custom-solapex-v140-engineering-innovations)
+1. [Download & Install Signed Release APK or Play Store Bundle (`v1.5.0`)](#1-download--install-signed-release-apk-or-play-store-bundle-v150)
+2. [What's New in `v1.5.0` ("SolApex™ Streamer Pro")](#2-whats-new-in-v150-solapex-streamer-pro)
+3. [How Human + Multi-AI Built This App](#3-how-human--multi-ai-built-this-app)
+4. [The 10 Custom `SolApex™ v1.5.0` Engineering Innovations](#4-the-10-custom-solapex-v150-engineering-innovations)
 5. [Complete Plain-English User Manual: Every Card, Drawer & Floating Tab Explained](#5-complete-plain-english-user-manual-every-card-drawer--floating-tab-explained)
-6. [Global Broadcast Inspirations (Windows, macOS & iOS -> Android)](#6-global-broadcast-inspirations-windows-macos--ios---android)
-7. [For Android Developers & Engineers: Architecture, 6-Stage `SolLuxe™ 3.0 Pure` & Build Spec](#7-for-android-developers--engineers-architecture-6-stage-solluxe-30-pure--build-spec)
-8. [For AI Coding Assistants, Security Auditors & Forkers](#8-for-ai-coding-assistants-security-auditors--forkers)
-9. [Privacy Policy, Google Play Compliance & Open-Source Licenses](#9-privacy-policy-google-play-compliance--open-source-licenses)
+6. [For Android Developers & Engineers: Architecture, 6-Stage `SolLuxe™ 3.0 Pure` & Build Spec](#6-for-android-developers--engineers-architecture-6-stage-solluxe-30-pure--build-spec)
+7. [For AI Coding Assistants, Security Auditors & Forkers](#7-for-ai-coding-assistants-security-auditors--forkers)
+8. [Privacy Policy, Google Play Compliance & Open-Source Licenses](#8-privacy-policy-google-play-compliance--open-source-licenses)
 
 ---
 
-## 1. Download & Install Signed Release APK or Play Store Bundle (`v1.4.0`)
+## 1. Download & Install Signed Release APK or Play Store Bundle (`v1.5.0`)
 
 1. Open the **[Releases](https://github.com/PppP01/SolStream-Studio/releases)** page on this repository.
-2. Tap **`SolStream-Studio-v1.4.0.apk`** under **Assets** to download the full **Ultra Master Edition** (`~3.7 MB` signed release APK) directly onto your Android phone (or download **`SolStream-Studio-v1.4.0-PlayStore.aab`** for Google Play Console distribution). All earlier versions (`v1.0.2` – `v1.3.0`) remain permanently available in Releases.
-3. **Seamless 1-Tap Updates:** All official Releases are signed with the same permanent V3 cryptographic key—you can install **`v1.4.0`** (`versionCode = 11`) straight over any earlier version (`v1.3.0` or older) as an **Update** without uninstalling, re-entering your Stream Key, or redoing Restricted Accessibility!
+2. Tap **`SolStream-Studio-v1.5.0.apk`** under **Assets** to download the full **Ultra Master Edition** (`~3.8 MB` signed release APK) directly onto your Android phone (or download **`SolStream-Studio-v1.5.0-PlayStore.aab`** for Google Play Console distribution). All earlier versions (`v1.0.2` – `v1.4.0`) remain permanently available in Releases.
+3. **Seamless 1-Tap Updates:** All official Releases are signed with the same permanent V3 cryptographic key—you can install **`v1.5.0`** (`versionCode = 12`) straight over any earlier version (`v1.4.0` or older) as an **Update** without uninstalling, re-entering your Stream Key, or redoing Restricted Accessibility!
 
 ---
 
-## 2. How Human + Multi-AI Built This App
+## 2. What's New in `v1.5.0` ("SolApex™ Streamer Pro")
+
+- **`SolHUD™` Live GPU Telemetry Badge (Opt-In, `0 MB` VRAM When OFF):** Renders a sleek live **`FPS • °C • Mbps`** badge directly inside OpenGL (`138 KB` reused bitmap updated every 2s via `glTexSubImage2D`)—visible to viewers even during **Android 14–18 Single-App Capture** while keeping your control buttons hidden.
+- **100% Offline Corner QR Code Overlay (Opt-In):** Pure-Kotlin **ISO/IEC 18004** QR encoder (Versions 1–10, Error Correction Level M, up to 213 UTF-8 bytes) rendered with razor-sharp `GL_NEAREST` scaling for UPI support links, YouTube channels, or Discord invites—zero external libraries, zero internet calls, zero permissions.
+- **Zero-Camera 2-PNG PNGTuber Avatar (Opt-In):** Upload your own Idle & Talking transparent PNGs (max `512×512` = `2.0 MiB` total VRAM) or use the built-in **Obsidian-Glass Cyber Visor Esports Avatar** that automatically matches your Mic Studio gender profile (`MALE` / `FEMALE` / `NEUTRAL`). Animated at ~47 Hz from existing `MicDspProcessor.vadSpeechActive` with a 140 ms talk-hold and smooth talk-hop—zero `CAMERA` permission and zero changes to audio DSP.
+- **1-Tap Clean Screenshot (`📸 Shot` in Floating Pill):** Captures a pill-free `<=1080p` YouTube thumbnail via a temporary offscreen RGBA8 OpenGL FBO (eliminating black readbacks on write-only `MediaCodec` encoder surfaces) and saves a crisp `quality = 92` JPEG to `Pictures/SolStream/` via zero-permission `MediaStore` (`IS_PENDING = 1 → 0`, 3s cooldown).
+- **4 One-Tap Hardware-Adapted Studio Profiles (Card 2):** Pre-loaded with **`Wi-Fi Max`**, **`Mobile Data`**, **`Shorts 9:16`**, and **`Custom`**—auto-clamped to every phone's verified hardware tier. Tap to switch setups instantly; long-press any slot to save & rename your current setup (Stream Keys are never saved inside profiles).
+- **Marathon Reliability & Telemetry Fixes:**
+  - Frozen post-stop **Session Reports** (`isSessionFinalized` + `@Synchronized` stop/checkpoint lock so idle reopens never overwrite end-of-stream power, thermal headroom, or heap metrics).
+  - Live-temp toast guard when tapping `30FPS Cool:ACTIVE` while Android OS is still in `SEVERE` warmth (prevents `30 → 60 → 30` bounce and `[THERMAL]` log spam).
+  - Preserved cumulative dropped-frame counters across RTMPS reconnects, negotiated-FPS thermal floor enforcement, and 3× fewer main-thread hardware Binder IPCs per 2-second tick.
+  - Expanded CI verification suite to **48 JUnit 4 unit tests** covering QR matrix ISO compliance, corner MVP clamping, screenshot FBO sizing/flip math, Studio Profiles, and thermal/report guards.
+
+---
+
+## 3. How Human + Multi-AI Built This App
 
 This repository was engineered through a continuous verification loop between a competitive mobile gamer and frontier AI models auditing each other's code line-by-line:
 
 - **Product Vision, Requirements & Live Marathon Testing — `Sol Gaming CODM` ([`@Sol_CODM`](https://youtube.com/@Sol_CODM)):**
-  - Validated builds across multi-hour (`98m–330m`) continuous `1440p60 HEVC` (`18–20 Mbps`) Multiplayer and Battle Royale live streams on an unrooted **Samsung Galaxy S24 FE** (`Exynos 2400e • Samsung Xclipse 940 (Vulkan)`, `2340×1080` 120 Hz display, 8 GB RAM), **realme Buds Wireless 5 ANC** neckband earphones, and 5 GHz Fiber Wi-Fi (`0` sender drops, `0` reconnects, `0 ms` send queue, `28 ms` A/V sync offset, `~8%` app CPU, `258 MB` peak PSS).
-  - Caught real-world audio and OS reliability edge cases directly from live streams: eliminating speech-onset `"prit-prit"` gate clicks, isolating the Samsung `Device Care → Memory → Excluded apps` background-kill behavior on 8 GB phones, fixing Floating Pill `Game:...` truncation and unified `Logo:OFF` toggling, and replacing the old boxed launcher icon with the full-bleed **Solar Eclipse `'S'`** design.
+  - Validated marathon `1440p60 HEVC` (`18–20 Mbps`) Multiplayer and Battle Royale broadcasts (`138m–330m`) on an unrooted **Samsung Galaxy S24 FE** (`Exynos 2400e • Samsung Xclipse 940 (Vulkan)`, 120 Hz display, 8 GB RAM), **realme Buds Wireless 5 ANC**, and 5 GHz Fiber Wi-Fi (`0` drops, `0` reconnects, `~7%` CPU, `199 MB` peak PSS, `0 ms` send queue).
+  - Caught real-world stream UX and diagnostic edge cases directly from marathon session reports—leading to `v1.5.0`'s frozen post-stop reports, `SEVERE` 30 FPS toast guard, Single-App-visible `SolHUD™`, offline Corner QR, zero-camera PNGTuber, and 1-Tap Clean Thumbnails.
 - **System Architecture, Native C/OpenGL/DSP Engineering & Code Generation — `Google Gemini`:**
-  - Engineered the pure-Kotlin zero-XML Android architecture, `16 KB`-aligned Native C `48 kHz RNNoise` JNI engine (`sol_rnnoise_jni.c`), the rebuilt 6-stage thread-safe **`SolLuxe™ 3.0 Pure`** audio engine (`MicDspProcessor.kt` + `SolDualAudioEngine.kt`), **`SolCore Ultra™`** OpenGL ES 3.0 `Fast-FP16` video pipeline (`SolVideoPipeline.kt`), **`SolCodec™`** concurrent-instance capability scanner (`CodecCapabilityProbe.kt`), **`SolRelay Omega™`** adaptive-chunk RTMPS transport & 60-second checkpointing (`KeystoreVault.kt`, `SolStreamService.kt`, `DiagnosticsLogger.kt`), **Obsidian-Glass** dashboard & visual User Guide (`MainActivity.kt`), **Solar Eclipse `'S'`** adaptive vector icon (`ic_solstream_logo.xml`), and pinned CI/CD verification pipeline (`build.yml`).
+  - Engineered the pure-Kotlin zero-XML Android architecture, `16 KB`-aligned Native C `48 kHz RNNoise` JNI engine (`sol_rnnoise_jni.c`), **`SolLuxe™ 3.0 Pure`** audio engine (`MicDspProcessor.kt` + `SolDualAudioEngine.kt`), **`SolCore Ultra™`** OpenGL ES 3.0 `Fast-FP16` video pipeline (`SolVideoPipeline.kt`), pure-Kotlin **`SolHudAndQrRenderer.kt`**, **`SolCodec™`** capability scanner (`CodecCapabilityProbe.kt`), **`SolRelay Omega™`** adaptive-chunk RTMPS transport & 60-second checkpointing (`KeystoreVault.kt`, `SolStreamService.kt`, `DiagnosticsLogger.kt`), **Obsidian-Glass** dashboard (`MainActivity.kt`), and **48-test** CI verification pipeline (`build.yml`).
 - **Independent Line-by-Line Source Audits — `OpenAI ChatGPT` & `Anthropic Claude`:**
-  - Audited live commits against Pedro `RootEncoder 2.8.1`, Xiph `RNNoise v0.1.1`, W3C biquad filter stability (`max pole radius < 1.0`), and Android 10–17 API rules—surfacing key fixes shipped in `v1.4.0`: `setCheckServerAlive(false)` code alignment, atomic frame-boundary DSP coefficient updates, Auto vs. Manual HPF preservation, headphone-aware effective Speaker AEC cutoff, exact-launched 2-worker audio cleanup barrier, `PCM_16BIT`/alternate-rate mic fallback, `AuxRtmpTarget` per-client callback ownership, off-main-thread `activeTeardownLatch` timeout handling, simultaneous-instance companion codec filtering, pinned RNNoise commit + NDK `28.2.13676358`, `16 KB` `zipalign` verification, and an expanded **38-test JUnit 4 suite**.
+  - Audited commits against Pedro `RootEncoder 2.8.1`, Xiph `RNNoise v0.1.1`, W3C biquad stability, and Android 10–17 API rules—catching `setCheckServerAlive(false)`, atomic frame-boundary DSP updates, `AudioWorkerBarrier`, `LinearMonoResampler48k`, `AuxRtmpCallback` ownership, pinned NDK/RNNoise builds, and `16 KB` `zipalign` verification.
 
 ---
 
-## 3. For Casual Readers & Gamers: What Does SolStream Studio Ultra Actually Do?
+## 4. The 10 Custom `SolApex™ v1.5.0` Engineering Innovations
 
-Most Android streaming apps hurt competitive gaming in at least one way: they bundle `45–180 MB` of camera masks, AdMob ads, GPS/Contact trackers, and coin timers; lock `1440p/HEVC` behind subscriptions; click or distort your voice when a game switches the mic HAL to `16 kHz`; or get silently killed by Android's background memory manager at hour 3.
-
-**SolStream Studio Ultra (`SolApex™ HyperStream Engine v1.4.0`) solves all of those problems in a `~3.7 MB` (Release), unrooted, zero-ad studio:**
-
-1. **Obsidian-Glass Dashboard, Solar Eclipse `'S'` Branding & Live "Protect Long Streams" Banner:**
-  - Features the full-bleed **Solar Eclipse `'S'`** adaptive vector icon, 3 glanceable top studio chips (`SolLuxe 3.0` • `1440p60 • HEVC` • `Protected ✓`), a 3-Tile Hero Summary Bar (`[ 🎥 1440p (2K) ] [ ⚡ 60 FPS ] [ 📡 20 Mbps ]`), collapsible pro accordion drawers, and a zero-permission **Protect Long Streams** readiness banner with brand-aware anti-kill tips (Samsung, Xiaomi/POCO, Vivo/iQOO, OnePlus/Realme/Oppo, Pixel).
-2. **Plays at 90–185 FPS on Your Screen, Streams Steady 60/30 FPS (`360p` to `4K60` • `0.5` to `100 Mbps`):**
-  - Your display stays at its native `120 / 144 / 165 / 185 Hz` refresh rate while Android 11–18 `Surface.setFrameRate()` hardware pacing and dedicated hardware encoders (`SolCodec™`) encode rock-steady Constant Frame Rate video with a strict 2-second keyframe cadence and a **3-Attempt Bare-Metal Hardware Encoder Fallback Ladder**.
-3. **`SolLuxe™ 3.0 Pure` — 6 Non-Fighting Pure Condenser Stages (Zero "Prit-Prit" Clicks):**
-  - Rebuilt from the ground up into 6 mathematically separated stages so zero filters fight or cancel each other: `55 / 68 / 85 Hz` 64-bit Butterworth HPF → `<0.6 ms` Raised-Cosine Micro-Impulse Clamper → Native C `48 kHz` `RNNoise` + `16 kHz`-Safe Hybrid Neural-VAD Smooth Expander (`8 ms` attack / `220 ms` release, `-14 dB` floor) → Split-Band Dynamic Plosive Guard (`<115 Hz` wind vs. vocal core) → 4-Gear × 3-Gender Condenser EQ + Low-Band Analog Warmth Shaper → Gender-Sidechain Soft-Knee Leveler + Dynamic Sibilance-Ratio De-Esser + `4×` True-Peak Limiter (`-1.16 dBTP`).
-4. **Crash-Proof 60-Second Auto-Checkpoint + Live App vs. Game Resource Split:**
-  - Checkpoints live session telemetry and `★ Saved Clips` to a single dedicated storage slot every 60 seconds (never polluting your 9-slot session history), so even an unexpected OS kill never wipes your report or clip timestamps.
-
----
-
-## 4. The 10 Custom `SolApex™ v1.4.0` Engineering Innovations
-
-| # | Custom `SolApex™ v1.4.0` Innovation | The Real-World Gaming Problem It Solves | How Our Custom Math & Silicon Engineering Works |
+| # | Custom `SolApex™ v1.5.0` Innovation | The Real-World Gaming Problem It Solves | How Our Custom Math & Silicon Engineering Works |
 |---|---|---|---|
-| **1** | **6-Stage Non-Fighting `SolLuxe™ 3.0 Pure` Condenser Chain + Thread-Safe Frame-Boundary Snapshots** | Hard `0-ms` gates, `4.5 ms` consonant blankers, and step-cliff whisper boosts caused `"prit-prit"` speech-onset clicks and hollow mids; mutating biquad coefficients from the UI thread risked live audio glitches. | Publishes settings atomically via an immutable `DspConfigSnapshot` adopted strictly at `10 ms` frame boundaries on the audio thread; replaces hard gates with an `8 ms` / `220 ms` Hybrid Neural-VAD smooth expander (`-14 dB` floor), `<0.6 ms` raised-cosine micro-impulse clamping, and strictly non-overlapping 4×3 EQ pockets. |
-| **2** | **`16 kHz`-Safe Hybrid Neural-VAD + True `100%` Native C `RNNoise` + Headphone-Aware Speaker AEC** | When CODM activates in-game voice chat, Samsung's HAL locks the mic to `16 kHz`; meanwhile, leaving Speaker AEC enabled with earphones plugged in could silently route through `VOICE_COMMUNICATION` and hollow out vocal bass. | Opens the expander smoothly whenever neural `vadProb >= 0.35` OR `200–2500 Hz` speech energy exceeds the adaptive noise floor by `+6 dB`; sets RNNoise Level 3 to true `1.00f` wet strength; enforces `effectiveSpeakerAec = activeSpeakerAecEnabled && !headphonesConnected` on every route change and verifies `AcousticEchoCanceler.getEnabled()`. |
-| **3** | **Universal 4-Tier Mic Capture Fallback (`LinearMonoResampler48k`) + Exact-Launched 2-Worker Barrier** | Strict OEM audio HALs on some phones reject `48 kHz ENCODING_PCM_FLOAT`; independent worker finalizers could race and release shared DSP/AAC resources while the other audio thread was still exiting. | Tries `48 kHz PCM_FLOAT` first (zero overhead on flagships), falling back cleanly through `48 kHz / 44.1 kHz / 16 kHz PCM_16BIT` linearly resampled to exact `480-sample / 48 kHz` float; `AudioWorkerBarrier` releases shared resources strictly once after both `SolFloatAudioMixer` and `SolAacDrain` exit. |
-| **4** | **Network-Adaptive RTMP Write Chunking (`65,535 B` / `4,096 B`) + `setCheckServerAlive(false)`** | Pedro's default `128-byte` RTMP chunking creates heavy packetization overhead at `20 Mbps`, while `setCheckServerAlive(true)` invokes ICMP `socket.isReachable()` which causes false disconnects on restricted Wi-Fi/VPNs. | Disables ICMP reachability probes (`setCheckServerAlive(false)`) in favor of real RTMP pings + `8.5s` handshake & `6s` stall watchdogs, and dynamically sets `setWriteChunkSize` to **`65,535 bytes` (64 KB)** on Wi-Fi/Ethernet for YouTube/Twitch/Kick and **`4,096 bytes` (4 KB)** on Cellular and unknown custom RTMP servers. |
-| **5** | **Per-Client Callback Ownership (`PrimaryRtmpCallback` + `AuxRtmpCallback`) & Bounded Leased-Slot Pool** | Delayed async `onDisconnect()` callbacks from a previous `RtmpClient` could mark a newly reconnected auxiliary target offline, and naive ring buffers could overwrite queued simulcast packets. | Wraps every primary and auxiliary `RtmpClient` in a dedicated per-client callback checking `sourceClient === client`, resets `connected = false` before client swaps, and leases exclusively owned `PacketSlot` buffers from a bounded `ArrayBlockingQueue`. |
-| **6** | **Off-Main-Thread `5s` Teardown Guard + 60-Second Single-Slot Storage Auto-Checkpoint** | Starting a new stream before a slow encoder finished tearing down could cause resource contention; sudden OS kills at hour 3+ wiped in-memory session logs. | Awaits `activeTeardownLatch` off the main thread with an explicit `5s` abort ceiling, writes live 60-second checkpoints to a dedicated single slot (`LIVE / INCOMPLETE`) without touching the 9-slot session archive, and clears orphaned ghost notifications on cold start. |
-| **7** | **Simultaneous-Instance-Verified Companion Codec Selection (`eligibleCompanionEncoders`)** | Devices where H.264 supports 2 concurrent instances but HEVC supports only 1 could pass a generic dual-encoder check and then fail trying to open a second HEVC instance. | Filters companion candidates strictly to codecs reporting `maxConcurrentInstances >= 2` with 1080p support, falling back cleanly from HEVC to H.264 in both `SolVideoPipeline` and `SolStreamService`. |
-| **8** | **Slider-Independent `3D Game Soundstage` + `4×` Catmull-Rom Inter-Sample True-Peak Limiting** | High `Game Mix %` or `Mic Boost %` settings can create inter-sample peaks that clip AAC encoders even when individual samples stay below `0 dBFS`. | Evaluates 4× oversampled Catmull-Rom cubic inter-sample peaks (`t = 0.25, 0.50, 0.75`) at `-1.16 dBTP` (`0.875`) on both the vocal bus and the 64-sample look-ahead stereo master bus, paired with phase-safe `62 Hz` Sub-Punch and `250 Hz + 2.45 kHz` Footstep Focus. |
-| **9** | **Gated Neighbor Shader (`14.74M` Fewer Reads/Frame) + `Surface.setFrameRate()` + Vulkan PSS Guard** | Unconditional neighbor texel reads waste GPU power when Sharpen/Shadow Boost are OFF, and minimizing a landscape game can trigger portrait `VirtualDisplay.resize()` Vulkan memory spikes. | Gates the 4 cardinal neighbor fetches strictly inside `if (uSharpen > 0.01 \|\| uShadowBoost > 0.5)`, paces `SurfaceFlinger` capture in hardware, and ignores portrait resize callbacks on `16:9` landscape streams. |
-| **10** | **100% Google Play Policy Cleanliness + Pinned Reproducible NDK & `16 KB` `zipalign` CI** | Play Store flags `REQUEST_IGNORE_BATTERY_OPTIMIZATIONS`, unverified native downloads, and non-16 KB aligned APKs (enforced for API 35+ updates). | Declares zero restricted battery permissions (uses standard App Info guidance + `PowerManager.isIgnoringBatteryOptimizations` status check), pins NDK `28.2.13676358` and Xiph RNNoise commit `6cbfd53eb348a8d394e0757b4025c6ded34eb2b6`, and verifies both `zipalign -c -P 16` and `readelf` ELF segments on every build. |
+| **1** | **6-Stage Non-Fighting `SolLuxe™ 3.0 Pure` Condenser Chain + Thread-Safe Frame-Boundary Snapshots** | Hard `0-ms` gates caused `"prit-prit"` speech-onset clicks; UI-thread filter mutation risked audio glitches. | Immutable `DspConfigSnapshot` adopted strictly at `10 ms` frame boundaries; `8 ms / 220 ms` Hybrid Neural-VAD smooth expander (`-14 dB` floor), `<0.6 ms` raised-cosine impulse clamper, and non-overlapping 4×3 Condenser EQ pockets. |
+| **2** | **`SolHUD™`, Pure-Kotlin ISO QR & Zero-Camera PNGTuber (`SolHudAndQrRenderer.kt`)** | Android 14+ Single-App Capture hides floating pills so viewers can't see live FPS/temp; front cameras add `2–3°C` heat and require `CAMERA` permission. | Renders `SolHUD™` (`138 KB` zero-GC `glTexSubImage2D`), ISO/IEC 18004 V1–10 Level M QR (`GL_NEAREST`), and 2-PNG PNGTuber (`vadSpeechActive` @ ~47 Hz + 140 ms hold) straight inside OpenGL above Privacy Blur (`~2.4 MiB` total VRAM when all 3 are ON; `0 MB` when OFF). |
+| **3** | **Offscreen RGBA8 FBO 1-Tap Clean Thumbnail (`Pictures/SolStream/`)** | `glReadPixels()` directly on `MediaCodec` surfaces returns black on Samsung Exynos / Adreno write-only gralloc buffers and stalls 60 FPS encoding. | Allocates a temporary `<=1920×1080` (`<=7.91 MiB`) RGBA8 FBO *after* `eglSwapBuffers()`, destroys it immediately (`0 MB` retained VRAM), flips rows in-place on a background thread, and saves `quality = 92` JPEG via scoped `MediaStore` (`IS_PENDING = 1 → 0`, 3s cooldown). |
+| **4** | **`16 kHz`-Safe Hybrid Neural-VAD + True `100%` Native C `RNNoise` + Headphone-Aware Speaker AEC** | In-game squad chat locks phone mics to `16 kHz`; leaving Speaker AEC active on earphones hollows out bass. | Opens expander cleanly on `vadProb >= 0.35` OR `200–2500 Hz` speech energy `+6 dB` above floor; sets RNNoise Lv3 to `1.00f` wet; enforces `effectiveSpeakerAec = activeSpeakerAecEnabled && !headphonesConnected`. |
+| **5** | **Universal 4-Tier Mic Capture Fallback (`LinearMonoResampler48k`) + `AudioWorkerBarrier`** | Strict OEM HALs reject `48 kHz PCM_FLOAT`; racing audio worker finalizers can free shared buffers early. | Falls back cleanly from `48 kHz PCM_FLOAT` through `48 / 44.1 / 16 kHz PCM_16BIT` linearly resampled to exact `480-sample` float; `AudioWorkerBarrier` releases shared resources strictly once after both workers exit. |
+| **6** | **Network-Adaptive RTMP Chunking (`65,535 B` / `4,096 B`) + `setCheckServerAlive(false)`** | Default `128 B` RTMP chunks waste CPU at `20 Mbps`; ICMP `isReachable()` causes false Wi-Fi/VPN drops. | Disables ICMP probes in favor of active RTMP pings + `8.5s` handshake / `6s` stall watchdogs, and adapts write chunk size to `65,535 B` on Wi-Fi major ingests and `4,096 B` on Cellular/Custom relays. |
+| **7** | **Per-Client Callback Identity (`PrimaryRtmpCallback` + `AuxRtmpCallback`) & Bounded Leased-Slot Pool** | Delayed callbacks from old sockets could disconnect active streams or overwrite queued simulcast packets. | Guards every callback against exact `sourceClient === client` + `sessionGen`, tracks cumulative drops across reconnects, and leases exclusive `PacketSlot` buffers from a bounded `ArrayBlockingQueue`. |
+| **8** | **Off-Main-Thread `5s` Teardown Guard + Frozen Post-Stop Reports + 60s Checkpoint** | Starting before teardown finishes causes encoder contention; sudden OS kills wipe logs; idle reopens overwrote post-stop telemetry. | Awaits `activeTeardownLatch` off the main thread (`5s` ceiling), freezes finalized reports (`isSessionFinalized`), and synchronizes 60-second checkpoints cleanly against Stop. |
+| **9** | **Simultaneous-Instance-Verified Companion Codec Selection + Gated Neighbor Shader + Vulkan PSS Guard** | Single-instance HEVC chips failed naive dual-stream starts; portrait resizes spiked Vulkan memory. | Filters companion candidates strictly to `maxConcurrentInstances >= 2`, gates cardinal neighbor fetches (`14.74M` fewer reads/frame), paces via `Surface.setFrameRate()`, and ignores portrait resizes on `16:9` streams. |
+| **10** | **100% Google Play Policy Cleanliness + Pinned NDK & `16 KB` `zipalign` CI (`48` Unit Tests)** | Play Store blocks restricted battery/storage/camera permissions and non-16 KB aligned APKs (API 35+). | Zero restricted permissions (`AndroidManifest.xml` untouched in `v1.5.0`), pinned NDK `28.2.13676358`, pinned RNNoise commit `6cbfd53eb348a8d394e0757b4025c6ded34eb2b6`, `zipalign -c -P 16` + `readelf` verification, and **48 passing JUnit 4 tests**. |
 
 ---
 
 ## 5. Complete Plain-English User Manual: Every Card, Drawer & Floating Tab Explained
 
 ### Step A: One-Time Long-Stream Protection & Android 13–18 Setup (2 Minutes)
+1. **Prevent 3-Hour Background OS Kills:** Tap **`Protect`** on the top banner → **Battery** → **`Unrestricted`**.
+  - **Samsung One UI:** Also add **both `SolStream Studio` and your game** to **Settings → Device Care → Memory → Excluded apps**, keep **RAM Plus OFF** on 8 GB phones, and enable **Game Booster → Pause USB PD charging** with a 25W+ PPS charger for `2–4°C` cooler streams.
+  - **Xiaomi / POCO / Vivo / iQOO / OnePlus / Realme:** Disable battery restrictions, enable Autostart/Background Activity, and lock SolStream in Recents.
+2. **Enable Assistive Broadcast Dock:**
+  - **Play Store install:** Card 1 → **`3. Tap Accessibility 1st`** → Accept disclosure → switch **SolStream Studio ON**.
+  - **Sideloaded GitHub APK (Android 13–18):** Tap greyed-out **SolStream Studio** once & OK → Card 1 **`4. Unlock Restricted (⋮)`** → tap **`⋮`** (or bottom of App Info on Xiaomi/POCO/Vivo) → **Allow restricted settings** → switch **ON**.
 
-1. **Prevent 3-Hour Background OS Kills (Important on 8 GB Phones!):**
-  - **All Android Phones:** Tap **`Protect`** on the top **Long-Stream Protection** banner (or Step 2 in Card 1) → **Battery** → select **`Unrestricted`**. Once set, the banner turns green (`Protected ✓`).
-  - **Samsung One UI (`Galaxy S24 FE`, S23/S24/S25, A-Series, etc.):**
-    1. Open **Settings → Device Care → Memory → Excluded apps** → tap **`+`** and add **both `SolStream Studio` and your game (e.g., `Call of Duty`)** permanently. *(This stops Samsung's automatic RAM cleaner from killing SolStream during 3+ hour streams and costs zero battery when idle.)*
-    2. On 8 GB phones, open **Settings → Device Care → Memory → RAM Plus** → toggle **OFF** and restart once to prevent background flash-swap hitches mid-match.
-    3. If using a 25W+ USB-PD PPS charger, enable **Game Booster → Pause USB PD charging when gaming** for `2–4°C` cooler sessions.
-  - **Xiaomi / Redmi / POCO (HyperOS / MIUI):** Set Battery Saver to **No restrictions**, enable **Autostart**, and **lock SolStream Studio in Recents**.
-  - **OnePlus / Oppo / Realme / Vivo / iQOO:** Allow **Background Activity / High Background Power Consumption**, lock SolStream in Recents, and on Vivo/iQOO keep **Game Frame Interpolation OFF** (use Native 90/120 FPS).
-2. **Enable Assistive Broadcast Dock (Google Play Store & Sideloaded APK):**
-  - **Play Store install:** Tap **`3. Tap Accessibility 1st`** in Card 1 → tap **Accept & Open Settings** → switch **SolStream Studio** **ON** in 1 tap.
-  - **Sideloaded GitHub APK (Android 13–18):**
-    1. Tap **`3. Tap Accessibility 1st`** → *Installed apps* → tap greyed-out **SolStream Studio** once and tap **OK**.
-    2. Return and tap **`4. Unlock Restricted (⋮)`** → tap **`⋮`** at top-right (or **scroll to the bottom of App Info on Xiaomi/POCO/Vivo**) → tap **Allow restricted settings**.
-    3. Return to Accessibility and switch **SolStream Studio** **ON**. Once all 4 checks are `READY`, Card 1 auto-collapses cleanly.
-3. **Earphones & External Mics (`Auto` 12-Mode Matrix):**
-  - **Bluetooth Neckbands & Earbuds (`realme Buds Wireless 5 ANC`, etc.):** Keep `Mic Input` on **`Auto (Phone Studio Mic Locked)`**. Your Bluetooth earphones stay in `100%` HD Stereo (`A2DP`) for footsteps while SolStream captures your phone's `48 kHz` studio mic (`PHONE_STUDIO` mode) with hardware Speaker AEC strictly disabled.
-  - **Wired `3.5mm` & `USB-C` Mics:** Plugging in a wired or USB-C mic automatically switches `SolLuxe™ 3.0 Pure` to **`WIRED_USB_CLOSE`** mode (`+5 Hz` HPF shield, lighter chest boost, deeper `280–355 Hz` proximity mud cleanup).
-
----
-
-### Step B: Pre-Stream Dashboard (Top-to-Bottom Guide)
-
-#### Fixed Obsidian-Glass Header & 3-Tile Hero Summary Bar
-- **Pinned Header:** Full-bleed **Solar Eclipse `'S'`** icon + `SolStream Studio (SolApex™ HyperStream • v1.4.0)` + 3 glanceable live chips (**Audio Preset**, **Res/FPS/Codec**, and **Protected ✓**) + visual **📖 User Guide & Privacy**, `Copy Preset`, and `Import Preset` (with Smart Cross-Phone Hardware Clamping).
-- **Live Protect Long Streams Banner & Telemetry Banner:** Monitors battery-unrestricted status in real time alongside live pre-stream `Idle Temp °C`, `SoC Load %`, `Free RAM GB`, and power state.
-- **3-Tile Hero Summary Bar:** Tap **`[ 🎥 1440p (2K) ]`**, **`[ ⚡ 60 FPS ]`**, or **`[ 📡 20 Mbps ]`** directly at the top anytime.
-
-#### Card 0 — Smart Device Tier Presets (`Lite` | `Balanced` | `High` | `Flagship` | `Ultra`)
-- Configures optimal resolution, FPS, bitrate, and `SOL_LUXE` 6-stage studio audio for your device while respecting your selected Platform (`YouTube` vs `Twitch 6M` vs `Kick 8M`) and preserving explicit manual HPF overrides (`hpfAutoMode = false`).
-
-#### Card 1 — Pre-Flight Readiness & Setup
-- Auto-collapses once all 4 checks are `READY`, shows live Audio Route + Media Volume + `5 GHz Wi-Fi + BT` coexistence status, and provides the **All-Brand Anti-Kill & Setup Guide**.
-
-#### Card 2 — Stream Key Vault & Simulcast (`SolRelay Omega™`)
-- **4-Pill Platform Bar (`YouTube` | `Twitch` | `Kick` | `Custom`):** Auto-configures official ingest URLs and platform caps (`1080p60 H.264 6M 160k` on Twitch; `8M` on Kick).
-- **Hardware Keystore Vault & Smart Paste Guard:** AES-256-GCM encrypted locally, auto-saved in `onPause()`, strips invisible whitespace, and routes accidental URL pastes into the server box.
-- **Collapsible Simulcast & 9:16 Shorts Drawer + 5-Metric Network Analyzer:** Tests Download Mbps, Sustained Upload Mbps, Ingest TCP RTT & Jitter, Loaded Router Bufferbloat, and Platform-Aware Safe Bitrate.
-
-#### Card 3 — Video Engine (`SolCore Ultra™` — `360p–4K60` • `0.5–100M`)
-- **Direct-Tap Segmented Pill Rows:** Resolution (`360p`–`4K`), Hardware Codec (`HEVC` / `H.264` / `AV1`), Frame Rate (`30` / `60 FPS`), and Framing (`FIT` / `STRETCH 16:9` / `SMART` / `FILL`).
-- **Stackable Visual Filters & Collapsible Scene/Logo/Privacy Drawer:** `Cinematic Filmic`, `AMOLED Vivid Pop`, `Adaptive Dark-Corner Boost`, `Color Temp`, `GPU Crisp Sharpen`, unified **`Logo:OFF → FULL → TL → TR → BL → BR`** `.PNG` overlay control, live GPU text banner, `Auto-Blur Keyboard`, and 8 HUD blur zones.
-
-#### Card 4 — `SolLuxe™ 3.0 Pure` Voice Studio & 3D Game Audio
-- **1-Tap Gender Profile (`Neutral 68Hz` | `Male 55Hz` | `Female 85Hz`):** Auto-matches HPF, Condenser EQ pockets, gender-scaled Leveler sidechain (`110/140/180 Hz`), and De-Esser center (`6.2/6.7/7.2 kHz`) while preserving explicit manual HPF choices.
-- **6 Voice Presets:** `SOL_LUXE` (Pure Condenser), `RADIO STUDIO` (Punchy Cut-Through), `VELVET` (Warm Natural), `CLEAN` (Transparent Natural), `NEURAL` (C RNNoise Pure), and `RAW` (Dry Mic Bypass).
-- **SeekBar Volume Sliders (`−10% / +10%`):** Adjust Post-DSP Mic Boost (`50%–250%`) and Internal Stereo Game Mix (`0%–250%`), plus stackable `Cinema 3D Wide`, `Theater Sub-Punch`, `Footstep Focus`, `Blast Tamer`, and the **10-Second Studio Voice Test & Auto-Advisor**.
-
-#### Card 5 — Launch Broadcast, Clips & Reports (`Launch Deck`)
-- **`GO LIVE — START STREAM` ↔ `⏹ STOP LIVE STREAM`** (with 2-tap stop confirmation), **`Session Reports & History`** (highlights `⚡ Recovered 60s` if a previous stream was cut by the OS), **`★ Saved Clips & AI Highlights`**, **`Benchmark Other App`**, **`Refresh Mics / HW Scan`**, **`Check GitHub Update`**, and **`❤️ Subscribe to @Sol_CODM`**.
-
----
+### Step B: Pre-Stream Dashboard (Cards 0–5)
+- **Fixed Obsidian-Glass Header & 3-Tile Hero Bar:** Full-bleed **Solar Eclipse `'S'`** icon, 3 live studio chips (`SolLuxe 3.0` • `1440p60 • HEVC` • `Protected ✓`), visual **📖 User Guide**, `Copy/Import Preset`, **Long-Stream Protection** banner, and direct-tap `[ 🎥 Resolution ] [ ⚡ FPS ] [ 📡 Bitrate ]` tiles.
+- **Card 0 — Smart Device Tier Presets (`Lite` | `Balanced` | `High` | `Flagship` | `Ultra`):** Syncs codec, resolution, bitrate, and voice HPF to your device tier and platform.
+- **Card 1 — Pre-Flight Readiness:** Auto-collapses once all 4 checks are `READY`; shows live audio route and `5 GHz Wi-Fi + BT` coexistence status.
+- **Card 2 — Studio Profiles, Key Vault & Simulcast (`SolRelay Omega™`):**
+  - **4 One-Tap Studio Profiles (`Wi-Fi Max` | `Mobile Data` | `Shorts 9:16` | `Custom`):** Tap to apply hardware-clamped settings instantly; long-press any slot to save & rename your current setup or reset to default (Stream Keys are never saved inside profiles).
+  - **4-Pill Platform Bar (`YouTube` | `Twitch` | `Kick` | `Custom`), AES-256 Hardware Keystore Vault, Collapsible Simulcast & 9:16 Shorts Drawer, and 5-Metric Network Analyzer.**
+- **Card 3 — Video Engine (`SolCore Ultra™` — `360p–4K60` • `0.5–100M`):**
+  - Direct-tap Resolution, Codec, FPS, and Framing (`FIT` / `STRETCH 16:9` / `SMART` / `FILL`) pills + stackable GPU filters.
+  - **Collapsible Pro Overlays, Scenes & `SolCodec™` Drawer:** Configure **`SolHUD™`** (toggle + corner), **Offline Corner QR** (UPI/YouTube/Discord link + corner), **Zero-Camera 2-PNG PNGTuber** (pick Idle/Talk PNGs or use built-in Cyber Visor fallback + corner + `12–30%` size), custom Scenes/Logo/Text Banner, Dual Privacy Blur (`Minimap` + `Auto-Blur Keyboard`), and silicon controls (`OpenGL ES 3.0`, `HDR10`, `ROI`, `Keyframe/B-Frames/QP`).
+- **Card 4 — `SolLuxe™ 3.0 Pure` Voice Studio & 3D Game Audio:**
+  - 1-Tap Gender Profile (`Neutral 68Hz` | `Male 55Hz` | `Female 85Hz`), 6 Voice Presets (`SOL_LUXE`, `RADIO STUDIO`, `VELVET`, `CLEAN`, `NEURAL`, `RAW`), SeekBar volume sliders (`Mic 50–250%`, `Game 0–250%`), stackable 3D Game Soundstage, collapsible 6-Stage toggles, and **10-Second Studio Voice Test & Auto-Advisor**.
+- **Card 5 — Launch Deck:** `GO LIVE` / 2-tap `STOP`, `Session Reports & History` (with `⚡ Recovered 60s` indicator), `★ Saved Clips & AI Highlights`, `Benchmark Other App`, `Refresh Mics / HW Scan`, and `Check GitHub Update`.
 
 ### Step C: In-Game 3-Tab Floating Pill & Safe Notification Shade
-
-- **Short Closed Pill:** Displays **`● 05:36 | 17.6M | 60fps | Mic:ON | 38.4°C`** (sleeps at `38%` opacity, `0 Hz` idle redraws, `FLAG_SPLIT_TOUCH`).
-- **Expanded 3-Tab Pill (Zero-Truncation Quick Bar):**
-  - **Top Quick Bar:** `[ Mic:ON ] [ Game:ON ] [ LIVE ] [ ★ Clip ] [ ✕ ]` (fixed-width `✕` prevents any text cut-off on narrow screens).
-  - **Tab 1 (`🎙️ Audio`):** Voice Profile, Preset, Denoiser Mode/Level, Auto/Manual HPF, EQ/De-Ess/Warm/AGC toggles, Mic/Game volume steps, 3D Soundstage, and Mic Hardware switcher.
-  - **Tab 2 (`🎬 Video`):** Scene, Framing, Zoom, Upscaler, Sharpen, 180° Flip, Stackable Color Filters, unified **`Logo:OFF → FULL → TL → TR → BL → BR`** button, Banner, Minimap Blur, and Keyboard Blur.
-  - **Tab 3 (`📡 Bitrate/Net`):** Live Bitrate steps, ABR toggle, `30FPS Cool`, Stream/Game FPS, Queue/RTT, live **`🔥 Heat: App ~CPU | Game+OS ~SoC`** & **`💾 RAM: App MB | Game+OS GB`**, target status, and 2-tap **`⏹ Stop Stream`**.
-- **Safe Notification Bar (3 Actions Only):** Displays **`Mute Mic`**, **`Scene/BRB`**, and **`★ Clip`** — `Stop` is intentionally omitted from the notification shade so swiping notifications never ends a marathon stream accidentally.
+- **Top Quick Bar:** `[ Mic:ON ] [ Game:ON ] [ LIVE ] [ ★ Clip ] [ ✕ ]`
+- **Tab 1 (`🎙️ Audio`):** Full live `SolLuxe™ 3.0 Pure` controls, volume steps, 3D Soundstage, and Mic switcher.
+- **Tab 2 (`🎬 Video`):** Scene, Framing, Zoom, Upscaler, Sharpen, 180° Flip, Stackable Color Filters, unified `Logo:OFF` cycler, Banner, **`📸 Shot` (1-Tap Clean Thumbnail)**, **`HUD:OFF`**, **`QR:OFF`**, **`Avatar:OFF`**, Minimap Blur, and Keyboard Blur.
+- **Tab 3 (`📡 Bitrate/Net`):** Live Bitrate steps, ABR toggle, `30FPS Cool` (with `SEVERE` live-temp toast protection), Stream/Game FPS, Queue/RTT, live **App vs. Game Heat/CPU & RAM Split**, target status, and 2-tap `⏹ Stop Stream`.
+- **Safe Notification Bar (3 Actions Only):** `Mute Mic`, `Scene/BRB`, and `★ Clip` (no accidental Stop in shade).
 
 ---
 
-## 6. Global Broadcast Inspirations (Windows, macOS & iOS -> Android)
-
-| SolStream Studio Ultra `v1.4.0` Feature | Original Inspiration | How We Engineered It Safely for Unrooted Android |
-|---|---|---|
-| **6-Stage `SolLuxe™ 3.0 Pure` Condenser Chain** | Shure SM7B, Neumann U87, Neve 1073 & FabFilter Pro-C2 / Pro-DS | Non-overlapping 64-bit EQ pockets (`95/130/172 Hz` warmth, `315–365 Hz` mud cut, `920 Hz` dip, `4.5–5.1 kHz` sheen, `8.5/9.0 kHz` air shelf), `<0.6 ms` raised-cosine impulse clamper, `8 ms / 220 ms` Hybrid VAD expander, gender-sidechain soft-knee leveler, and post-comp sibilance-ratio de-esser. |
-| **Phase-Safe `62 Hz` Sub-Punch + `250 Hz + 2.45 kHz` Footsteps + `4×` Limiter** | Dolby Atmos Gaming & FabFilter Pro-L2 | Boosts `62 Hz` game sub-bass (`+3.0 dB`) when silent and ducks to `0.0 dB` neutral during speech, lifts `250 Hz` indoor thuds + `2,450 Hz` crunch, and protects `250%` game mix through a 64-sample look-ahead `4×` Catmull-Rom True-Peak Limiter (`-1.16 dBTP`). |
-| **`SolCore Ultra™` ES 3.0 `Fast-FP16` + Gated Neighbor Shader + `Surface.setFrameRate()`** | Desktop OBS Studio + AMD CAS + Android 11–18 SurfaceFlinger | Uses `mediump` FP16 registers, gates cardinal neighbor fetches (`14.74M` fewer reads/frame when Sharpen/Shadow Boost are OFF), paces capture in hardware, and preserves steady 2-second CFR keyframes. |
-| **Adaptive `64 KB / 4 KB` RTMP Chunking + $\mu\text{s} \rightarrow \text{ms}$ RTT Bridge + `Wi-Fi ↔ 5G` Failover** | OBS RTMP Tuning + IRL Pro / Cloudflare Speed | Converts Pedro `getRtt()` microseconds to true milliseconds, disables false ICMP disconnects (`setCheckServerAlive(false)`), adapts write chunk size to network & destination, and switches `Wi-Fi ↔ 5G` in `0.3s`. |
-
----
-
-## 7. For Android Developers & Engineers: Architecture, 6-Stage `SolLuxe™ 3.0 Pure` & Build Spec
+## 6. For Android Developers & Engineers: Architecture, 6-Stage `SolLuxe™ 3.0 Pure` & Build Spec
 
 ### Validated Cloud Build Toolchain (`build.yml` + `app/build.gradle.kts`)
-- **JDK, Gradle & Pinned NDK:** Temurin `21` (`JavaVersion.VERSION_17` target) + Gradle `8.14` + AGP `8.13.2` (with R8 `9.5.26` for Kotlin `2.4.20`) + `compileSdk = 37`, `targetSdk = 36`, `minSdk = 29`, `versionCode = 11`, `versionName = "1.4.0"` + **Pinned Android NDK `28.2.13676358`** (`CMake 3.22.1`, `-DANDROID_STL=none`, `-O3 -std=gnu11 -Wno-null-dereference`, `ndk.debugSymbolLevel = "SYMBOL_TABLE"`).
-- **Cryptographic Source Pinning, 16 KB `zipalign` + ELF Alignment & 38-Test JUnit Suite:** Fetches and verifies exact Xiph `RNNoise v0.1.1` commit **`6cbfd53eb348a8d394e0757b4025c6ded34eb2b6`**, enforces `-Wl,-z,max-page-size=16384` + `useLegacyPackaging = false`, verifies **`zipalign -c -P 16 -v 4`** on the signed Release APK alongside `readelf -lW` across all `arm64-v8a` and `x86_64` `.so` libraries and `apksigner` V3 checks, runs strict Android Lint (`abortOnError = true`) and fresh un-cached execution (`--rerun-tasks`) of all **38 JUnit 4 unit tests** (`SolStreamUnitTests.kt`), and uploads both `SolStream-Studio-v1.4.0.apk` and `SolStream-Studio-v1.4.0-PlayStore.aab`.
+- **JDK, Gradle & Pinned NDK:** Temurin `21` (`JavaVersion.VERSION_17` target) + Gradle `8.14` + AGP `8.13.2` (R8 `9.5.26` for Kotlin `2.4.20`) + `compileSdk = 37`, `targetSdk = 36`, `minSdk = 29`, `versionCode = 12`, `versionName = "1.5.0"` + **Pinned Android NDK `28.2.13676358`** (`CMake 3.22.1`, `-DANDROID_STL=none`, `ndk.debugSymbolLevel = "SYMBOL_TABLE"`).
+- **CI Verification:** Fetches and verifies exact Xiph `RNNoise v0.1.1` commit **`6cbfd53eb348a8d394e0757b4025c6ded34eb2b6`**, verifies **`zipalign -c -P 16 -v 4`**, `readelf -lW` `16 KB` ELF alignment across `arm64-v8a` and `x86_64`, `apksigner` V3 checks, strict Android Lint (`abortOnError = true`), and fresh un-cached execution (`--rerun-tasks`) of all **48 JUnit 4 unit tests** (`SolStreamUnitTests.kt`).
 
 ### The 6-Stage `SolLuxe™ 3.0 Pure` Vocal Architecture (`MicDspProcessor.kt`)
 
 | Stage | Module Name | Exact Technical Specification (`48,000 Hz`, 64-Bit `Biquad64`, Atomic Frame-Boundary Config) |
 |---|---|---|
-| **Stage 1** | **64-Bit Butterworth HPF** | 2nd-order `Q = 0.707`: **`55 Hz` (`MALE`)**, **`68 Hz` (`NEUTRAL`)**, **`85 Hz` (`FEMALE`)** (`+5 Hz` `WIRED_USB_CLOSE`, `+10 Hz` `BLUETOOTH_SCO`, `+15 Hz` `SPEAKER_AEC`). Explicit manual Hz cutoffs (`hpfAutoMode = false`) are never overwritten by preset or profile switches. |
-| **Stage 2** | **Raised-Cosine Micro-Impulse Clamper** | Tracks local `20 ms` RMS (`960 samples`). Triggers only on sub-millisecond spikes `<0.6 ms` ($\le 29$ samples) exceeding **`3.8×`** local RMS; clamps cleanly and recovers via a smooth **`2.0 ms` (`96-sample`)** raised-cosine ramp so `10–30 ms` `"P/T/K"` consonants stay crisp. |
-| **Stage 3** | **Native C `RNNoise` + Hybrid `16 kHz`-Safe Neural-VAD Expander** | Stack-allocated `GetFloatArrayRegion` JNI (`480 samples`, `480-sample` dry delay, hardware `FZ` guards; `65% / 88% / 100%` true `1.00f` wet). Hybrid trigger opens on `vadProb >= 0.35f` OR `200–2500 Hz` RMS `>= +6 dB` (`2.0×`) above adaptive floor. Smooth **`8.0 ms` attack**, **`220 ms` release**, **`140 ms` hold**, soft **`-14 dB` (`0.20×`)** floor (`-18 dB` / `0.126×` speakerphone + double-talk-safe bleed ducking). |
-| **Stage 4** | **Split-Band Dynamic Plosive Guard** | Causal 2-stage `<115 Hz` low-pass monitor vs. `420 Hz (Q = 1.05)` vocal-core detector. Ducks **only** the `<115 Hz` band by up to `-9 dB` when wind-to-vocal ratio exceeds `2.5×`, passing deep vocal fundamentals untouched before Stage 5. |
-| **Stage 5** | **4-Gear × 3-Gender Condenser EQ + Low-Band Analog Warmth Shaper** | Strictly non-overlapping `Biquad64` pockets: Chest Warmth (`95/130/172 Hz`, `Q=0.85` M/N, `Q=1.0` F), Surgical Mud Cut (`315/340/365 Hz`, `Q=2.0`), Anti-Nasal (`920 Hz`, `Q=1.8`), Neve Silk Presence (`4.5/4.8/5.1 kHz`, `Q=1.15`; or `2.9/3.2/3.5 kHz @ +1.6 dB` in `RADIO STUDIO`), and Clean Air Shelf (`8.5/9.0 kHz`, `Q=0.707`; or real `5.2 kHz` 2nd-order Butterworth LPF on `BLUETOOTH_SCO`). Low-band cubic analog warmth (`0.09 / 0.08 / 0.06f`; `tube2fDrive = 0.0f` on Neutral & Female). |
-| **Stage 6** | **VAD-Synced Soft-Knee Leveler + Dynamic De-Esser + `4×` True-Peak Limiter** | **Leveler:** Gender-matched HPF sidechain (`110/140/180 Hz`), `10 ms` attack / `130 ms` release, single continuous `6 dB` soft-knee curve (`2.5:1` default / `3.2:1` Radio / `2.0:1` Velvet above `-16 dBFS`) + up to `+3.5 dB` quiet-speech lift (`-38..-22 dBFS`) scaled by continuous `vadProb` ramp (`0.25 → 0.55`) × smoothed expander gain + speech-synced slow AGC.<br>**De-Esser:** Post-EQ/Post-Comp dynamic `6.2 / 6.7 / 7.2 kHz` (`Q=2.0`, max `-4.5 dB`) sibilance-to-vowel ratio check.<br>**Output:** Post-DSP Mic Boost (`50–250%`) → zero-allocation **`4×` Catmull-Rom Inter-Sample True-Peak Limiter at `-1.16 dBTP` (`0.875`)** + `4.5 ms` Low-End CPU Auto-Bypass watchdog. |
+| **Stage 1** | **64-Bit Butterworth HPF** | 2nd-order `Q = 0.707`: **`55 Hz` (`MALE`)**, **`68 Hz` (`NEUTRAL`)**, **`85 Hz` (`FEMALE`)** (`+5 Hz` `WIRED_USB_CLOSE`, `+10 Hz` `BLUETOOTH_SCO`, `+15 Hz` `SPEAKER_AEC`). Explicit manual Hz cutoffs (`hpfAutoMode = false`) are never overwritten. |
+| **Stage 2** | **Raised-Cosine Micro-Impulse Clamper** | Tracks `20 ms` RMS; clamps only `<0.6 ms` spikes exceeding `3.8×` local RMS and recovers via a `2.0 ms` raised-cosine ramp so `10–30 ms` consonants stay crisp. |
+| **Stage 3** | **Native C `RNNoise` + Hybrid `16 kHz`-Safe Neural-VAD Expander** | Stack-allocated `GetFloatArrayRegion` JNI (`480 samples`, `480-sample` dry delay, hardware `FZ` guards; `65% / 88% / 100%` wet). Hybrid trigger (`vadProb >= 0.35f` OR `200–2500 Hz` RMS `>= +6 dB` above floor), smooth `8.0 ms` attack / `220 ms` release, `-14 dB` floor (`-18 dB` speakerphone). |
+| **Stage 4** | **Split-Band Dynamic Plosive Guard** | Causal `<115 Hz` monitor vs. `420 Hz (Q = 1.05)` vocal core; ducks only `<115 Hz` wind blasts up to `-9 dB`. |
+| **Stage 5** | **4-Gear × 3-Gender Condenser EQ + Low-Band Analog Warmth** | Non-overlapping `Biquad64` pockets: Chest (`95/130/172 Hz`), Mud Cut (`315/340/365 Hz`), Anti-Nasal (`920 Hz`), Silk Presence (`4.5/4.8/5.1 kHz`; or `2.9/3.2/3.5 kHz` in `RADIO STUDIO`), Air Shelf (`8.5/9.0 kHz`; or `5.2 kHz` LPF on `BLUETOOTH_SCO`), plus clean low-band analog warmth (`0.09 / 0.08 / 0.06f`). |
+| **Stage 6** | **VAD-Synced Soft-Knee Leveler + Dynamic De-Esser + `4×` True-Peak Limiter** | Gender-matched HPF sidechain (`110/140/180 Hz`), `10 ms / 130 ms`, `6 dB` soft knee (`2.5:1` / `3.2:1` / `2.0:1`), VAD-synced quiet-speech lift + slow AGC, dynamic `6.2/6.7/7.2 kHz` De-Esser, Post-DSP Mic Boost (`50–250%`), and `4×` Catmull-Rom Inter-Sample True-Peak Limiter at **`-1.16 dBTP` (`0.875`)**. |
 
 ### Source Tree
 
 ~~~text
 .
-├── PRIVACY_POLICY.md                        # Public Google Play Console Privacy Policy & Data Safety Disclosure
-├── README.md                                # Complete v1.4.0 User Manual & Engineering Reference
+├── PRIVACY_POLICY.md                        # Public Google Play Console Privacy Policy, Data Deletion & Accessibility Disclosure
+├── README.md                                # Complete v1.5.0 User Manual & Engineering Reference
 ├── .github/workflows/build.yml              # Pinned NDK 28.2.13676358, Pinned RNNoise Commit, 16KB zipalign + ELF CI
 └── app/
-    ├── build.gradle.kts                     # v1.4.0 (versionCode 11) + Pinned NDK + SYMBOL_TABLE + 16 KB JNI packaging
+    ├── build.gradle.kts                     # v1.5.0 (versionCode 12) + Pinned NDK + SYMBOL_TABLE + 16 KB JNI packaging
     ├── proguard-rules.pro                   # Explicit R8 @Keep rules for JNI, RNNoise, RootEncoder & Services
     └── src/
         ├── main/
-        │   ├── AndroidManifest.xml          # Play-Store-clean permissions (zero REQUEST_IGNORE_BATTERY_OPTIMIZATIONS)
+        │   ├── AndroidManifest.xml          # Play-Store-clean permissions (zero battery/camera/storage/overlay bloat)
         │   ├── cpp/
         │   │   ├── CMakeLists.txt           # 16 KB page-aligned C build for Xiph RNNoise v0.1.1 + Bark-MMSE fallback
         │   │   └── sol_rnnoise_jni.c        # Zero-allocation stack JNI bridge + ARM/x86 FZ register guards + dry delay
@@ -206,20 +157,22 @@ Most Android streaming apps hurt competitive gaming in at least one way: they bu
         │   │   ├── drawable/ic_solstream_logo.xml # Full-bleed Solar Eclipse 'S' Adaptive Vector Icon
         │   │   ├── drawable/ic_stat_stream.xml    # Monochrome notification status icon
         │   │   ├── values/strings.xml & styles.xml # Play Store Accessibility disclosure & Obsidian-Glass #050A14 Theme
-        │   │   └── xml/accessibility_service_config.xml # canRetrieveWindowContent="false" & canPerformGestures="false"
+        │   │   └── xml/accessibility_service_config.xml # isAccessibilityTool="false", canRetrieveWindowContent="false"
         │   └── java/com/solgaming/solstreamstudio/
-        │       ├── MainActivity.kt          # Obsidian-Glass UI, Protect Long Streams Banner, Visual Card Guide, 660dp Responsive
-        │       ├── SolStreamService.kt      # Adaptive 64KB/4KB Chunking, setCheckServerAlive(false), AuxRtmpCallback, 60s Checkpoint, Pill
-        │       ├── SolVideoPipeline.kt      # OpenGL ES 3.0 Fast-FP16, Gated Fetches, Eligible Companion Codec Selector, Dual Blur
-        │       ├── SolSceneAssetStore.kt    # Atomic staging-file Starting Soon, BRB, .PNG Overlay & auto-fit GPU Text Banner
-        │       ├── SolDualAudioEngine.kt    # AudioWorkerBarrier, 4-Tier PCM16/Resampler Fallback, Headphone-Aware AEC, 3D Game Bus
+        │       ├── MainActivity.kt          # Obsidian-Glass UI, 4 Studio Profiles, SolHUD/QR/PNGTuber UI, Visual Guide
+        │       ├── SolStreamService.kt      # Adaptive Chunking, Severe Toast Guard, Live Avatar Sync, 60s Checkpoint, Pill
+        │       ├── SolVideoPipeline.kt      # ES 3.0 Fast-FP16, SolHUD/QR/PNGTuber Compositor, Offscreen FBO Clean Screenshot
+        │       ├── SolSceneAssetStore.kt    # Thread-safe Atomic Asset Store + Built-In Cyber Visor Avatar Generator
+        │       ├── SolDualAudioEngine.kt    # AudioWorkerBarrier, 4-Tier PCM16/Resampler Fallback, Headphone-Aware AEC
         │       ├── MicDspProcessor.kt       # SolLuxe™ 3.0 Pure 6-Stage Engine, Atomic DspConfigSnapshot, 4x True-Peak Limiter
         │       ├── SolNativeRnnoise.kt      # Safe Kotlin JNI wrapper for libsol_rnnoise.so
         │       ├── CodecCapabilityProbe.kt  # eligibleCompanionEncoders(), 5000ms Scan Gate, Global SoC/GPU Mapper
-        │       ├── KeystoreVault.kt         # Non-Destructive AES-256-GCM Vault, hpfAutoMode Schema v4, Cross-Phone Clamping
-        │       └── DiagnosticsLogger.kt     # Privacy-redacted v1.4.0 Reports, Single-Slot 60s Live Checkpoint & ★ Saved Clips
+        │       ├── KeystoreVault.kt         # Non-Destructive AES-256-GCM Vault, Schema v5, 4 Studio Profiles, Clamping
+        │       ├── DiagnosticsLogger.kt     # Frozen Post-Stop v1.5.0 Reports, Single-Slot 60s Checkpoint & ★ Saved Clips
+        │       └── recorder/
+        │           └── SolHudAndQrRenderer.kt # Pure-Kotlin ISO QR (V1–10 M), Zero-GC SolHUD, Corner MVP & MediaStore Saver
         └── test/java/com/solgaming/solstreamstudio/
-            └── SolStreamUnitTests.kt        # 38-test JUnit 4 verification suite (all 12 audio combos, barrier, chunking, codecs)
+            └── SolStreamUnitTests.kt        # 48-test JUnit 4 verification suite (DSP, QR, MVP, FBO, Profiles, Thermal, RTMP)
 ~~~
 
 ### Build & Release Verification Command
@@ -230,22 +183,22 @@ gradle testDebugUnitTest lintDebug assembleDebug assembleRelease bundleRelease -
 
 ---
 
-## 8. For AI Coding Assistants, Security Auditors & Forkers
+## 7. For AI Coding Assistants, Security Auditors & Forkers
 
 ### Strict Architectural Invariants for AI Assistants / PR Contributors
-1. **NEVER** promote `SolStreamService` to `FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION` before `Activity.RESULT_OK` from `MediaProjectionManager.createScreenCaptureIntent()`, **ALWAYS** call `startForeground()` before any early return in `startLiveBroadcast()`, **ALWAYS** await `activeTeardownLatch` off the main thread with an explicit timeout abort, and **ALWAYS** call `DiagnosticsLogger.lockFinalMicStatusBeforeStop()` + `videoPipeline.prepareForImmediateStop()` synchronously before async teardown.
-2. **NEVER** mutate `Biquad64` coefficients from the UI thread (`MainActivity` / Floating Pill)—publish an immutable `DspConfigSnapshot` atomically and apply filter updates strictly on the audio thread at `10 ms` frame boundaries.
-3. **NEVER** enable `setCheckServerAlive(true)` on Pedro's `RtmpClient` (ICMP probe causes false firewall disconnects), **NEVER** release shared audio engine resources until `AudioWorkerBarrier` confirms both `SolFloatAudioMixer` and `SolAacDrain` have exited, and **NEVER** allow `VOICE_COMMUNICATION` / hardware `AcousticEchoCanceler` when headphones are connected (`computeEffectiveSpeakerAec`).
-4. **NEVER** open test `MediaCodec` encoder instances inside `CodecCapabilityProbe.scanDevice()` while `SolStreamService.isBroadcastLive || CodecCapabilityProbe.isBroadcastStartingOrLive`, **NEVER** poll `PowerManager.getThermalHeadroom()` faster than once every `10.5 seconds`, and **NEVER** resize `VirtualDisplay` to portrait dimensions during a `16:9` landscape stream.
-5. **NEVER** re-introduce `REQUEST_IGNORE_BATTERY_OPTIMIZATIONS`, `CAMERA`, `READ/WRITE_EXTERNAL_STORAGE`, `READ_MEDIA_IMAGES`, `ACCESS_FINE_LOCATION`, `SYSTEM_ALERT_WINDOW`, `AudioManager.setCommunicationDevice()`, `-ffast-math` in `CMakeLists.txt`, or CPU software video encoders (`c2.android.av1.encoder`).
+1. **NEVER** promote `SolStreamService` to `FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION` before `Activity.RESULT_OK`, **ALWAYS** call `startForeground()` before any early return in `startLiveBroadcast()`, **ALWAYS** await `activeTeardownLatch` off the main thread (`5s` timeout), and **ALWAYS** call `DiagnosticsLogger.lockFinalMicStatusBeforeStop()` + `videoPipeline.prepareForImmediateStop()` before async teardown.
+2. **NEVER** call `glReadPixels()` directly on a `MediaCodec` `InputSurface` (use a temporary offscreen RGBA8 FBO and restore `glBindFramebuffer(0)` + `glViewport` in `finally`), and **NEVER** allocate new `Bitmap` objects per frame inside the OpenGL loop (`SolHUD™` must reuse its scratch bitmap via `glTexSubImage2D`).
+3. **NEVER** mutate `Biquad64` coefficients from the UI thread—publish an immutable `DspConfigSnapshot` atomically at `10 ms` frame boundaries.
+4. **NEVER** enable `setCheckServerAlive(true)`, **NEVER** release audio resources before `AudioWorkerBarrier` confirms both workers exited, and **NEVER** allow `VOICE_COMMUNICATION` / hardware AEC when headphones are connected.
+5. **NEVER** re-introduce `REQUEST_IGNORE_BATTERY_OPTIMIZATIONS`, `CAMERA`, `READ/WRITE_EXTERNAL_STORAGE`, `READ_MEDIA_IMAGES`, `ACCESS_FINE_LOCATION`, `SYSTEM_ALERT_WINDOW` (prior to Phase 2 Offline Recorder), `AudioManager.setCommunicationDevice()`, `-ffast-math`, or CPU software video encoders.
 
 ---
 
-## 9. Privacy Policy, Google Play Compliance & Open-Source Licenses
+## 8. Privacy Policy, Google Play Compliance & Open-Source Licenses
 
-- **Privacy Policy & Zero Data Collection:** See [**`PRIVACY_POLICY.md`**](./PRIVACY_POLICY.md) for our full Google Play Store Privacy Policy and `AccessibilityService` disclosure (`android:canRetrieveWindowContent="false"`, `android:canPerformGestures="false"`, zero personal data collection, zero analytics/ad SDKs).
+- **Privacy Policy & Zero Data Collection:** See [**`PRIVACY_POLICY.md`**](./PRIVACY_POLICY.md) for our full Google Play Store Privacy Policy, Data Deletion controls, and `AccessibilityService` disclosure (`isAccessibilityTool="false"`, `canRetrieveWindowContent="false"`, `canPerformGestures="false"`).
 - **Created & Maintained By:** **Sol Studio (`@Sol_CODM`)** — [YouTube Channel](https://youtube.com/@Sol_CODM)
 - **Dual Licensed:**
   - **Free for Gamers, Streamers & Personal/Academic Use:** Licensed under the **[PolyForm Noncommercial License 1.0.0](./LICENSE)**.
   - **Commercial Redistribution & App-Store Monetization:** Selling, bundling ads/subscriptions into, or publishing commercial copies of SolStream Studio on app stores requires a written commercial revenue-share license under **[COMMERCIAL-LICENSE.md](./COMMERCIAL-LICENSE.md)**.
-- **Open-Source Credits:** Encrypted RTMPS socket packet transport uses `RtmpClient` from [`pedroSG94/RootEncoder`](https://github.com/pedroSG94/RootEncoder) (`Apache-2.0`, zero root access required) and neural voice denoising uses [`xiph/rnnoise`](https://github.com/xiph/rnnoise) (`BSD-3-Clause`).
+- **Open-Source Credits:** Encrypted RTMPS transport uses `RtmpClient` from [`pedroSG94/RootEncoder`](https://github.com/pedroSG94/RootEncoder) (`Apache-2.0`) and neural voice denoising uses [`xiph/rnnoise`](https://github.com/xiph/rnnoise) (`BSD-3-Clause`).
