@@ -16,6 +16,7 @@ import android.graphics.Color
 import android.graphics.LinearGradient
 import android.graphics.Matrix
 import android.graphics.Paint
+import android.graphics.Path
 import android.graphics.PorterDuff
 import android.graphics.RectF
 import android.graphics.Shader
@@ -36,10 +37,13 @@ object SolSceneAssetStore {
         STARTING_SOON("scene_starting_soon.png", 1920),
         BRB_SCENE("scene_brb.png", 1920),
         OVERLAY_PNG("stream_overlay_rgba.png", 2560),
-        SHORTS_POSTER("shorts_backdrop_poster.png", 1920)
+        SHORTS_POSTER("shorts_backdrop_poster.png", 1920),
+        PNGTUBER_IDLE("pngtuber_idle.png", 512),
+        PNGTUBER_TALK("pngtuber_talk.png", 512)
     }
 
     private const val SCENES_DIR = "scenes"
+    private val fileIoLock = Any()
     private val revisionCounter = AtomicInteger(1)
 
     fun currentRevision(): Int = revisionCounter.get()
@@ -56,16 +60,16 @@ object SolSceneAssetStore {
         return File(dir, slot.fileName)
     }
 
-    fun hasCustomAsset(context: Context, slot: AssetSlot): Boolean {
+    fun hasCustomAsset(context: Context, slot: AssetSlot): Boolean = synchronized(fileIoLock) {
         val f = slotFile(context, slot)
-        return f.exists() && f.length() > 64L
+        f.exists() && f.length() > 64L
     }
 
-    fun clearCustomAsset(context: Context, slot: AssetSlot): Boolean {
+    fun clearCustomAsset(context: Context, slot: AssetSlot): Boolean = synchronized(fileIoLock) {
         val f = slotFile(context, slot)
         val ok = if (f.exists()) f.delete() else true
         bumpRevision()
-        return ok
+        ok
     }
 
     /**
@@ -73,7 +77,7 @@ object SolSceneAssetStore {
      * staging file first and unconditionally restores [backupFile] if any step fails or throws,
      * so a partially written destination file can never block rollback.
      */
-    internal fun replaceFileSafely(tempFile: File, outFile: File): Boolean {
+    internal fun replaceFileSafely(tempFile: File, outFile: File): Boolean = synchronized(fileIoLock) {
         if (!tempFile.exists() || tempFile.length() <= 64L) return false
         val expectedLength = tempFile.length()
         val backupFile = File(outFile.parentFile, "${outFile.name}.bak")
@@ -157,6 +161,8 @@ object SolSceneAssetStore {
 
     fun importAssetFromUri(context: Context, uri: Uri, slot: AssetSlot): Result<String> {
         val resolver = context.applicationContext.contentResolver
+        var tempFile: File? = null
+        var finalBitmap: Bitmap? = null
         return try {
             val rotationDeg = try {
                 resolver.openInputStream(uri)?.use { exifStream ->
@@ -197,23 +203,27 @@ object SolSceneAssetStore {
                 BitmapFactory.decodeStream(imgStream, null, decodeOpts)
             } ?: return Result.failure(IllegalStateException("Could not decode selected image."))
 
-            val finalBitmap = transformAndClampBitmap(decoded, rotationDeg, maxTarget)
-            if (finalBitmap !== decoded) {
+            val transformed = transformAndClampBitmap(decoded, rotationDeg, maxTarget)
+            if (transformed !== decoded) {
                 decoded.recycle()
             }
+            finalBitmap = transformed
 
             val outFile = slotFile(context, slot)
-            val tempFile = File(outFile.parentFile, "${slot.fileName}.tmp")
-            val compressedOk = FileOutputStream(tempFile).use { fos ->
-                val ok = finalBitmap.compress(Bitmap.CompressFormat.PNG, 100, fos)
+            val tmp = File(outFile.parentFile, "${slot.fileName}.tmp")
+            tempFile = tmp
+
+            val finalW = transformed.width
+            val finalH = transformed.height
+            val compressedOk = FileOutputStream(tmp).use { fos ->
+                val ok = transformed.compress(Bitmap.CompressFormat.PNG, 100, fos)
                 fos.flush()
                 ok
             }
-            val finalW = finalBitmap.width
-            val finalH = finalBitmap.height
-            finalBitmap.recycle()
+            transformed.recycle()
+            finalBitmap = null
 
-            if (!compressedOk || !replaceFileSafely(tempFile, outFile)) {
+            if (!compressedOk || !replaceFileSafely(tmp, outFile)) {
                 return Result.failure(IllegalStateException("Failed to write image file to internal storage."))
             }
 
@@ -221,6 +231,17 @@ object SolSceneAssetStore {
             Result.success("${finalW}x${finalH} saved")
         } catch (e: Exception) {
             Result.failure(e)
+        } finally {
+            try {
+                if (finalBitmap != null && !finalBitmap.isRecycled) {
+                    finalBitmap.recycle()
+                }
+            } catch (_: Exception) {}
+            try {
+                if (tempFile != null && tempFile.exists()) {
+                    tempFile.delete()
+                }
+            } catch (_: Exception) {}
         }
     }
 
@@ -255,10 +276,10 @@ object SolSceneAssetStore {
         return transformed
     }
 
-    fun loadSavedBitmapForGl(context: Context, slot: AssetSlot): Bitmap? {
+    fun loadSavedBitmapForGl(context: Context, slot: AssetSlot): Bitmap? = synchronized(fileIoLock) {
         val file = slotFile(context, slot)
-        if (!file.exists() || file.length() <= 64L) return null
-        return try {
+        if (!file.exists() || file.length() <= 64L) return@synchronized null
+        try {
             val opts = BitmapFactory.Options().apply {
                 inPreferredConfig = Bitmap.Config.ARGB_8888
                 inPremultiplied = true
@@ -267,6 +288,178 @@ object SolSceneAssetStore {
         } catch (_: Exception) {
             null
         }
+    }
+
+    /**
+     * Loads the PNGTuber avatar pair for OpenGL:
+     * - 2 custom PNGs uploaded -> returns (customIdle, customTalk)
+     * - 1 custom PNG uploaded -> returns (customImg, null) so pipeline reuses 1 texture with smooth talk-hop
+     * - 0 custom PNGs uploaded -> procedurally generates the Obsidian-Glass Cyber Visor Esports Avatar
+     *   matched to the active Mic Studio voiceGenderProfile ("MALE" / "FEMALE" / "NEUTRAL").
+     */
+    fun loadPngTuberPairForGl(context: Context, genderProfile: String): Pair<Bitmap, Bitmap?> {
+        val customIdle = loadSavedBitmapForGl(context, AssetSlot.PNGTUBER_IDLE)
+        val customTalk = loadSavedBitmapForGl(context, AssetSlot.PNGTUBER_TALK)
+        if (customIdle != null && customTalk != null) return customIdle to customTalk
+        if (customIdle != null) return customIdle to null
+        if (customTalk != null) return customTalk to null
+        return generateCyberAvatarBitmap(isTalking = false, genderProfile = genderProfile) to
+            generateCyberAvatarBitmap(isTalking = true, genderProfile = genderProfile)
+    }
+
+    /**
+     * Generates a transparent 512x512 Obsidian-Glass Cyber Visor Esports Avatar matching SolStream's theme
+     * (zero APK bloat, zero CAMERA permission, auto-styled to MALE / FEMALE / NEUTRAL voice profile).
+     */
+    fun generateCyberAvatarBitmap(isTalking: Boolean, genderProfile: String): Bitmap {
+        val size = 512
+        val bmp = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(bmp)
+        canvas.drawColor(Color.TRANSPARENT, PorterDuff.Mode.CLEAR)
+
+        val normGender = genderProfile.trim().uppercase(Locale.US)
+        val accentStart = when (normGender) {
+            "FEMALE" -> Color.parseColor("#FF4081")
+            "MALE" -> Color.parseColor("#00E5FF")
+            else -> Color.parseColor("#18FFFF")
+        }
+        val accentEnd = when (normGender) {
+            "FEMALE" -> Color.parseColor("#7C4DFF")
+            "MALE" -> Color.parseColor("#2979FF")
+            else -> Color.parseColor("#00B0FF")
+        }
+        val glowColor = when (normGender) {
+            "FEMALE" -> Color.parseColor(if (isTalking) "#88FF4081" else "#38FF4081")
+            "MALE" -> Color.parseColor(if (isTalking) "#8800E5FF" else "#3800E5FF")
+            else -> Color.parseColor(if (isTalking) "#8818FFFF" else "#3818FFFF")
+        }
+
+        val cx = size * 0.5f
+        val cy = size * 0.5f
+
+        // Outer neon speech aura ring
+        val auraPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.STROKE
+            strokeWidth = if (isTalking) 18f else 10f
+            color = glowColor
+        }
+        canvas.drawCircle(cx, cy, 224f, auraPaint)
+
+        // Obsidian medallion fill
+        val bodyPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            shader = LinearGradient(
+                64f, 48f, 448f, 464f,
+                intArrayOf(
+                    Color.parseColor("#F008101C"),
+                    Color.parseColor("#F5111E32"),
+                    Color.parseColor("#F0060B14")
+                ),
+                floatArrayOf(0f, 0.5f, 1f),
+                Shader.TileMode.CLAMP
+            )
+        }
+        canvas.drawCircle(cx, cy, 212f, bodyPaint)
+
+        // Crisp metallic gradient rim
+        val rimPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.STROKE
+            strokeWidth = if (isTalking) 8.5f else 5.5f
+            shader = LinearGradient(48f, 48f, 464f, 464f, accentStart, accentEnd, Shader.TileMode.CLAMP)
+        }
+        canvas.drawCircle(cx, cy, 212f, rimPaint)
+
+        // Tactical headset ear-cups
+        val cupPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.parseColor("#18283F")
+            style = Paint.Style.FILL
+        }
+        canvas.drawRoundRect(RectF(66f, 188f, 114f, 314f), 20f, 20f, cupPaint)
+        canvas.drawRoundRect(RectF(398f, 188f, 446f, 314f), 20f, 20f, cupPaint)
+
+        val cupAccent = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = accentStart
+            style = Paint.Style.FILL
+        }
+        canvas.drawRoundRect(RectF(78f, 214f, 92f, 288f), 6f, 6f, cupAccent)
+        canvas.drawRoundRect(RectF(420f, 214f, 434f, 288f), 6f, 6f, cupAccent)
+
+        // Cyber helmet silhouette
+        val helmetPath = Path().apply {
+            moveTo(126f, 218f)
+            quadTo(128f, 102f, cx, 96f)
+            quadTo(384f, 102f, 386f, 218f)
+            lineTo(374f, 326f)
+            quadTo(366f, 396f, cx, 412f)
+            quadTo(146f, 396f, 138f, 326f)
+            close()
+        }
+        val helmetFill = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.parseColor("#101A2B")
+            style = Paint.Style.FILL
+        }
+        canvas.drawPath(helmetPath, helmetFill)
+        val helmetEdge = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.STROKE
+            strokeWidth = 4f
+            color = Color.parseColor("#355070")
+        }
+        canvas.drawPath(helmetPath, helmetEdge)
+
+        // Glossy cyber visor panel
+        val visorRect = RectF(150f, 188f, 362f, 266f)
+        val visorFill = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.parseColor("#04080F")
+            style = Paint.Style.FILL
+        }
+        canvas.drawRoundRect(visorRect, 32f, 32f, visorFill)
+        val visorStroke = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.STROKE
+            strokeWidth = 3.5f
+            shader = LinearGradient(visorRect.left, visorRect.top, visorRect.right, visorRect.bottom, accentStart, accentEnd, Shader.TileMode.CLAMP)
+        }
+        canvas.drawRoundRect(visorRect, 32f, 32f, visorStroke)
+
+        // Glowing cyber eyes inside visor (brighter & slightly angled when speaking)
+        val eyePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            shader = LinearGradient(170f, 210f, 340f, 245f, accentStart, Color.WHITE, Shader.TileMode.CLAMP)
+            style = Paint.Style.FILL
+        }
+        val eyeHalfH = if (isTalking) 14f else 9.5f
+        val leftEye = RectF(186f, 227f - eyeHalfH, 238f, 227f + eyeHalfH)
+        val rightEye = RectF(274f, 227f - eyeHalfH, 326f, 227f + eyeHalfH)
+        canvas.drawRoundRect(leftEye, 10f, 10f, eyePaint)
+        canvas.drawRoundRect(rightEye, 10f, 10f, eyePaint)
+
+        // Voice equalizer mouth (calm horizontal line when idle, 5 glowing neon bars when talking)
+        val mouthPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            shader = LinearGradient(184f, 310f, 328f, 366f, accentStart, accentEnd, Shader.TileMode.CLAMP)
+            style = Paint.Style.FILL
+        }
+        if (isTalking) {
+            val barHeights = floatArrayOf(22f, 44f, 58f, 44f, 22f)
+            val barW = 16f
+            val gap = 14f
+            val totalW = barHeights.size * barW + (barHeights.size - 1) * gap
+            var bx = cx - totalW * 0.5f
+            val mouthCy = 336f
+            for (bh in barHeights) {
+                canvas.drawRoundRect(
+                    RectF(bx, mouthCy - bh * 0.5f, bx + barW, mouthCy + bh * 0.5f),
+                    8f,
+                    8f,
+                    mouthPaint
+                )
+                bx += barW + gap
+            }
+        } else {
+            val idleMouthPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = Color.parseColor("#6690A4AE")
+                style = Paint.Style.FILL
+            }
+            canvas.drawRoundRect(RectF(206f, 331f, 306f, 341f), 5f, 5f, idleMouthPaint)
+        }
+
+        return bmp
     }
 
     fun loadOrGenerateSceneBitmap(
