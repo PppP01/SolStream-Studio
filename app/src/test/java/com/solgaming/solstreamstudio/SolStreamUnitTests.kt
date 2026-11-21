@@ -10,8 +10,11 @@ package com.solgaming.solstreamstudio
 
 import android.media.MediaCodec
 import android.media.MediaFormat
+import android.os.PowerManager
+import com.solgaming.solstreamstudio.recorder.SolHudAndQrRenderer
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -1008,5 +1011,388 @@ class SolStreamUnitTests {
         assertFalse(SolStreamService.SMART_ZOOM_STEPS.contains(104))
         assertEquals(108, StreamSettings().smartZoomPercent)
         assertEquals("SOL LUXE 3.0 (Pure Condenser)", MicDspProcessor.presetDisplayName("SOL_LUXE"))
+    }
+
+    // === PHASE 1 (v1.5.0) UNIT TESTS ===
+
+    @Test
+    fun diagnosticsReportFreeze_stopsResamplingAfterSessionFinalized() {
+        assertEquals("v1.5.0", DiagnosticsLogger.ENGINE_VERSION)
+        try {
+            DiagnosticsLogger.resetSessionLifecycleForTests()
+            // Before any session starts -> allowed to sample idle hardware health
+            assertTrue(DiagnosticsLogger.shouldSampleHealthOnReport(isLive = false))
+
+            // Active live session -> allowed to sample
+            DiagnosticsLogger.sessionStartMs = 1_700_000_000_000L
+            DiagnosticsLogger.isSessionFinalized = false
+            assertTrue(DiagnosticsLogger.shouldSampleHealthOnReport(isLive = true))
+            assertTrue(DiagnosticsLogger.shouldSampleHealthOnReport(isLive = false))
+
+            // Finalized post-stop report -> MUST stay frozen on idle reopen
+            DiagnosticsLogger.isSessionFinalized = true
+            assertFalse(DiagnosticsLogger.shouldSampleHealthOnReport(isLive = false))
+            // If a live session is active again, sampling is allowed
+            assertTrue(DiagnosticsLogger.shouldSampleHealthOnReport(isLive = true))
+        } finally {
+            DiagnosticsLogger.resetSessionLifecycleForTests()
+        }
+    }
+
+    @Test
+    fun thermalManualReleaseGuard_blocksOverrideWhileAndroidIsStillSevere() {
+        assertTrue(
+            SolStreamService.shouldBlockManual30FpsRelease(
+                requestingThrottleOff = true,
+                autoThermalActive = true,
+                currentThermalStatus = PowerManager.THERMAL_STATUS_SEVERE
+            )
+        )
+        assertTrue(
+            SolStreamService.shouldBlockManual30FpsRelease(
+                requestingThrottleOff = true,
+                autoThermalActive = true,
+                currentThermalStatus = PowerManager.THERMAL_STATUS_CRITICAL
+            )
+        )
+        // Once cooled to MODERATE or lower, release is allowed
+        assertFalse(
+            SolStreamService.shouldBlockManual30FpsRelease(
+                requestingThrottleOff = true,
+                autoThermalActive = true,
+                currentThermalStatus = PowerManager.THERMAL_STATUS_MODERATE
+            )
+        )
+        // Turning manual 30 FPS saver ON is never blocked
+        assertFalse(
+            SolStreamService.shouldBlockManual30FpsRelease(
+                requestingThrottleOff = false,
+                autoThermalActive = true,
+                currentThermalStatus = PowerManager.THERMAL_STATUS_SEVERE
+            )
+        )
+        // Releasing a purely manual saver when auto-thermal is NOT active is allowed
+        assertFalse(
+            SolStreamService.shouldBlockManual30FpsRelease(
+                requestingThrottleOff = true,
+                autoThermalActive = false,
+                currentThermalStatus = PowerManager.THERMAL_STATUS_SEVERE
+            )
+        )
+    }
+
+    @Test
+    fun studioProfiles_adaptAll4StarterSlotsToFlagshipAndLiteHardware() {
+        val flagshipHevc = HardwareEncoderReport(
+            codecKey = "HEVC",
+            mimeType = MediaFormat.MIMETYPE_VIDEO_HEVC,
+            encoderName = "c2.exynos.hevc.encoder",
+            supports1440p60 = true,
+            supports1080p60 = true,
+            supportsCbr = true,
+            supportsVbr = true,
+            complexityMin = 0,
+            complexityMax = 0,
+            verifiedSurfaceConfigure = true,
+            verifiedRealEncode = true
+        )
+        val flagshipScan = DeviceScanSummary(
+            deviceModel = "samsung SM-S721B",
+            socModel = "Samsung Exynos 2400e",
+            androidRelease = "17",
+            sdkInt = 37,
+            totalRamGb = 8,
+            hevcHardware = flagshipHevc,
+            h264Hardware = flagshipHevc.copy(codecKey = "H264", mimeType = MediaFormat.MIMETYPE_VIDEO_AVC),
+            av1Hardware = null,
+            recommendedTier = DeviceTier.FLAGSHIP,
+            recommendedCodec = "HEVC",
+            recommendedWidth = 2560,
+            recommendedHeight = 1440
+        )
+
+        val currentFlagship = StreamSettings(deviceTier = "FLAGSHIP")
+        val p0 = KeystoreVault.buildDefaultStudioProfile(0, currentFlagship, flagshipScan)
+        val p1 = KeystoreVault.buildDefaultStudioProfile(1, currentFlagship, flagshipScan)
+        val p2 = KeystoreVault.buildDefaultStudioProfile(2, currentFlagship, flagshipScan)
+        val p3 = KeystoreVault.buildDefaultStudioProfile(3, currentFlagship, flagshipScan)
+
+        assertEquals("Wi-Fi Max", p0.name)
+        assertEquals(2560, p0.settings.width)
+        assertEquals(60, p0.settings.fps)
+        assertEquals("HEVC", p0.settings.codec)
+
+        assertEquals("Mobile Data", p1.name)
+        assertEquals(1280, p1.settings.width)
+        assertEquals(30, p1.settings.fps)
+        assertEquals(4500, p1.settings.targetBitrateKbps)
+        assertEquals(128, p1.settings.audioBitrateKbps)
+        assertTrue(p1.settings.adaptiveBitrate)
+
+        assertEquals("Shorts 9:16", p2.name)
+        assertTrue(p2.settings.isVertical)
+        assertTrue(p2.settings.useShortsKeySlot)
+        assertEquals("BLUR", p2.settings.shortsBackdropMode)
+        assertEquals(12000, p2.settings.targetBitrateKbps)
+
+        assertEquals("Custom", p3.name)
+        assertFalse(p3.isUserCustomized)
+
+        // Lite budget phone (H.264 1080p30 max) must auto-clamp Wi-Fi Max and Shorts cleanly
+        val liteH264 = HardwareEncoderReport(
+            codecKey = "H264",
+            mimeType = MediaFormat.MIMETYPE_VIDEO_AVC,
+            encoderName = "c2.mtk.avc.encoder",
+            supports1440p60 = false,
+            supports1080p60 = false,
+            supports1080p30 = true,
+            supportsCbr = true,
+            supportsVbr = true,
+            maxBitrateMbps = 12,
+            complexityMin = 0,
+            complexityMax = 0,
+            verifiedSurfaceConfigure = true,
+            verifiedRealEncode = true
+        )
+        val liteScan = flagshipScan.copy(
+            hevcHardware = null,
+            h264Hardware = liteH264,
+            recommendedTier = DeviceTier.LITE,
+            recommendedCodec = "H264",
+            recommendedWidth = 1920,
+            recommendedHeight = 1080,
+            recommendedFps = 30
+        )
+        val liteWifi = KeystoreVault.buildDefaultStudioProfile(0, StreamSettings(deviceTier = "LITE"), liteScan)
+        val liteShorts = KeystoreVault.buildDefaultStudioProfile(2, StreamSettings(deviceTier = "LITE"), liteScan)
+        assertEquals("H264", liteWifi.settings.codec)
+        assertEquals(1920, liteWifi.settings.width)
+        assertEquals(30, liteWifi.settings.fps)
+        assertEquals(1280, liteShorts.settings.width)
+        assertEquals(30, liteShorts.settings.fps)
+    }
+
+    @Test
+    fun overlayCornerSanitizer_acceptsFourValidCornersAndRejectsInvalidInput() {
+        assertEquals("TOP_LEFT", KeystoreVault.sanitizeOverlayCorner("top_left", "BOTTOM_RIGHT"))
+        assertEquals("TOP_RIGHT", KeystoreVault.sanitizeOverlayCorner(" TOP_RIGHT ", "TOP_LEFT"))
+        assertEquals("BOTTOM_LEFT", KeystoreVault.sanitizeOverlayCorner("BOTTOM_LEFT", "TOP_LEFT"))
+        assertEquals("BOTTOM_RIGHT", KeystoreVault.sanitizeOverlayCorner("bottom_right", "TOP_LEFT"))
+        assertEquals("TOP_LEFT", KeystoreVault.sanitizeOverlayCorner("CENTER", "TOP_LEFT"))
+        assertEquals("BOTTOM_RIGHT", KeystoreVault.sanitizeOverlayCorner("", "BOTTOM_RIGHT"))
+        assertEquals("BOTTOM_LEFT", KeystoreVault.sanitizeOverlayCorner(null, "BOTTOM_LEFT"))
+    }
+
+    @Test
+    fun qrEncoder_generatesValidIsoMatricesForYoutubeUpiAndMax213Bytes() {
+        assertNull(SolHudAndQrRenderer.encodeQrMatrix(""))
+        assertNull(SolHudAndQrRenderer.encodeQrMatrix("   "))
+        assertNull(SolHudAndQrRenderer.encodeQrMatrix("A".repeat(214)))
+        // 72 Devanagari chars = 216 UTF-8 bytes (> 213 byte Version 10-M capacity) -> rejected cleanly
+        assertNull(SolHudAndQrRenderer.encodeQrMatrix("ॐ".repeat(72)))
+
+        val ytQr = SolHudAndQrRenderer.encodeQrMatrix("https://youtube.com/@Sol_CODM")
+        assertNotNull(ytQr)
+        assertEquals(3, ytQr!!.version)
+        assertEquals(29, ytQr.size)
+        // Verify top-left 7x7 finder pattern + separator + fixed dark module
+        assertTrue(ytQr.modules[0][0])
+        assertTrue(ytQr.modules[3][3])
+        assertFalse(ytQr.modules[1][1])
+        assertFalse(ytQr.modules[0][7])
+        assertTrue(ytQr.modules[ytQr.size - 8][8])
+
+        val upiQr = SolHudAndQrRenderer.encodeQrMatrix(
+            "upi://pay?pa=solgaming@okaxis&pn=Sol%20Gaming%20CODM&cu=INR&tn=Stream%20Support"
+        )
+        assertNotNull(upiQr)
+        assertEquals(5, upiQr!!.version)
+        assertEquals(37, upiQr.size)
+        assertTrue(upiQr.modules[upiQr.size - 8][8])
+
+        // Boundary test: exact 213-byte Version 10 Level M payload (exercises 16-bit length + BCH version blocks)
+        val maxQr = SolHudAndQrRenderer.encodeQrMatrix("A".repeat(213))
+        assertNotNull(maxQr)
+        assertEquals(10, maxQr!!.version)
+        assertEquals(57, maxQr.size)
+        assertTrue(maxQr.modules[maxQr.size - 8][8])
+    }
+
+    @Test
+    fun cornerQuadMvpMatrix_staysStrictlyInsideViewportAcross16x9And9x16() {
+        val mvp = FloatArray(16)
+        val targets = listOf(2560 to 1440, 1080 to 1920)
+        for ((dstW, dstH) in targets) {
+            for (corner in SolStreamService.CORNER_POSITION_ORDER) {
+                SolHudAndQrRenderer.computeCornerQuadMvp(
+                    mvp = mvp,
+                    bmpW = SolHudAndQrRenderer.HUD_WIDTH_PX,
+                    bmpH = SolHudAndQrRenderer.HUD_HEIGHT_PX,
+                    dstW = dstW,
+                    dstH = dstH,
+                    corner = corner,
+                    maxHeightFrac = 0.062f,
+                    maxWidthFrac = 0.30f,
+                    extraOffsetY = 0.032f
+                )
+                val sx = mvp[0]
+                val sy = mvp[5]
+                val tx = mvp[12]
+                val ty = mvp[13]
+                assertEquals(1.0f, mvp[10], 1e-6f)
+                assertEquals(1.0f, mvp[15], 1e-6f)
+                assertTrue("scaleX must be positive", sx > 0f)
+                assertTrue("scaleY must be positive", sy > 0f)
+                assertTrue("left edge must stay >= -1.0", tx - sx >= -1.0f)
+                assertTrue("right edge must stay <= 1.0", tx + sx <= 1.0f)
+                assertTrue("bottom edge must stay >= -1.0", ty - sy >= -1.0f)
+                assertTrue("top edge must stay <= 1.0", ty + sy <= 1.0f)
+
+                when (corner) {
+                    "TOP_LEFT" -> {
+                        assertTrue(tx < 0f)
+                        assertTrue(ty > 0f)
+                    }
+                    "TOP_RIGHT" -> {
+                        assertTrue(tx > 0f)
+                        assertTrue(ty > 0f)
+                    }
+                    "BOTTOM_LEFT" -> {
+                        assertTrue(tx < 0f)
+                        assertTrue(ty < 0f)
+                    }
+                    "BOTTOM_RIGHT" -> {
+                        assertTrue(tx > 0f)
+                        assertTrue(ty < 0f)
+                    }
+                }
+            }
+        }
+    }
+
+    @Test
+    fun solHudFormatter_rendersNormalThrottledAndMissingTempCleanly() {
+        assertEquals(
+            "60 FPS  •  39.4°C  •  20.0M",
+            SolHudAndQrRenderer.formatHudTelemetryLine(60, 39.4f, 20.0f, isThrottled30 = false)
+        )
+        assertEquals(
+            "30 FPS COOL  •  43.8°C  •  12.0M",
+            SolHudAndQrRenderer.formatHudTelemetryLine(30, 43.8f, 12.0f, isThrottled30 = true)
+        )
+        assertEquals(
+            "60 FPS  •  --.-°C  •  15.5M",
+            SolHudAndQrRenderer.formatHudTelemetryLine(60, 0f, 15.5f, isThrottled30 = false)
+        )
+    }
+
+    @Test
+    fun screenshotDimensionClamp_capsAt1080pEvenDimensionsWithoutUpscaling() {
+        assertEquals(1920 to 1080, SolVideoPipeline.computeScreenshotDimensions(3840, 2160))
+        assertEquals(1920 to 1080, SolVideoPipeline.computeScreenshotDimensions(2560, 1440))
+        assertEquals(1920 to 1080, SolVideoPipeline.computeScreenshotDimensions(1920, 1080))
+        assertEquals(1080 to 1920, SolVideoPipeline.computeScreenshotDimensions(1440, 2560))
+        assertEquals(1080 to 1920, SolVideoPipeline.computeScreenshotDimensions(1080, 1920))
+        assertEquals(1280 to 720, SolVideoPipeline.computeScreenshotDimensions(1280, 720))
+
+        val (oddW, oddH) = SolVideoPipeline.computeScreenshotDimensions(2559, 1439)
+        assertEquals(0, oddW % 2)
+        assertEquals(0, oddH % 2)
+        assertTrue(oddW * oddH * 4 <= 1920 * 1080 * 4)
+    }
+
+    @Test
+    fun screenshotVerticalRowFlip_invertsRgbaRowsInPlaceAccurately() {
+        // 2x3 RGBA image (rowStride = 8 bytes)
+        val pixels = byteArrayOf(
+            1, 2, 3, 4, 5, 6, 7, 8,         // Row 0 (bottom in OpenGL)
+            11, 12, 13, 14, 15, 16, 17, 18, // Row 1 (middle)
+            21, 22, 23, 24, 25, 26, 27, 28  // Row 2 (top in OpenGL)
+        )
+        SolHudAndQrRenderer.flipRgbaRowsVerticallyInPlace(pixels, width = 2, height = 3)
+        assertEquals(21.toByte(), pixels[0])
+        assertEquals(28.toByte(), pixels[7])
+        assertEquals(11.toByte(), pixels[8])
+        assertEquals(18.toByte(), pixels[15])
+        assertEquals(1.toByte(), pixels[16])
+        assertEquals(8.toByte(), pixels[23])
+    }
+
+    @Test
+    fun activeOverlaysSummaryAndCornerTags_formatCleanReportStrings() {
+        assertEquals("TL", SolStreamService.formatCompactCornerShortTag("TOP_LEFT"))
+        assertEquals("TR", SolStreamService.formatCompactCornerShortTag("TOP_RIGHT"))
+        assertEquals("BL", SolStreamService.formatCompactCornerShortTag("BOTTOM_LEFT"))
+        assertEquals("BR", SolStreamService.formatCompactCornerShortTag("BOTTOM_RIGHT"))
+
+        assertEquals("None", SolStreamService.buildActiveOverlaysSummary(StreamSettings()))
+
+        val allPro = StreamSettings(
+            hudTelemetryEnabled = true,
+            hudTelemetryCorner = "TOP_LEFT",
+            qrOverlayEnabled = true,
+            qrOverlayText = "https://youtube.com/@Sol_CODM",
+            qrOverlayCorner = "BOTTOM_RIGHT",
+            pngTuberEnabled = true,
+            pngTuberCorner = "BOTTOM_LEFT"
+        )
+        val summary = SolStreamService.buildActiveOverlaysSummary(allPro)
+        assertTrue(summary.contains("SolHUD (TL)"))
+        assertTrue(summary.contains("QR (BR)"))
+        assertTrue(summary.contains("PNGTuber (BL)"))
+
+        // QR with blank text must not appear as active in summary
+        val blankQr = StreamSettings(qrOverlayEnabled = true, qrOverlayText = "   ")
+        assertEquals("None", SolStreamService.buildActiveOverlaysSummary(blankQr))
+    }
+
+    @Test
+    fun pngTuberAssetSlots_enforce512PxMaxFor2MbTotalVramBudget() {
+        assertEquals(512, SolSceneAssetStore.AssetSlot.PNGTUBER_IDLE.maxDimensionPx)
+        assertEquals(512, SolSceneAssetStore.AssetSlot.PNGTUBER_TALK.maxDimensionPx)
+        val totalVramBytes = 2L * 512L * 512L * 4L
+        assertEquals(2_097_152L, totalVramBytes)
+    }
+
+    @Test
+    fun flagshipTierFallback_stepsTo30FpsWhenHardwareLacks60FpsSupport() {
+        val hevc30Only = HardwareEncoderReport(
+            codecKey = "HEVC",
+            mimeType = MediaFormat.MIMETYPE_VIDEO_HEVC,
+            encoderName = "c2.vendor.hevc30.encoder",
+            supports1440p60 = false,
+            supports1440p30 = false,
+            supports1080p60 = false,
+            supports1080p30 = true,
+            supportsCbr = true,
+            supportsVbr = true,
+            complexityMin = 0,
+            complexityMax = 0,
+            verifiedSurfaceConfigure = true,
+            verifiedRealEncode = true
+        )
+        val scan30Only = DeviceScanSummary(
+            deviceModel = "30fps Test Device",
+            socModel = "Test SoC",
+            androidRelease = "15",
+            sdkInt = 35,
+            totalRamGb = 8,
+            hevcHardware = hevc30Only,
+            h264Hardware = null,
+            av1Hardware = null,
+            recommendedTier = DeviceTier.FLAGSHIP,
+            recommendedCodec = "HEVC",
+            recommendedWidth = 1920,
+            recommendedHeight = 1080,
+            recommendedFps = 30
+        )
+        val applied = KeystoreVault.applyPlatformAndVoiceAwareTierPreset(
+            current = StreamSettings(platformPreset = "YOUTUBE"),
+            tier = DeviceTier.FLAGSHIP,
+            scan = scan30Only
+        )
+        assertEquals(1920, applied.width)
+        assertEquals(1080, applied.height)
+        assertEquals(30, applied.fps)
     }
 }
