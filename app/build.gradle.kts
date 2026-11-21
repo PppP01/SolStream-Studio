@@ -51,8 +51,8 @@ android {
         applicationId = "com.solgaming.solstreamstudio"
         minSdk = 29
         targetSdk = 36
-        versionCode = 11
-        versionName = "1.4.0"
+        versionCode = 12
+        versionName = "1.5.0"
 
         ndk {
             abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64")
@@ -84,6 +84,7 @@ android {
                 )
                 ksFile.parentFile?.mkdirs()
                 ksFile.writeBytes(Base64.getMimeDecoder().decode(keystoreBase64))
+                ksFile.deleteOnExit()
                 storeFile = ksFile
                 storePassword = keystoreStorePass
                 keyAlias = keystoreKeyAlias
