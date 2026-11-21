@@ -54,12 +54,14 @@ import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
+import com.solgaming.solstreamstudio.recorder.SolHudAndQrRenderer
 import org.json.JSONObject
 import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.Socket
 import java.net.URI
 import java.net.URL
+import java.nio.charset.StandardCharsets
 import java.util.Locale
 import java.util.concurrent.atomic.AtomicBoolean
 import javax.net.ssl.HttpsURLConnection
@@ -81,6 +83,7 @@ class MainActivity : AppCompatActivity() {
     private var preflightManuallyExpanded = false
     private var askedRuntimePermOnce = false
     private var lastDashboardStopTapMs = 0L
+    private var activeStudioProfileSlot = -1
     private var suppressSeekBarCallback = false
     private var pendingAssetPickSlot: SolSceneAssetStore.AssetSlot = SolSceneAssetStore.AssetSlot.BRB_SCENE
     private var benchmarkTargetAppName: String = "Glip / Other App"
@@ -126,7 +129,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var btnTapAccessibilityFirst: Button
     private lateinit var btnUnlockRestricted: Button
 
-    // Card 2: SolRelay Omega™ Vault, 4-Pill Platform Bar, Simulcast & 5-Metric Speed Test
+    // Card 2: 4 Studio Profiles, SolRelay Omega™ Vault, 4-Pill Platform Bar, Simulcast & 5-Metric Speed Test
+    private val studioProfileButtons = mutableListOf<Button>()
     private val platformPillButtons = mutableMapOf<String, Button>()
     private lateinit var etRtmpsUrl: EditText
     private lateinit var tvVaultSecurityLabel: TextView
@@ -149,7 +153,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var btnNetTest: Button
     private lateinit var tvNetTestResult: TextView
 
-    // Card 3: SolCore Ultra™ Video Engine, Segmented Pills, Visuals & Scenes
+    // Card 3: SolCore Ultra™ Video Engine, Segmented Pills, Visuals, Scenes & Phase 1 Pro Overlays
     private val resPillButtons = mutableMapOf<Int, Button>()
     private val codecPillButtons = mutableMapOf<String, Button>()
     private val fpsPillButtons = mutableMapOf<Int, Button>()
@@ -178,6 +182,16 @@ class MainActivity : AppCompatActivity() {
     private lateinit var btnPickOverlayPng: Button
     private lateinit var btnOverlayPosition: Button
     private lateinit var btnPickShortsPoster: Button
+    private lateinit var btnHudTelemetryToggle: Button
+    private lateinit var btnHudTelemetryCorner: Button
+    private lateinit var etQrOverlayText: EditText
+    private lateinit var btnQrOverlayToggle: Button
+    private lateinit var btnQrOverlayCorner: Button
+    private lateinit var btnPickPngTuberIdle: Button
+    private lateinit var btnPickPngTuberTalk: Button
+    private lateinit var btnPngTuberToggle: Button
+    private lateinit var btnPngTuberCorner: Button
+    private lateinit var btnPngTuberSize: Button
     private lateinit var etBannerText: EditText
     private lateinit var btnBannerToggle: Button
     private lateinit var btnBannerPos: Button
@@ -233,6 +247,12 @@ class MainActivity : AppCompatActivity() {
     private lateinit var btnReportsQuick: Button
     private lateinit var btnSavedClipsQuick: Button
     private lateinit var btnGlipBench: Button
+
+    private val dashboardStopResetRunnable = Runnable {
+        if (!isFinishing && !isDestroyed && SolStreamService.isBroadcastLive && ::btnGoLive.isInitialized) {
+            btnGoLive.text = "⏹ STOP LIVE STREAM"
+        }
+    }
 
     private val idleTelemetryRefreshRunnable = object : Runnable {
         override fun run() {
@@ -291,20 +311,35 @@ class MainActivity : AppCompatActivity() {
     ) { uri: Uri? ->
         if (uri == null) return@registerForActivityResult
         val targetSlot = pendingAssetPickSlot
-        Toast.makeText(this, "Saving ${targetSlot.name} graphic...", Toast.LENGTH_SHORT).show()
+        val friendlyName = friendlyAssetSlotName(targetSlot)
+        Toast.makeText(this, "Saving $friendlyName...", Toast.LENGTH_SHORT).show()
         Thread({
             val res = SolSceneAssetStore.importAssetFromUri(applicationContext, uri, targetSlot)
             runOnUiThread {
                 if (!isFinishing && !isDestroyed) {
                     res.onSuccess { info ->
-                        if (targetSlot == SolSceneAssetStore.AssetSlot.OVERLAY_PNG && !settings.overlayImageEnabled) {
-                            updateSetting(settings.copy(overlayImageEnabled = true))
-                        } else if (targetSlot == SolSceneAssetStore.AssetSlot.SHORTS_POSTER) {
-                            updateSetting(settings.copy(shortsBackdropMode = "POSTER"))
-                        } else {
-                            refreshAllUi()
+                        when (targetSlot) {
+                            SolSceneAssetStore.AssetSlot.OVERLAY_PNG -> {
+                                if (!settings.overlayImageEnabled) {
+                                    updateSetting(settings.copy(overlayImageEnabled = true))
+                                } else {
+                                    refreshAllUi()
+                                }
+                            }
+                            SolSceneAssetStore.AssetSlot.SHORTS_POSTER -> {
+                                updateSetting(settings.copy(shortsBackdropMode = "POSTER"))
+                            }
+                            SolSceneAssetStore.AssetSlot.PNGTUBER_IDLE,
+                            SolSceneAssetStore.AssetSlot.PNGTUBER_TALK -> {
+                                if (!settings.pngTuberEnabled) {
+                                    updateSetting(settings.copy(pngTuberEnabled = true))
+                                } else {
+                                    refreshAllUi()
+                                }
+                            }
+                            else -> refreshAllUi()
                         }
-                        Toast.makeText(this, "${targetSlot.name}: $info!", Toast.LENGTH_SHORT).show()
+                        Toast.makeText(this, "$friendlyName: $info!", Toast.LENGTH_SHORT).show()
                     }.onFailure { err ->
                         Toast.makeText(this, "Image load failed: ${err.message}", Toast.LENGTH_LONG).show()
                     }
@@ -376,10 +411,20 @@ class MainActivity : AppCompatActivity() {
 
     override fun onDestroy() {
         uiHandler.removeCallbacks(idleTelemetryRefreshRunnable)
+        uiHandler.removeCallbacks(dashboardStopResetRunnable)
         if (SolStreamService.onStateChangedListener != null) {
             SolStreamService.onStateChangedListener = null
         }
         super.onDestroy()
+    }
+
+    private fun friendlyAssetSlotName(slot: SolSceneAssetStore.AssetSlot): String = when (slot) {
+        SolSceneAssetStore.AssetSlot.STARTING_SOON -> "Starting Soon Graphic"
+        SolSceneAssetStore.AssetSlot.BRB_SCENE -> "BRB Privacy Graphic"
+        SolSceneAssetStore.AssetSlot.OVERLAY_PNG -> ".PNG Stream Logo"
+        SolSceneAssetStore.AssetSlot.SHORTS_POSTER -> "9:16 Shorts Poster"
+        SolSceneAssetStore.AssetSlot.PNGTUBER_IDLE -> "PNGTuber Idle Avatar"
+        SolSceneAssetStore.AssetSlot.PNGTUBER_TALK -> "PNGTuber Talking Avatar"
     }
 
     private fun readAppVersionName(): String {
@@ -390,9 +435,9 @@ class MainActivity : AppCompatActivity() {
                 @Suppress("DEPRECATION")
                 packageManager.getPackageInfo(packageName, 0)
             }
-            info.versionName?.removeSuffix("-debug") ?: "1.4.0"
+            info.versionName?.removeSuffix("-debug") ?: "1.5.0"
         } catch (_: Exception) {
-            "1.4.0"
+            "1.5.0"
         }
     }
 
@@ -694,6 +739,7 @@ class MainActivity : AppCompatActivity() {
                 }
                 layoutParams = lp
                 setOnClickListener {
+                    activeStudioProfileSlot = -1
                     val updated = applyTierDefaultsToSettings(settings, tier, scanSummary)
                     updateSetting(updated, requiresRestartIfLive = true)
                     Toast.makeText(
@@ -766,12 +812,44 @@ class MainActivity : AppCompatActivity() {
         cardPreflight.addView(boxPreflightButtonsContainer)
         container.addView(cardPreflight)
 
-        // === CARD 2: SOLRELAY OMEGA VAULT, 4-PILL PLATFORM BAR, SIMULCAST & 5-METRIC SPEED TEST ===
+        // === CARD 2: 4 STUDIO PROFILES, SOLRELAY OMEGA VAULT, 4-PILL PLATFORM BAR & SPEED TEST ===
         val cardStream = sectionCard(
-            heading = "2. Stream Key Vault & Simulcast",
+            heading = "2. Studio Profiles, Key Vault & Simulcast",
             engineBadge = "SOLRELAY OMEGA™",
             badgeHex = "#00E5FF"
         )
+
+        cardStream.addView(labelText("One-Tap Studio Profiles (Tap to Load • Long-Press to Save/Rename Current Setup):"))
+        studioProfileButtons.clear()
+        val profileRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = dp(4); bottomMargin = dp(6) }
+        }
+        for (slotIdx in 0 until KeystoreVault.STUDIO_PROFILE_COUNT) {
+            val b = Button(this).apply {
+                text = "Profile ${slotIdx + 1}"
+                isAllCaps = false
+                setTextColor(Color.WHITE)
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 10.4f)
+                maxLines = 1
+                ellipsize = TextUtils.TruncateAt.END
+                setPadding(dp(3), dp(5), dp(3), dp(5))
+                layoutParams = LinearLayout.LayoutParams(0, dp(38), 1f).apply {
+                    if (slotIdx > 0) marginStart = dp(4)
+                }
+                setOnClickListener { loadStudioProfileSlot(slotIdx) }
+                setOnLongClickListener {
+                    showSaveStudioProfileDialog(slotIdx)
+                    true
+                }
+            }
+            studioProfileButtons.add(b)
+            profileRow.addView(b)
+        }
+        cardStream.addView(profileRow)
 
         cardStream.addView(labelText("Broadcast Platform (Auto-configures Codec, Max Mbps & AAC):"))
         val platRow = LinearLayout(this).apply {
@@ -954,7 +1032,7 @@ class MainActivity : AppCompatActivity() {
         cardStream.addView(tvNetTestResult)
         container.addView(cardStream)
 
-        // === CARD 3: SOLCORE ULTRA VIDEO ENGINE, DIRECT-TAP PILLS, VISUALS & SCENES ===
+        // === CARD 3: SOLCORE ULTRA VIDEO ENGINE, DIRECT-TAP PILLS, VISUALS & PRO OVERLAYS ===
         val cardVideo = sectionCard(
             heading = "3. Video Engine (360p–4K60 • 0.5–100M)",
             engineBadge = "SOLCORE ULTRA™",
@@ -1123,7 +1201,7 @@ class MainActivity : AppCompatActivity() {
         cardVideo.addView(buttonRow(btnShadowBoost, btnColorTemp))
         cardVideo.addView(btnSharpen)
 
-        // Collapsible Accordion Drawer: Scenes, Unified Logo:OFF, Text Banner, Privacy Blur & SolCodec
+        // Collapsible Accordion Drawer: Scenes, Pro Overlays (SolHUD, QR, PNGTuber), Privacy Blur & SolCodec
         boxSceneProDrawer = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             visibility = View.GONE
@@ -1136,13 +1214,46 @@ class MainActivity : AppCompatActivity() {
             layoutParams = lp
         }
         btnToggleSceneProDrawer = actionButton(
-            "▸ Scenes, Logo Overlay, Privacy Blur & SolCodec™ (Tap to Expand)",
+            "▸ Scenes, SolHUD™, QR, PNGTuber, Privacy & SolCodec™",
             "#111D30"
         ) {
             val show = boxSceneProDrawer.visibility != View.VISIBLE
             boxSceneProDrawer.visibility = if (show) View.VISIBLE else View.GONE
             refreshAccordionHeaders()
         }
+
+        boxSceneProDrawer.addView(labelText("SolHUD™ Live GPU Telemetry Badge (Visible Even in Single-App Capture):"))
+        btnHudTelemetryToggle = actionButton("", "#101929") {
+            updateSetting(settings.copy(hudTelemetryEnabled = !settings.hudTelemetryEnabled))
+        }
+        btnHudTelemetryCorner = actionButton("", "#13284A") { cycleHudTelemetryCorner() }
+        boxSceneProDrawer.addView(buttonRow(btnHudTelemetryToggle, btnHudTelemetryCorner))
+
+        boxSceneProDrawer.addView(labelText("Corner QR Code Overlay (Offline UPI / YouTube / Discord — Max 200 Chars):"))
+        etQrOverlayText = styledEditText(settings.qrOverlayText, isPassword = false).apply {
+            hint = "upi://pay?pa=name@upi&pn=Sol  or  https://youtube.com/@Sol_CODM"
+        }
+        btnQrOverlayToggle = actionButton("", "#101929") { toggleQrOverlayFromDashboard() }
+        btnQrOverlayCorner = actionButton("", "#13284A") { cycleQrOverlayCorner() }
+        boxSceneProDrawer.addView(etQrOverlayText)
+        boxSceneProDrawer.addView(buttonRow(btnQrOverlayToggle, btnQrOverlayCorner))
+
+        boxSceneProDrawer.addView(labelText("Zero-Camera 2-PNG PNGTuber Avatar (Syncs to Mic Voice • Built-In Cyber Fallback):"))
+        btnPickPngTuberIdle = actionButton("", "#13284A") {
+            pendingAssetPickSlot = SolSceneAssetStore.AssetSlot.PNGTUBER_IDLE
+            imageAssetPickerLauncher.launch("image/*")
+        }
+        btnPickPngTuberTalk = actionButton("", "#13284A") {
+            pendingAssetPickSlot = SolSceneAssetStore.AssetSlot.PNGTUBER_TALK
+            imageAssetPickerLauncher.launch("image/*")
+        }
+        btnPngTuberToggle = actionButton("", "#101929") {
+            updateSetting(settings.copy(pngTuberEnabled = !settings.pngTuberEnabled))
+        }
+        btnPngTuberCorner = actionButton("", "#13284A") { cyclePngTuberCorner() }
+        btnPngTuberSize = actionButton("", "#13284A") { cyclePngTuberSize() }
+        boxSceneProDrawer.addView(buttonRow(btnPickPngTuberIdle, btnPickPngTuberTalk))
+        boxSceneProDrawer.addView(buttonRow(btnPngTuberToggle, btnPngTuberCorner, btnPngTuberSize))
 
         boxSceneProDrawer.addView(labelText("Zero-Permission Saved Graphics (Tap to Pick from Gallery):"))
         btnPickStartImg = actionButton("", "#13284A") {
@@ -1165,7 +1276,11 @@ class MainActivity : AppCompatActivity() {
         val btnClearGraphics = actionButton("Clear Saved Graphics", "#1E293B") {
             SolSceneAssetStore.AssetSlot.entries.forEach { SolSceneAssetStore.clearCustomAsset(this, it) }
             updateSetting(settings.copy(overlayImageEnabled = false))
-            Toast.makeText(this, "Cleared custom scene/overlay images (reverted to built-in slates).", Toast.LENGTH_SHORT).show()
+            Toast.makeText(
+                this,
+                "Cleared custom scenes, logo & avatar PNGs (reverted to built-in slates/cyber avatar).",
+                Toast.LENGTH_SHORT
+            ).show()
         }
 
         boxSceneProDrawer.addView(buttonRow(btnPickStartImg, btnPickBrbImg))
@@ -1645,12 +1760,19 @@ class MainActivity : AppCompatActivity() {
         }
 
         val sceneOpen = boxSceneProDrawer.visibility == View.VISIBLE
-        val logoTag = SolStreamService.formatCompactOverlayPositionTag(settings.overlayImageEnabled, settings.overlayPosition)
-        val blurTag = if (settings.minimapShieldEnabled) "Blur:ON" else "Blur:OFF"
+        val proTags = mutableListOf<String>()
+        if (settings.hudTelemetryEnabled) proTags.add("HUD")
+        if (settings.qrOverlayEnabled && settings.qrOverlayText.isNotBlank()) proTags.add("QR")
+        if (settings.pngTuberEnabled) proTags.add("Avatar")
+        if (settings.overlayImageEnabled) {
+            proTags.add(SolStreamService.formatCompactOverlayPositionTag(true, settings.overlayPosition))
+        }
+        if (settings.minimapShieldEnabled) proTags.add("Blur")
+        val sceneSummary = if (proTags.isEmpty()) "All OFF" else proTags.joinToString(" • ")
         btnToggleSceneProDrawer.text = if (sceneOpen) {
-            "▾ Scenes, $logoTag, $blurTag & SolCodec™"
+            "▾ Scenes, SolHUD™, QR, Avatar & SolCodec™ ($sceneSummary)"
         } else {
-            "▸ Scenes, $logoTag, $blurTag & SolCodec™"
+            "▸ Scenes, SolHUD™, QR, Avatar & SolCodec™ ($sceneSummary)"
         }
 
         val voiceOpen = boxVoiceStageDrawer.visibility == View.VISIBLE
@@ -1792,7 +1914,20 @@ class MainActivity : AppCompatActivity() {
         }
         tvRestrictedHint.visibility = if (accEnabled) View.GONE else View.VISIBLE
 
-        // Card 2: 4-Pill Platform Selector, Key Vault Badge, Simulcast & Speed Test
+        // Card 2: 4 Studio Profiles, 4-Pill Platform Selector, Key Vault Badge, Simulcast & Speed Test
+        val loadedProfiles = KeystoreVault.loadAllStudioProfiles(this, settings, scanSummary)
+        for (idx in studioProfileButtons.indices) {
+            val btn = studioProfileButtons[idx]
+            val prof = loadedProfiles.getOrNull(idx) ?: continue
+            btn.text = if (prof.isUserCustomized) "★ ${prof.name}" else prof.name
+            styleToggleBtn(
+                btn,
+                isOn = (idx == activeStudioProfileSlot),
+                activeFillHex = "#0D3652",
+                activeStrokeHex = "#00E5FF"
+            )
+        }
+
         val activePlat = settings.platformPreset.uppercase(Locale.US)
         platformPillButtons.forEach { (pKey, btn) ->
             styleToggleBtn(btn, isOn = (pKey == activePlat))
@@ -1909,6 +2044,30 @@ class MainActivity : AppCompatActivity() {
             "GPU Crisp Sharpen: OFF (Recommended — Coolest Temp)"
         }
         styleToggleBtn(btnSharpen, isOn = settings.gpuSharpen)
+
+        // Phase 1 (v1.5.0) Pro Broadcast Overlays inside Card 3 Drawer
+        btnHudTelemetryToggle.text = "SolHUD™ Telemetry: ${onOff(settings.hudTelemetryEnabled)}"
+        styleToggleBtn(btnHudTelemetryToggle, isOn = settings.hudTelemetryEnabled)
+        btnHudTelemetryCorner.text = "HUD Corner: ${SolStreamService.formatCompactCornerShortTag(settings.hudTelemetryCorner)}"
+
+        if (!etQrOverlayText.hasFocus() && etQrOverlayText.text?.toString() != settings.qrOverlayText) {
+            etQrOverlayText.setText(settings.qrOverlayText)
+        }
+        val qrActive = settings.qrOverlayEnabled && settings.qrOverlayText.isNotBlank()
+        btnQrOverlayToggle.text = "Corner QR Overlay: ${onOff(qrActive)}"
+        styleToggleBtn(btnQrOverlayToggle, isOn = qrActive)
+        btnQrOverlayCorner.text = "QR Corner: ${SolStreamService.formatCompactCornerShortTag(settings.qrOverlayCorner)}"
+
+        val hasPngIdle = SolSceneAssetStore.hasCustomAsset(this, SolSceneAssetStore.AssetSlot.PNGTUBER_IDLE)
+        val hasPngTalk = SolSceneAssetStore.hasCustomAsset(this, SolSceneAssetStore.AssetSlot.PNGTUBER_TALK)
+        btnPickPngTuberIdle.text = "Idle PNG (${if (hasPngIdle) "Saved" else "Cyber Default"})"
+        styleToggleBtn(btnPickPngTuberIdle, isOn = hasPngIdle, activeFillHex = "#13284A", activeStrokeHex = "#38BDF8")
+        btnPickPngTuberTalk.text = "Talk PNG (${if (hasPngTalk) "Saved" else "Cyber Default"})"
+        styleToggleBtn(btnPickPngTuberTalk, isOn = hasPngTalk, activeFillHex = "#13284A", activeStrokeHex = "#38BDF8")
+        btnPngTuberToggle.text = "Avatar: ${onOff(settings.pngTuberEnabled)}"
+        styleToggleBtn(btnPngTuberToggle, isOn = settings.pngTuberEnabled)
+        btnPngTuberCorner.text = "Pos: ${SolStreamService.formatCompactCornerShortTag(settings.pngTuberCorner)}"
+        btnPngTuberSize.text = "Size: ${settings.pngTuberSizePercent}%"
 
         // Scenes, Unified Logo:OFF Overlay, Dual Privacy Blur & Pro Silicon Drawer
         val hasStart = SolSceneAssetStore.hasCustomAsset(this, SolSceneAssetStore.AssetSlot.STARTING_SOON)
@@ -2042,7 +2201,7 @@ class MainActivity : AppCompatActivity() {
         btnGameBlastTamer.text = "Blast Tamer (35ms Smooth): ${onOff(settings.gameBlastTamerEnabled)}"
         styleToggleBtn(btnGameBlastTamer, isOn = settings.gameBlastTamerEnabled)
 
-        // Individual 6-Stage SolLuxe™ 3.0 Pure Switches (Accurate Naming + Auto/Manual HPF Badge)
+        // Individual 6-Stage SolLuxe™ 3.0 Pure Switches
         btnStageHpf.text = when {
             settings.hpfCutoffHz == 0 -> "1. Butterworth HPF: OFF"
             settings.hpfAutoMode -> "1. HPF: ${settings.hpfCutoffHz} Hz (Auto)"
@@ -2162,6 +2321,120 @@ class MainActivity : AppCompatActivity() {
             ).show()
         }
         refreshAllUi()
+    }
+
+    // === PHASE 1 (v1.5.0) STUDIO PROFILES & PRO OVERLAY HANDLERS ===
+    private fun loadStudioProfileSlot(slotIndex: Int) {
+        val loaded = KeystoreVault.loadStudioProfile(this, slotIndex, settings, scanSummary)
+        val next = loaded.settings
+        val needsRestart = next.codec != settings.codec ||
+            next.width != settings.width ||
+            next.height != settings.height ||
+            next.fps != settings.fps ||
+            next.isVertical != settings.isVertical ||
+            next.hdr10Enabled != settings.hdr10Enabled ||
+            next.audioBitrateKbps != settings.audioBitrateKbps
+        activeStudioProfileSlot = slotIndex
+        updateSetting(next, requiresRestartIfLive = needsRestart)
+        val resTag = "${min(next.width, next.height)}p${next.fps}"
+        val orientTag = if (next.isVertical) "9:16" else "16:9"
+        Toast.makeText(
+            this,
+            "Loaded Profile: ${loaded.name} ($resTag $orientTag • ${next.codec} • ${formatBitrateMbps(next.targetBitrateKbps)})",
+            Toast.LENGTH_SHORT
+        ).show()
+    }
+
+    private fun showSaveStudioProfileDialog(slotIndex: Int) {
+        val existing = KeystoreVault.loadStudioProfile(this, slotIndex, settings, scanSummary)
+        val nameInput = styledEditText(existing.name, isPassword = false).apply {
+            hint = "Profile Name (max 20 chars)"
+        }
+        val wrap = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(18), dp(10), dp(18), dp(4))
+            addView(bodyText("Save your current video, audio & overlay settings into Slot #${slotIndex + 1}. (Stream Keys are never saved inside profiles.)"))
+            addView(nameInput)
+        }
+        AlertDialog.Builder(this)
+            .setTitle("Studio Profile Slot #${slotIndex + 1}")
+            .setView(wrap)
+            .setPositiveButton("Save Current Setup") { _, _ ->
+                saveVaultInputs(showToast = false)
+                val chosenName = nameInput.text?.toString()?.trim()?.take(20).orEmpty().ifBlank { existing.name }
+                val ok = KeystoreVault.saveStudioProfile(this, slotIndex, chosenName, settings)
+                if (ok) {
+                    activeStudioProfileSlot = slotIndex
+                    refreshAllUi()
+                    Toast.makeText(this, "Saved current setup to \"$chosenName\"!", Toast.LENGTH_SHORT).show()
+                } else {
+                    Toast.makeText(this, "Could not save profile slot.", Toast.LENGTH_SHORT).show()
+                }
+            }
+            .setNeutralButton("Reset Default") { _, _ ->
+                KeystoreVault.resetStudioProfile(this, slotIndex)
+                if (activeStudioProfileSlot == slotIndex) activeStudioProfileSlot = -1
+                refreshAllUi()
+                Toast.makeText(this, "Reset Slot #${slotIndex + 1} to hardware default.", Toast.LENGTH_SHORT).show()
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    private fun nextCornerInOrder(currentCorner: String): String {
+        val order = SolStreamService.CORNER_POSITION_ORDER
+        val idx = order.indexOf(currentCorner.uppercase(Locale.US))
+        return order[(idx + 1) % order.size]
+    }
+
+    private fun cycleHudTelemetryCorner() {
+        updateSetting(settings.copy(hudTelemetryCorner = nextCornerInOrder(settings.hudTelemetryCorner)))
+    }
+
+    private fun toggleQrOverlayFromDashboard() {
+        val rawText = etQrOverlayText.text?.toString()?.trim()?.take(KeystoreVault.MAX_QR_OVERLAY_CHARS) ?: ""
+        val nextEnabled = !(settings.qrOverlayEnabled && settings.qrOverlayText.isNotBlank())
+        if (nextEnabled) {
+            if (rawText.isEmpty()) {
+                Toast.makeText(
+                    this,
+                    "Enter a UPI, YouTube, or Discord link in the QR box first!",
+                    Toast.LENGTH_LONG
+                ).show()
+                return
+            }
+            val utf8Bytes = rawText.toByteArray(StandardCharsets.UTF_8).size
+            if (utf8Bytes > SolHudAndQrRenderer.MAX_QR_UTF8_BYTES) {
+                Toast.makeText(
+                    this,
+                    "QR link is $utf8Bytes UTF-8 bytes (max ${SolHudAndQrRenderer.MAX_QR_UTF8_BYTES} bytes). Shorten the link so cameras can scan it!",
+                    Toast.LENGTH_LONG
+                ).show()
+                return
+            }
+        }
+        updateSetting(settings.copy(qrOverlayText = rawText, qrOverlayEnabled = nextEnabled))
+    }
+
+    private fun cycleQrOverlayCorner() {
+        val rawText = etQrOverlayText.text?.toString()?.trim()?.take(KeystoreVault.MAX_QR_OVERLAY_CHARS) ?: settings.qrOverlayText
+        updateSetting(
+            settings.copy(
+                qrOverlayText = rawText,
+                qrOverlayCorner = nextCornerInOrder(settings.qrOverlayCorner)
+            )
+        )
+    }
+
+    private fun cyclePngTuberCorner() {
+        updateSetting(settings.copy(pngTuberCorner = nextCornerInOrder(settings.pngTuberCorner)))
+    }
+
+    private fun cyclePngTuberSize() {
+        val steps = listOf(12, 15, 18, 22, 26, 30)
+        val idx = steps.indexOf(settings.pngTuberSizePercent)
+        val nextSize = steps[(idx + 1) % steps.size]
+        updateSetting(settings.copy(pngTuberSizePercent = nextSize))
     }
 
     // === PLATFORM, SIMULCAST & VIDEO PILL HANDLERS ===
@@ -2553,6 +2826,7 @@ class MainActivity : AppCompatActivity() {
         val imported = KeystoreVault.importPresetJson(raw, settings)
         if (imported != null) {
             val (clamped, wasAdapted) = KeystoreVault.clampImportedSettingsToHardware(imported, scanSummary)
+            activeStudioProfileSlot = -1
             updateSetting(clamped, requiresRestartIfLive = true)
             val msg = if (wasAdapted) {
                 "Preset imported & auto-adapted to your phone's verified hardware capabilities!"
@@ -2646,7 +2920,7 @@ class MainActivity : AppCompatActivity() {
                 badgeText = "CARD 1 • 3-STEP QUICK START",
                 titleText = "Go Live in Under 60 Seconds",
                 bodyContent = "1. Paste your YouTube, Twitch, or Kick Stream Key in Card 2 (AES-256 Hardware Keystore encrypted).\n" +
-                    "2. Pick your Device Tier (Card 0) and Gender Voice Profile (Card 4) — HPF, bitrate, and codecs auto-sync.\n" +
+                    "2. Pick your Device Tier (Card 0), One-Tap Studio Profile (Card 2), and Gender Voice Profile (Card 4) — HPF, bitrate, and codecs auto-sync.\n" +
                     "3. Tap GO LIVE. In YouTube Studio, keep 'Turn on manual settings' OFF so one key works for both 16:9 and 9:16 Shorts.",
                 accentHex = "#00E5FF"
             )
@@ -2682,11 +2956,12 @@ class MainActivity : AppCompatActivity() {
 
         guideContainer.addView(
             makeGuideCard(
-                badgeText = "CARD 4 • CONTROLS & VIDEO",
-                titleText = "Floating Pill, Notification Bar & Privacy",
-                bodyContent = "• Floating Pill: Double-tap or hold the compact pill to open 3 tabs (Audio, Video, Bitrate/Net). Tap Logo:OFF to cycle OFF → FULL → TL → TR → BL → BR.\n" +
-                    "• Safe Notification Shade: Exactly 3 quick actions (Mute Mic, Scene/BRB, ★ Clip) — Stop is safely locked inside the app & Floating Pill with 2-tap confirm.\n" +
-                    "• Framing & Privacy: Use STRETCH (16:9) for zero black bars + 100% HUD. Auto-Blur Keyboard protects passwords automatically when typing.",
+                badgeText = "CARD 4 • CONTROLS, PRO OVERLAYS & VIDEO",
+                titleText = "Floating Pill, SolHUD™, QR, PNGTuber & Thumbnails",
+                bodyContent = "• Floating Pill: Double-tap or hold the compact pill to open 3 tabs (Audio, Video, Bitrate/Net). Tap 📸 Shot in Video tab to save a clean pill-free 1080p YouTube thumbnail to Pictures/SolStream/.\n" +
+                    "• Pro Overlays (Opt-In, 0 MB VRAM When OFF): Turn on SolHUD™ (live FPS • °C • Mbps visible even in Single-App Capture), offline Corner QR (UPI / YouTube / Discord), or zero-camera 2-PNG PNGTuber Avatar.\n" +
+                    "• Studio Profiles: Tap any of the 4 profiles in Card 2 to switch setups in 1 tap; long-press any slot to save & rename your current setup.\n" +
+                    "• Safe Notification Shade: Exactly 3 quick actions (Mute Mic, Scene/BRB, ★ Clip) — Stop is safely locked inside the app & Floating Pill with 2-tap confirm.",
                 accentHex = "#38BDF8"
             )
         )
@@ -2719,6 +2994,7 @@ class MainActivity : AppCompatActivity() {
 
     // === VAULT & KEY VISIBILITY ACTIONS ===
     private fun saveVaultInputs(showToast: Boolean): Boolean {
+        if (!::etRtmpsUrl.isInitialized || !::etStreamKey.isInitialized) return false
         val rawUrl = etRtmpsUrl.text?.toString() ?: KeystoreVault.DEFAULT_YOUTUBE_RTMPS
         val normalizedUrl = KeystoreVault.normalizeIngestUrl(rawUrl)
         val cleanKey = KeystoreVault.sanitizeStreamKeyInput(etStreamKey.text?.toString() ?: "")
@@ -2740,11 +3016,32 @@ class MainActivity : AppCompatActivity() {
         )
         val allSavedOk = okPrimary && okShorts && okTwitch && okKick
 
-        val bannerTxt = etBannerText.text?.toString()?.trim()?.take(80) ?: ""
-        if (bannerTxt != settings.liveBannerText) {
-            settings = settings.copy(liveBannerText = bannerTxt)
+        var overlayTextsChanged = false
+        var updatedSettings = settings
+        if (::etBannerText.isInitialized) {
+            val bannerTxt = etBannerText.text?.toString()?.trim()?.take(80) ?: ""
+            if (bannerTxt != updatedSettings.liveBannerText) {
+                updatedSettings = updatedSettings.copy(liveBannerText = bannerTxt)
+                overlayTextsChanged = true
+                SolSceneAssetStore.bumpRevision()
+            }
+        }
+        if (::etQrOverlayText.isInitialized) {
+            val qrTxt = etQrOverlayText.text?.toString()?.trim()?.take(KeystoreVault.MAX_QR_OVERLAY_CHARS) ?: ""
+            if (qrTxt != updatedSettings.qrOverlayText) {
+                val keepQrOn = updatedSettings.qrOverlayEnabled &&
+                    qrTxt.isNotEmpty() &&
+                    qrTxt.toByteArray(StandardCharsets.UTF_8).size <= SolHudAndQrRenderer.MAX_QR_UTF8_BYTES
+                updatedSettings = updatedSettings.copy(
+                    qrOverlayText = qrTxt,
+                    qrOverlayEnabled = keepQrOn
+                )
+                overlayTextsChanged = true
+            }
+        }
+        if (overlayTextsChanged) {
+            settings = updatedSettings
             KeystoreVault.saveSettings(this, settings)
-            SolSceneAssetStore.bumpRevision()
             if (SolStreamService.isBroadcastLive) {
                 SolStreamService.instance?.applyDashboardSettingsLive(settings)
             }
@@ -2937,6 +3234,7 @@ class MainActivity : AppCompatActivity() {
             val now = SystemClock.uptimeMillis()
             if (now - lastDashboardStopTapMs < 2500L) {
                 lastDashboardStopTapMs = 0L
+                uiHandler.removeCallbacks(dashboardStopResetRunnable)
                 val liveSvc = SolStreamService.instance
                 if (liveSvc != null) {
                     liveSvc.stopLiveBroadcast("Stopped from dashboard")
@@ -2949,11 +3247,8 @@ class MainActivity : AppCompatActivity() {
                 lastDashboardStopTapMs = now
                 btnGoLive.text = "⚠️ TAP AGAIN WITHIN 2.5s TO STOP LIVE STREAM"
                 Toast.makeText(this, "Tap STOP again to end your live broadcast.", Toast.LENGTH_SHORT).show()
-                uiHandler.postDelayed({
-                    if (!isFinishing && !isDestroyed && SolStreamService.isBroadcastLive) {
-                        btnGoLive.text = "⏹ STOP LIVE STREAM"
-                    }
-                }, 2500L)
+                uiHandler.removeCallbacks(dashboardStopResetRunnable)
+                uiHandler.postDelayed(dashboardStopResetRunnable, 2500L)
             }
             return
         }
@@ -3556,18 +3851,18 @@ class MainActivity : AppCompatActivity() {
         val msg = """
             $detectedBrandTip
 
-            1. LONG-STREAM BATTERY PROTECTION (Zero Extra Permissions):
-            • Tap 'Battery / App Info' below → Battery → select 'Unrestricted'.
+1. LONG-STREAM BATTERY PROTECTION (Zero Extra Permissions):
+- Tap 'Battery / App Info' below → Battery → select 'Unrestricted'.
 
-            2. ENABLE ACCESSIBILITY DOCK (Play Store & Sideloaded APK):
-            • Play Store install: Tap 'Step 3: Accessibility' and switch SolStream Studio ON in 1 tap.
-            • Sideloaded GitHub APK (Android 13–18):
+2. ENABLE ACCESSIBILITY DOCK (Play Store & Sideloaded APK):
+- Play Store install: Tap 'Step 3: Accessibility' and switch SolStream Studio ON in 1 tap.
+- Sideloaded GitHub APK (Android 13–18):
               a) Tap 'Step 3: Accessibility' → Installed apps → tap greyed-out SolStream Studio once & press OK.
               b) Tap 'Step 4: App Info (⋮)' → tap ⋮ at top-right → 'Allow restricted settings', then switch ON.
 
-            3. EARPHONES, WIRED & USB-C MICS (SolLuxe™ 3.0 Pure 4×3 Matrix):
-            • Bluetooth Earphones stay in 100% HD Stereo (A2DP) for footsteps while SolStream captures your phone's 48 kHz studio mic.
-            • Plugging in a Wired 3.5mm or USB-C mic auto-switches from Far-Field to Close-Talk tuning and forces hardware Speaker AEC OFF.
+3. EARPHONES, WIRED & USB-C MICS (SolLuxe™ 3.0 Pure 4×3 Matrix):
+- Bluetooth Earphones stay in 100% HD Stereo (A2DP) for footsteps while SolStream captures your phone's 48 kHz studio mic.
+- Plugging in a Wired 3.5mm or USB-C mic auto-switches from Far-Field to Close-Talk tuning and forces hardware Speaker AEC OFF.
         """.trimIndent()
 
         AlertDialog.Builder(this)
