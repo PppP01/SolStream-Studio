@@ -435,9 +435,9 @@ class MainActivity : AppCompatActivity() {
                 @Suppress("DEPRECATION")
                 packageManager.getPackageInfo(packageName, 0)
             }
-            info.versionName?.removeSuffix("-debug") ?: "1.5.0"
+            info.versionName?.removeSuffix("-debug") ?: "1.5.1"
         } catch (_: Exception) {
-            "1.5.0"
+            "1.5.1"
         }
     }
 
@@ -647,7 +647,14 @@ class MainActivity : AppCompatActivity() {
             background = roundedDrawable("#F59E0B", "#FDE68A")
             setPadding(dp(12), dp(4), dp(12), dp(4))
             layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, dp(32))
-            setOnClickListener { openBatteryUnrestricted() }
+            setOnClickListener {
+                val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+                if (pm.isIgnoringBatteryOptimizations(packageName)) {
+                    showAllBrandSetupGuide()
+                } else {
+                    openBatteryUnrestricted()
+                }
+            }
         }
         protectTopRow.addView(tvProtectTitle)
         protectTopRow.addView(btnProtectAction)
@@ -948,14 +955,15 @@ class MainActivity : AppCompatActivity() {
         }
 
         boxSimulcastDrawer.addView(
-            labelText("Slot #2 — YouTube 9:16 Shorts Key (Keep 'Turn on manual settings' OFF in YT Studio):")
+            labelText("Slot #2 — 9:16 Vertical Shorts Key (Paste your Shorts key here; auto-enables switch below — keep 'Manual settings' OFF in YT Studio):")
         )
         etShortsKey = styledEditText(KeystoreVault.getShortsStreamKey(this), isPassword = true).apply {
-            hint = "Optional Slot #2 Variable Key for 9:16 Shorts"
+            hint = "Paste 9:16 Vertical / Shorts Stream Key here"
         }
         btnUseShortsSlot = actionButton("", "#101929") {
-            saveVaultInputs(showToast = false)
-            updateSetting(settings.copy(useShortsKeySlot = !settings.useShortsKeySlot), requiresRestartIfLive = true)
+            val nextUseSlot = !settings.useShortsKeySlot
+            saveVaultInputs(showToast = false, autoEnableShortsIfNewlyAdded = false)
+            updateSetting(settings.copy(useShortsKeySlot = nextUseSlot), requiresRestartIfLive = true)
         }
         boxSimulcastDrawer.addView(etShortsKey)
         boxSimulcastDrawer.addView(btnUseShortsSlot)
@@ -1944,7 +1952,7 @@ class MainActivity : AppCompatActivity() {
 
         btnShowHideKey.text = if (showStreamKeyPlain) "Hide Key" else "Show Key"
         btnUseShortsSlot.text =
-            "Auto-Use Slot #2 Key When 9:16 Shorts Selected: ${onOff(settings.useShortsKeySlot)}"
+            "Use Slot #2 Key for 9:16 Vertical Shorts: ${onOff(settings.useShortsKeySlot)}"
         styleToggleBtn(btnUseShortsSlot, isOn = settings.useShortsKeySlot)
 
         val dualSupported = scanSummary.supportsDualFormatCompanion(primaryCodec = settings.codec)
@@ -2045,7 +2053,7 @@ class MainActivity : AppCompatActivity() {
         }
         styleToggleBtn(btnSharpen, isOn = settings.gpuSharpen)
 
-        // Phase 1 (v1.5.0) Pro Broadcast Overlays inside Card 3 Drawer
+        // Phase 1 (v1.5.0+) Pro Broadcast Overlays inside Card 3 Drawer
         btnHudTelemetryToggle.text = "SolHUD™ Telemetry: ${onOff(settings.hudTelemetryEnabled)}"
         styleToggleBtn(btnHudTelemetryToggle, isOn = settings.hudTelemetryEnabled)
         btnHudTelemetryCorner.text = "HUD Corner: ${SolStreamService.formatCompactCornerShortTag(settings.hudTelemetryCorner)}"
@@ -2107,7 +2115,7 @@ class MainActivity : AppCompatActivity() {
         styleToggleBtn(btnBannerToggle, isOn = settings.liveBannerEnabled)
 
         btnBannerPos.text = "Banner Pos: ${settings.liveBannerPosition}"
-        btnShortsBackdrop.text = "9:16 Shorts Canvas: ${settings.shortsBackdropMode} (40% Cooler GPU Blur)"
+        btnShortsBackdrop.text = formatShortsBackdropButtonLabel(settings.shortsBackdropMode)
         btnMinimapShield.text =
             "Privacy / Minimap Blur Shield: ${onOff(settings.minimapShieldEnabled)} (${settings.minimapShieldCorner})"
         styleToggleBtn(btnMinimapShield, isOn = settings.minimapShieldEnabled)
@@ -2323,7 +2331,7 @@ class MainActivity : AppCompatActivity() {
         refreshAllUi()
     }
 
-    // === PHASE 1 (v1.5.0) STUDIO PROFILES & PRO OVERLAY HANDLERS ===
+    // === PHASE 1 (v1.5.0+) STUDIO PROFILES & PRO OVERLAY HANDLERS ===
     private fun loadStudioProfileSlot(slotIndex: Int) {
         val loaded = KeystoreVault.loadStudioProfile(this, slotIndex, settings, scanSummary)
         val next = loaded.settings
@@ -2972,7 +2980,7 @@ class MainActivity : AppCompatActivity() {
                 titleText = "Data Safety, Accessibility & Credits",
                 bodyContent = "• Zero Data Collection: All video/audio processing runs locally on-device and streams solely to your configured RTMP/RTMPS ingest. Zero developer servers, zero analytics, zero ads.\n" +
                     "• Hardware Keystore: Stream keys are encrypted via Android Keystore (AES-256-GCM) and auto-redacted ([REDACTED_KEY]) from logs.\n" +
-                    "• AccessibilityService Policy: Used optionally for the assistive floating dock and continuous mic routing alongside game voice chat. Strictly sets canRetrieveWindowContent=\"false\" and canPerformGestures=\"false\" — cannot read screen text or passwords.\n\n" +
+                    "• AccessibilityService Policy: Used optionally for the assistive floating dock and continuous mic routing alongside game voice chat. Strictly sets isAccessibilityTool=\"false\", canRetrieveWindowContent=\"false\", and canPerformGestures=\"false\" — cannot read screen text or passwords.\n\n" +
                     "Open-Source Credits:\n" +
                     "1. RootEncoder (Pedro Sánchez / pedroSG94) — Apache-2.0\n" +
                     "2. Xiph RNNoise v0.1.1 (Xiph.Org & Jean-Marc Valin) — BSD 3-Clause\n" +
@@ -2993,8 +3001,20 @@ class MainActivity : AppCompatActivity() {
     }
 
     // === VAULT & KEY VISIBILITY ACTIONS ===
-    private fun saveVaultInputs(showToast: Boolean): Boolean {
-        if (!::etRtmpsUrl.isInitialized || !::etStreamKey.isInitialized) return false
+    private fun saveVaultInputs(
+        showToast: Boolean,
+        autoEnableShortsIfNewlyAdded: Boolean = true
+    ): Boolean {
+        if (!::etRtmpsUrl.isInitialized ||
+            !::etStreamKey.isInitialized ||
+            !::etShortsKey.isInitialized ||
+            !::etTwitchUrl.isInitialized ||
+            !::etTwitchKey.isInitialized ||
+            !::etKickUrl.isInitialized ||
+            !::etKickKey.isInitialized
+        ) {
+            return false
+        }
         val rawUrl = etRtmpsUrl.text?.toString() ?: KeystoreVault.DEFAULT_YOUTUBE_RTMPS
         val normalizedUrl = KeystoreVault.normalizeIngestUrl(rawUrl)
         val cleanKey = KeystoreVault.sanitizeStreamKeyInput(etStreamKey.text?.toString() ?: "")
@@ -3002,8 +3022,11 @@ class MainActivity : AppCompatActivity() {
             etRtmpsUrl.setText(normalizedUrl)
         }
 
+        val prevShortsKey = KeystoreVault.getShortsStreamKey(this)
+        val cleanShortsKey = KeystoreVault.sanitizeStreamKeyInput(etShortsKey.text?.toString() ?: "")
+
         val okPrimary = KeystoreVault.saveEndpointAndKey(this, normalizedUrl, cleanKey)
-        val okShorts = KeystoreVault.saveShortsStreamKey(this, etShortsKey.text?.toString() ?: "")
+        val okShorts = KeystoreVault.saveShortsStreamKey(this, cleanShortsKey)
         val okTwitch = KeystoreVault.saveTwitchUrlAndKey(
             this,
             etTwitchUrl.text?.toString() ?: KeystoreVault.DEFAULT_TWITCH_RTMPS,
@@ -3016,13 +3039,26 @@ class MainActivity : AppCompatActivity() {
         )
         val allSavedOk = okPrimary && okShorts && okTwitch && okKick
 
-        var overlayTextsChanged = false
+        var settingsChanged = false
+        var autoEnabledShortsSlot = false
         var updatedSettings = settings
+
+        if (autoEnableShortsIfNewlyAdded &&
+            okShorts &&
+            prevShortsKey.isEmpty() &&
+            cleanShortsKey.isNotEmpty() &&
+            !updatedSettings.useShortsKeySlot
+        ) {
+            updatedSettings = updatedSettings.copy(useShortsKeySlot = true)
+            settingsChanged = true
+            autoEnabledShortsSlot = true
+        }
+
         if (::etBannerText.isInitialized) {
             val bannerTxt = etBannerText.text?.toString()?.trim()?.take(80) ?: ""
             if (bannerTxt != updatedSettings.liveBannerText) {
                 updatedSettings = updatedSettings.copy(liveBannerText = bannerTxt)
-                overlayTextsChanged = true
+                settingsChanged = true
                 SolSceneAssetStore.bumpRevision()
             }
         }
@@ -3036,10 +3072,10 @@ class MainActivity : AppCompatActivity() {
                     qrOverlayText = qrTxt,
                     qrOverlayEnabled = keepQrOn
                 )
-                overlayTextsChanged = true
+                settingsChanged = true
             }
         }
-        if (overlayTextsChanged) {
+        if (settingsChanged) {
             settings = updatedSettings
             KeystoreVault.saveSettings(this, settings)
             if (SolStreamService.isBroadcastLive) {
@@ -3061,10 +3097,13 @@ class MainActivity : AppCompatActivity() {
         }
 
         if (showToast) {
-            val msg = if (cleanKey.isEmpty()) {
-                "Ingest URL & auxiliary slots saved (Primary Key box is empty)."
-            } else {
-                "All Stream Keys encrypted in Android Hardware Keystore!"
+            val msg = when {
+                autoEnabledShortsSlot ->
+                    "Saved! Slot #2 Shorts Key auto-enabled for 9:16 Vertical streams."
+                cleanKey.isEmpty() ->
+                    "Ingest URL & auxiliary slots saved (Primary Key box is empty)."
+                else ->
+                    "All Stream Keys encrypted in Android Hardware Keystore!"
             }
             Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
         }
@@ -3165,7 +3204,7 @@ class MainActivity : AppCompatActivity() {
             "1. Display an assistive floating in-game broadcast control dock (TYPE_ACCESSIBILITY_OVERLAY) for one-tap microphone mute, privacy blur shield, scene switching, and clip markers over full-screen games.\n" +
             "2. Maintain continuous microphone audio routing alongside internal game audio when multiplayer games activate in-game squad voice chat.\n\n" +
             "Privacy & Security Guarantee:\n" +
-            "• SolStream Studio CANNOT read your screen text, passwords, messages, or personal data (canRetrieveWindowContent is strictly false and canPerformGestures is false).\n" +
+            "• SolStream Studio CANNOT read your screen text, passwords, messages, or personal data (isAccessibilityTool is false, canRetrieveWindowContent is strictly false, and canPerformGestures is false).\n" +
             "• Zero audio, video, or personal data is ever collected, stored, or shared with developer servers; all streams are sent directly to your own configured RTMP/RTMPS server.\n\n" +
             "Sideloaded APK Note (Android 13–18): If SolStream Studio is greyed out in Accessibility, tap it once -> tap 'Step 4: App Info (⋮)' -> tap ⋮ at top-right -> 'Allow restricted settings'."
 
@@ -3260,7 +3299,10 @@ class MainActivity : AppCompatActivity() {
             Toast.makeText(this, "Please paste or type your Stream Key first!", Toast.LENGTH_LONG).show()
             return
         }
-        if (settings.dualFormatCompanionEnabled && !KeystoreVault.hasDistinctCompanionShortsKey(this)) {
+        if (!settings.isVertical &&
+            settings.dualFormatCompanionEnabled &&
+            !KeystoreVault.hasDistinctCompanionShortsKey(this)
+        ) {
             Toast.makeText(
                 this,
                 "Dual-Format 9:16 Companion is ON, but Slot #2 Shorts Key is empty or identical to Primary Key! Paste a 2nd Stream Key in Slot #2 or turn Dual-Format OFF.",
@@ -3848,22 +3890,17 @@ class MainActivity : AppCompatActivity() {
                     "• Set Battery to 'Unrestricted' in App Info so Android never pauses your background broadcast."
         }
 
-        val msg = """
-            $detectedBrandTip
-
-1. LONG-STREAM BATTERY PROTECTION (Zero Extra Permissions):
-- Tap 'Battery / App Info' below → Battery → select 'Unrestricted'.
-
-2. ENABLE ACCESSIBILITY DOCK (Play Store & Sideloaded APK):
-- Play Store install: Tap 'Step 3: Accessibility' and switch SolStream Studio ON in 1 tap.
-- Sideloaded GitHub APK (Android 13–18):
-              a) Tap 'Step 3: Accessibility' → Installed apps → tap greyed-out SolStream Studio once & press OK.
-              b) Tap 'Step 4: App Info (⋮)' → tap ⋮ at top-right → 'Allow restricted settings', then switch ON.
-
-3. EARPHONES, WIRED & USB-C MICS (SolLuxe™ 3.0 Pure 4×3 Matrix):
-- Bluetooth Earphones stay in 100% HD Stereo (A2DP) for footsteps while SolStream captures your phone's 48 kHz studio mic.
-- Plugging in a Wired 3.5mm or USB-C mic auto-switches from Far-Field to Close-Talk tuning and forces hardware Speaker AEC OFF.
-        """.trimIndent()
+        val msg = "$detectedBrandTip\n\n" +
+            "1. LONG-STREAM BATTERY PROTECTION (Zero Extra Permissions):\n" +
+            "• Tap 'Battery / App Info' below → Battery → select 'Unrestricted'.\n\n" +
+            "2. ENABLE ACCESSIBILITY DOCK (Play Store & Sideloaded APK):\n" +
+            "• Play Store install: Tap 'Step 3: Accessibility' and switch SolStream Studio ON in 1 tap.\n" +
+            "• Sideloaded GitHub APK (Android 13–18):\n" +
+            "  a) Tap 'Step 3: Accessibility' → Installed apps → tap greyed-out SolStream Studio once & press OK.\n" +
+            "  b) Tap 'Step 4: App Info (⋮)' → tap ⋮ at top-right → 'Allow restricted settings', then switch ON.\n\n" +
+            "3. EARPHONES, WIRED & USB-C MICS (SolLuxe™ 3.0 Pure 4×3 Matrix):\n" +
+            "• Bluetooth Earphones stay in 100% HD Stereo (A2DP) for footsteps while SolStream captures your phone's 48 kHz studio mic.\n" +
+            "• Plugging in a Wired 3.5mm or USB-C mic auto-switches from Far-Field to Close-Talk tuning and forces hardware Speaker AEC OFF."
 
         AlertDialog.Builder(this)
             .setTitle("🛡️ All-Brand Anti-Kill & Setup Guide")
@@ -4105,4 +4142,14 @@ class MainActivity : AppCompatActivity() {
     private fun onOff(v: Boolean): String = if (v) "ON" else "OFF"
     private fun dp(v: Int): Int =
         TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, v.toFloat(), resources.displayMetrics).toInt()
+
+    companion object {
+        internal fun formatShortsBackdropButtonLabel(mode: String): String {
+            return when (mode.trim().uppercase(Locale.US)) {
+                "DARK" -> "9:16 Shorts Canvas: DARK (0% Extra GPU — Coolest)"
+                "POSTER" -> "9:16 Shorts Canvas: POSTER (Static Image — Low GPU)"
+                else -> "9:16 Shorts Canvas: BLUR (40% Cooler Scissor Blur)"
+            }
+        }
+    }
 }
