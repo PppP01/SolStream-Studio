@@ -10,6 +10,7 @@ package com.solgaming.solstreamstudio
 
 import android.media.MediaCodec
 import android.media.MediaFormat
+import android.os.BatteryManager
 import android.os.PowerManager
 import com.solgaming.solstreamstudio.recorder.SolHudAndQrRenderer
 import org.junit.Assert.assertEquals
@@ -1013,11 +1014,11 @@ class SolStreamUnitTests {
         assertEquals("SOL LUXE 3.0 (Pure Condenser)", MicDspProcessor.presetDisplayName("SOL_LUXE"))
     }
 
-    // === PHASE 1 (v1.5.0) UNIT TESTS ===
+    // === PHASE 1 (v1.5.0 / v1.5.1) UNIT TESTS ===
 
     @Test
     fun diagnosticsReportFreeze_stopsResamplingAfterSessionFinalized() {
-        assertEquals("v1.5.0", DiagnosticsLogger.ENGINE_VERSION)
+        assertEquals("v1.5.1", DiagnosticsLogger.ENGINE_VERSION)
         try {
             DiagnosticsLogger.resetSessionLifecycleForTests()
             // Before any session starts -> allowed to sample idle hardware health
@@ -1394,5 +1395,192 @@ class SolStreamUnitTests {
         assertEquals(1920, applied.width)
         assertEquals(1080, applied.height)
         assertEquals(30, applied.fps)
+    }
+
+    // === v1.5.1 POLISH & PLAY STORE RELEASE UNIT TESTS ===
+
+    @Test
+    fun powerSourceClassifier_detectsBypassChargingAndAvoidsFalsePositives() {
+        // Unplugged -> Battery
+        assertEquals(
+            "Battery",
+            CodecCapabilityProbe.resolvePowerSourceLabel(
+                plugged = 0,
+                status = BatteryManager.BATTERY_STATUS_DISCHARGING,
+                battPct = 75
+            )
+        )
+
+        // Samsung Pause USB PD reporting NOT_CHARGING while on AC
+        assertEquals(
+            "Bypass Charging (USB-PD)",
+            CodecCapabilityProbe.resolvePowerSourceLabel(
+                plugged = BatteryManager.BATTERY_PLUGGED_AC,
+                status = BatteryManager.BATTERY_STATUS_NOT_CHARGING,
+                battPct = 68,
+                currentAvgMicroAmps = 0,
+                currentNowMicroAmps = 10_000
+            )
+        )
+
+        // Samsung Pause USB PD reporting CHARGING with small transient buffer current (-120 mA)
+        assertEquals(
+            "Bypass Charging (USB-PD)",
+            CodecCapabilityProbe.resolvePowerSourceLabel(
+                plugged = BatteryManager.BATTERY_PLUGGED_AC,
+                status = BatteryManager.BATTERY_STATUS_CHARGING,
+                battPct = 72,
+                currentAvgMicroAmps = -120_000,
+                currentNowMicroAmps = -140_000
+            )
+        )
+
+        // Falls back to CURRENT_NOW when CURRENT_AVERAGE is 0 (unsupported OEM)
+        assertEquals(
+            "Bypass Charging (USB-PD)",
+            CodecCapabilityProbe.resolvePowerSourceLabel(
+                plugged = BatteryManager.BATTERY_PLUGGED_AC,
+                status = BatteryManager.BATTERY_STATUS_CHARGING,
+                battPct = 60,
+                currentAvgMicroAmps = 0,
+                currentNowMicroAmps = 95_000
+            )
+        )
+
+        // Real AC Fast Charging (2.4 A) -> AC Fast Power
+        assertEquals(
+            "AC Fast Power",
+            CodecCapabilityProbe.resolvePowerSourceLabel(
+                plugged = BatteryManager.BATTERY_PLUGGED_AC,
+                status = BatteryManager.BATTERY_STATUS_CHARGING,
+                battPct = 60,
+                currentAvgMicroAmps = 2_400_000,
+                currentNowMicroAmps = 2_350_000
+            )
+        )
+
+        // Trickle charge near full (98%) must NOT falsely report Bypass Charging
+        assertEquals(
+            "AC Fast Power",
+            CodecCapabilityProbe.resolvePowerSourceLabel(
+                plugged = BatteryManager.BATTERY_PLUGGED_AC,
+                status = BatteryManager.BATTERY_STATUS_CHARGING,
+                battPct = 98,
+                currentAvgMicroAmps = 140_000,
+                currentNowMicroAmps = 140_000
+            )
+        )
+
+        // Slow PC USB port (180 mA) must report USB Power, not Bypass Charging
+        assertEquals(
+            "USB Power",
+            CodecCapabilityProbe.resolvePowerSourceLabel(
+                plugged = BatteryManager.BATTERY_PLUGGED_USB,
+                status = BatteryManager.BATTERY_STATUS_CHARGING,
+                battPct = 55,
+                currentAvgMicroAmps = 180_000,
+                currentNowMicroAmps = 180_000
+            )
+        )
+    }
+
+    @Test
+    fun captureResizeGuard_blocksHiddenResizesAcrossBoth16x9And9x16() {
+        // Hidden target (!isVisible) is blocked in BOTH 9:16 vertical and 16:9 landscape
+        assertFalse(
+            SolVideoPipeline.shouldAcceptCaptureResize(
+                isVerticalPrimary = true,
+                reqW = 1080,
+                reqH = 2340,
+                isVisible = false,
+                currentCapW = 2340,
+                currentCapH = 1080
+            )
+        )
+        assertFalse(
+            SolVideoPipeline.shouldAcceptCaptureResize(
+                isVerticalPrimary = false,
+                reqW = 2340,
+                reqH = 1080,
+                isVisible = false,
+                currentCapW = 1920,
+                currentCapH = 1080
+            )
+        )
+
+        // Visible 9:16 vertical stream allows initial portrait -> landscape game transition
+        assertTrue(
+            SolVideoPipeline.shouldAcceptCaptureResize(
+                isVerticalPrimary = true,
+                reqW = 2340,
+                reqH = 1080,
+                isVisible = true,
+                currentCapW = 1080,
+                currentCapH = 2340
+            )
+        )
+
+        // Visible 16:9 landscape stream blocks temporary portrait resizes
+        assertFalse(
+            SolVideoPipeline.shouldAcceptCaptureResize(
+                isVerticalPrimary = false,
+                reqW = 1080,
+                reqH = 2340,
+                isVisible = true,
+                currentCapW = 2340,
+                currentCapH = 1080
+            )
+        )
+
+        // Redundant identical size and tiny invalid dimensions are blocked
+        assertFalse(
+            SolVideoPipeline.shouldAcceptCaptureResize(
+                isVerticalPrimary = true,
+                reqW = 2340,
+                reqH = 1080,
+                isVisible = true,
+                currentCapW = 2340,
+                currentCapH = 1080
+            )
+        )
+        assertFalse(
+            SolVideoPipeline.shouldAcceptCaptureResize(
+                isVerticalPrimary = true,
+                reqW = 64,
+                reqH = 64,
+                isVisible = true,
+                currentCapW = 1080,
+                currentCapH = 2340
+            )
+        )
+    }
+
+    @Test
+    fun benchmarkSectionHeader_omitsCompetitorLabelWhenNoCompetitorSaved() {
+        assertEquals(
+            "--- PREVIOUS SOLSTREAM SESSION BENCHMARK ---",
+            DiagnosticsLogger.resolveBenchmarkSectionHeader(hasCompetitorBenchmark = false)
+        )
+        assertEquals(
+            "--- COMPETITOR vs. SOLSTREAM BENCHMARK COMPARISON ---",
+            DiagnosticsLogger.resolveBenchmarkSectionHeader(hasCompetitorBenchmark = true)
+        )
+    }
+
+    @Test
+    fun shortsBackdropButtonLabel_matchesSelectedModeAccurately() {
+        val darkLabel = MainActivity.formatShortsBackdropButtonLabel("DARK")
+        assertTrue(darkLabel.contains("DARK"))
+        assertTrue(darkLabel.contains("0% Extra GPU"))
+        assertFalse(darkLabel.contains("Blur", ignoreCase = true))
+
+        val posterLabel = MainActivity.formatShortsBackdropButtonLabel("POSTER")
+        assertTrue(posterLabel.contains("POSTER"))
+        assertTrue(posterLabel.contains("Static Image"))
+        assertFalse(posterLabel.contains("Blur", ignoreCase = true))
+
+        val blurLabel = MainActivity.formatShortsBackdropButtonLabel("BLUR")
+        assertTrue(blurLabel.contains("BLUR"))
+        assertTrue(blurLabel.contains("40% Cooler Scissor Blur"))
     }
 }
