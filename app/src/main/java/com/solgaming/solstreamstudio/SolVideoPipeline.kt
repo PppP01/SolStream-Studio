@@ -119,7 +119,7 @@ class SolVideoPipeline(private val context: Context) {
     @Volatile var liveMinimapShieldCorner = "TOP_RIGHT"
     @Volatile var liveRoiMode = "AUTO"
 
-    // Phase 1 (v1.5.0) Pro Broadcast Overlays (strictly opt-in, 0 MB VRAM when OFF)
+    // Phase 1 (v1.5.0+) Pro Broadcast Overlays (strictly opt-in, 0 MB VRAM when OFF)
     @Volatile var liveHudTelemetryEnabled = false
     @Volatile var liveHudTelemetryCorner = "TOP_LEFT"
     @Volatile var liveHudTempC = 0f
@@ -167,8 +167,7 @@ class SolVideoPipeline(private val context: Context) {
     @Volatile var onFatalPipelineError: ((String) -> Unit)? = null
     @Volatile var onCompanionPipelineStopped: ((String) -> Unit)? = null
 
-    @Volatile private var pendingCaptureWidth = 0
-    @Volatile private var pendingCaptureHeight = 0
+    private val pendingCaptureResize = AtomicReference<Pair<Int, Int>?>(null)
     @Volatile private var capturedContentVisible = true
 
     // Async 1-Tap Clean Screenshot guard (3-second cooldown, max 1 in-flight offscreen FBO capture)
@@ -224,7 +223,7 @@ class SolVideoPipeline(private val context: Context) {
         liveMinimapShieldCorner = s.minimapShieldCorner.uppercase(Locale.US)
         liveRoiMode = s.roiMode.uppercase(Locale.US)
 
-        // Phase 1 (v1.5.0) Pro Broadcast Overlays
+        // Phase 1 (v1.5.0+) Pro Broadcast Overlays
         liveHudTelemetryEnabled = s.hudTelemetryEnabled
         liveHudTelemetryCorner = KeystoreVault.sanitizeOverlayCorner(s.hudTelemetryCorner, "TOP_LEFT")
         liveQrOverlayEnabled = s.qrOverlayEnabled
@@ -296,6 +295,7 @@ class SolVideoPipeline(private val context: Context) {
      */
     fun prepareForImmediateStop() {
         isRunning = false
+        pendingCaptureResize.set(null)
         pendingScreenshotCallback.getAndSet(null)?.let { cb ->
             screenshotInFlight.set(false)
             try { cb(Result.failure(IllegalStateException("Stream stopped before screenshot completed."))) } catch (_: Exception) {}
@@ -379,6 +379,7 @@ class SolVideoPipeline(private val context: Context) {
         liveVoiceSpeaking = false
         screenshotInFlight.set(false)
         pendingScreenshotCallback.set(null)
+        pendingCaptureResize.set(null)
         lastSentVideoPtsUs = -1L
         actualEncodedFps = 0
         actualEncodedBitrateBps = 0
@@ -579,8 +580,6 @@ class SolVideoPipeline(private val context: Context) {
         val panelShort = evenDimension(min(rawScreenW, rawScreenH).coerceAtLeast(720))
         val capWidth = if (settings.isVertical && !isDisplayCurrentlyLandscape()) panelShort else panelLong
         val capHeight = if (capWidth == panelShort) panelLong else panelShort
-        pendingCaptureWidth = 0
-        pendingCaptureHeight = 0
 
         // Android 14+ strict invariant: register MediaProjection.Callback BEFORE createVirtualDisplay()
         synchronized(projectionCallbackLock) {
@@ -601,22 +600,31 @@ class SolVideoPipeline(private val context: Context) {
                 override fun onCapturedContentResize(width: Int, height: Int) {
                     val safeW = evenDimension(width)
                     val safeH = evenDimension(height)
-                    if (!isRunning || safeW < 128 || safeH < 128) return
+                    if (!isRunning) return
 
-                    // Vulkan PSS Memory Guard:
-                    // When streaming in 16:9 Landscape (!settings.isVertical), ignore temporary portrait
-                    // resize callbacks (safeW < safeH) fired when the game is minimized to the home screen
-                    // or notification shade.
-                    if (!settings.isVertical && (safeW < safeH || !capturedContentVisible)) {
+                    // Unified Vulkan PSS Memory Guard (16:9 Landscape & 9:16 Vertical):
+                    // Ignores resize callbacks while captured game is hidden/unfocused (!capturedContentVisible)
+                    // AND ignores temporary portrait resizes during 16:9 landscape streams.
+                    if (!shouldAcceptCaptureResize(
+                            isVerticalPrimary = settings.isVertical,
+                            reqW = safeW,
+                            reqH = safeH,
+                            isVisible = capturedContentVisible,
+                            currentCapW = 0,
+                            currentCapH = 0
+                        )
+                    ) {
                         return
                     }
-                    pendingCaptureWidth = safeW
-                    pendingCaptureHeight = safeH
+                    pendingCaptureResize.set(safeW to safeH)
                 }
 
                 override fun onCapturedContentVisibilityChanged(isVisible: Boolean) {
                     if (isVisible == capturedContentVisible) return
                     capturedContentVisible = isVisible
+                    if (!isVisible) {
+                        pendingCaptureResize.set(null)
+                    }
                     if (!isRunning) return
                     if (!isVisible) {
                         DiagnosticsLogger.log(
@@ -1232,12 +1240,14 @@ class SolVideoPipeline(private val context: Context) {
         var overlayTexId = 0
         var overlayBitmapW = 1920
         var overlayBitmapH = 1080
+        var overlayLoadAttemptedRev = -1
         var posterTexId = 0
+        var posterLoadAttemptedRev = -1
         var bannerTexId = 0
         var loadedBannerSig = ""
         var seenAssetRevision = -1
 
-        // Phase 1 (v1.5.0) opt-in GPU overlays (0 MB VRAM when OFF)
+        // Phase 1 (v1.5.0+) opt-in GPU overlays (0 MB VRAM when OFF)
         var hudTexId = 0
         var hudScratchBitmap: Bitmap? = null
         var lastHudUpdateMs = 0L
@@ -1476,12 +1486,18 @@ class SolVideoPipeline(private val context: Context) {
                     nextRenderNs = nowNs + frameIntervalNs
                 }
 
-                val reqW = pendingCaptureWidth
-                val reqH = pendingCaptureHeight
-                if (reqW >= 128 && reqH >= 128 && (reqW != activeCapW || reqH != activeCapH)) {
-                    pendingCaptureWidth = 0
-                    pendingCaptureHeight = 0
-                    if (isVerticalPrimary || reqW >= reqH) {
+                val pendingSize = pendingCaptureResize.getAndSet(null)
+                if (pendingSize != null) {
+                    val (reqW, reqH) = pendingSize
+                    if (shouldAcceptCaptureResize(
+                            isVerticalPrimary = isVerticalPrimary,
+                            reqW = reqW,
+                            reqH = reqH,
+                            isVisible = capturedContentVisible,
+                            currentCapW = activeCapW,
+                            currentCapH = activeCapH
+                        )
+                    ) {
                         activeCapW = reqW
                         activeCapH = reqH
                         try {
@@ -1533,9 +1549,12 @@ class SolVideoPipeline(private val context: Context) {
                     freshWindowStartMs = nowMs
                     freshFramesInWindow = 0
 
-                    if (isVerticalPrimary && activeCapW < activeCapH && isDisplayCurrentlyLandscape()) {
-                        pendingCaptureWidth = panelLong
-                        pendingCaptureHeight = panelShort
+                    if (isVerticalPrimary &&
+                        capturedContentVisible &&
+                        activeCapW < activeCapH &&
+                        isDisplayCurrentlyLandscape()
+                    ) {
+                        pendingCaptureResize.compareAndSet(null, panelLong to panelShort)
                     }
                 }
 
@@ -1559,6 +1578,8 @@ class SolVideoPipeline(private val context: Context) {
                 if (assetDirty) {
                     seenAssetRevision = curRev
                     loadedSceneSlotKey = ""
+                    overlayLoadAttemptedRev = -1
+                    posterLoadAttemptedRev = -1
                     if (overlayTexId != 0) {
                         GlShaderBank.deleteTexture2d(overlayTexId)
                         overlayTexId = 0
@@ -1599,48 +1620,62 @@ class SolVideoPipeline(private val context: Context) {
                     }
                 }
 
-                if (liveOverlayImageEnabled && overlayTexId == 0) {
-                    SolSceneAssetStore.loadSavedBitmapForGl(context, SolSceneAssetStore.AssetSlot.OVERLAY_PNG)?.let { bmp ->
-                        overlayBitmapW = max(1, bmp.width)
-                        overlayBitmapH = max(1, bmp.height)
-                        overlayTexId = GlShaderBank.uploadBitmapTexture2d(bmp)
-                        bmp.recycle()
+                if (liveOverlayImageEnabled) {
+                    if (overlayTexId == 0 && overlayLoadAttemptedRev != curRev) {
+                        overlayLoadAttemptedRev = curRev
+                        SolSceneAssetStore.loadSavedBitmapForGl(context, SolSceneAssetStore.AssetSlot.OVERLAY_PNG)?.let { bmp ->
+                            overlayBitmapW = max(1, bmp.width)
+                            overlayBitmapH = max(1, bmp.height)
+                            overlayTexId = GlShaderBank.uploadBitmapTexture2d(bmp)
+                            bmp.recycle()
+                        }
                     }
-                } else if (!liveOverlayImageEnabled && overlayTexId != 0) {
-                    GlShaderBank.deleteTexture2d(overlayTexId)
-                    overlayTexId = 0
+                } else {
+                    if (overlayTexId != 0) {
+                        GlShaderBank.deleteTexture2d(overlayTexId)
+                        overlayTexId = 0
+                    }
+                    overlayLoadAttemptedRev = -1
                 }
 
                 val needPoster = (isVerticalPrimary || companionEglSurface != EGL14.EGL_NO_SURFACE) &&
                     liveShortsBackdropMode == "POSTER"
-                if (needPoster && posterTexId == 0) {
-                    SolSceneAssetStore.loadSavedBitmapForGl(context, SolSceneAssetStore.AssetSlot.SHORTS_POSTER)?.let { bmp ->
-                        posterTexId = GlShaderBank.uploadBitmapTexture2d(bmp)
-                        bmp.recycle()
+                if (needPoster) {
+                    if (posterTexId == 0 && posterLoadAttemptedRev != curRev) {
+                        posterLoadAttemptedRev = curRev
+                        SolSceneAssetStore.loadSavedBitmapForGl(context, SolSceneAssetStore.AssetSlot.SHORTS_POSTER)?.let { bmp ->
+                            posterTexId = GlShaderBank.uploadBitmapTexture2d(bmp)
+                            bmp.recycle()
+                        }
                     }
-                } else if (!needPoster && posterTexId != 0) {
-                    GlShaderBank.deleteTexture2d(posterTexId)
-                    posterTexId = 0
+                } else {
+                    if (posterTexId != 0) {
+                        GlShaderBank.deleteTexture2d(posterTexId)
+                        posterTexId = 0
+                    }
+                    posterLoadAttemptedRev = -1
                 }
 
                 val wantBanner = liveBannerEnabled && liveBannerText.isNotBlank()
                 val curBannerSig = if (wantBanner) "${liveBannerPosition}:${liveBannerText.trim()}" else ""
-                if (wantBanner && (bannerTexId == 0 || curBannerSig != loadedBannerSig)) {
-                    if (bannerTexId != 0) GlShaderBank.deleteTexture2d(bannerTexId)
-                    val bBmp = SolSceneAssetStore.buildLiveBannerBitmap(liveBannerText.trim())
-                    bannerTexId = if (bBmp != null) {
-                        val id = GlShaderBank.uploadBitmapTexture2d(bBmp)
-                        bBmp.recycle()
-                        id
-                    } else 0
-                    loadedBannerSig = curBannerSig
-                } else if (!wantBanner && bannerTexId != 0) {
+                if (wantBanner) {
+                    if (curBannerSig != loadedBannerSig) {
+                        if (bannerTexId != 0) GlShaderBank.deleteTexture2d(bannerTexId)
+                        val bBmp = SolSceneAssetStore.buildLiveBannerBitmap(liveBannerText.trim())
+                        bannerTexId = if (bBmp != null) {
+                            val id = GlShaderBank.uploadBitmapTexture2d(bBmp)
+                            bBmp.recycle()
+                            id
+                        } else 0
+                        loadedBannerSig = curBannerSig
+                    }
+                } else if (bannerTexId != 0 || loadedBannerSig.isNotEmpty()) {
                     GlShaderBank.deleteTexture2d(bannerTexId)
                     bannerTexId = 0
                     loadedBannerSig = ""
                 }
 
-                // === Phase 1 (v1.5.0) Zero-Allocation SolHUD™ Live GPU Telemetry Texture ===
+                // === Phase 1 (v1.5.0+) Zero-Allocation SolHUD™ Live GPU Telemetry Texture ===
                 if (liveHudTelemetryEnabled) {
                     if (hudTexId == 0 || monoMs - lastHudUpdateMs >= HUD_REFRESH_INTERVAL_MS) {
                         lastHudUpdateMs = monoMs
@@ -1678,25 +1713,27 @@ class SolVideoPipeline(private val context: Context) {
                     lastHudUpdateMs = 0L
                 }
 
-                // === Phase 1 (v1.5.0) Corner QR Code Overlay (GL_NEAREST for razor-sharp camera scanning) ===
+                // === Phase 1 (v1.5.0+) Corner QR Code Overlay (GL_NEAREST for razor-sharp camera scanning) ===
                 val wantQr = liveQrOverlayEnabled && liveQrOverlayText.isNotBlank()
                 val curQrSig = if (wantQr) liveQrOverlayText.trim() else ""
-                if (wantQr && (qrTexId == 0 || curQrSig != loadedQrSig)) {
-                    if (qrTexId != 0) GlShaderBank.deleteTexture2d(qrTexId)
-                    val qrBmp = SolHudAndQrRenderer.generateQrOverlayBitmap(curQrSig)
-                    qrTexId = if (qrBmp != null) {
-                        val id = GlShaderBank.uploadBitmapTexture2d(qrBmp, nearestFilter = true)
-                        qrBmp.recycle()
-                        id
-                    } else 0
-                    loadedQrSig = curQrSig
-                } else if (!wantQr && qrTexId != 0) {
+                if (wantQr) {
+                    if (curQrSig != loadedQrSig) {
+                        if (qrTexId != 0) GlShaderBank.deleteTexture2d(qrTexId)
+                        val qrBmp = SolHudAndQrRenderer.generateQrOverlayBitmap(curQrSig)
+                        qrTexId = if (qrBmp != null) {
+                            val id = GlShaderBank.uploadBitmapTexture2d(qrBmp, nearestFilter = true)
+                            qrBmp.recycle()
+                            id
+                        } else 0
+                        loadedQrSig = curQrSig
+                    }
+                } else if (qrTexId != 0 || loadedQrSig.isNotEmpty()) {
                     GlShaderBank.deleteTexture2d(qrTexId)
                     qrTexId = 0
                     loadedQrSig = ""
                 }
 
-                // === Phase 1 (v1.5.0) Zero-Camera 2-PNG PNGTuber Avatar (140ms hangover + smooth talk-hop) ===
+                // === Phase 1 (v1.5.0+) Zero-Camera 2-PNG PNGTuber Avatar (140ms hangover + smooth talk-hop) ===
                 if (livePngTuberEnabled) {
                     val genderNow = liveVoiceGenderProfile
                     if (pngTuberIdleTexId == 0 || loadedPngTuberGender != genderNow) {
@@ -2190,9 +2227,10 @@ class SolVideoPipeline(private val context: Context) {
                 val activeZoom = if (framing == "SMART") (zoomPct.coerceIn(100, 250) / 100.0f) else 1.0f
                 val sharpScaleY = ((dstAspect / srcAspect) * activeZoom).coerceIn(0.10f, 1.50f)
 
-                computeFramingMatrix(mvpMatrix, srcW, srcH, dstW, dstH, "FILL", 100, liveLandscapeFlip)
-                if (sharpScaleY < 0.96f) {
-                    val barHeightPx = (((1.0f - sharpScaleY) * 0.5f * dstH).roundToInt() + 4).coerceIn(8, dstH / 2)
+                // Skip blur completely when zoomed gameplay already fills 100% of vertical height
+                if (sharpScaleY < 0.998f) {
+                    computeFramingMatrix(mvpMatrix, srcW, srcH, dstW, dstH, "FILL", 100, liveLandscapeFlip)
+                    val barHeightPx = (((1.0f - sharpScaleY) * 0.5f * dstH).roundToInt() + 4).coerceIn(4, dstH / 2)
                     GLES20.glEnable(GLES20.GL_SCISSOR_TEST)
                     GLES20.glScissor(0, 0, dstW, barHeightPx)
                     drawOesGameplayQuad(
@@ -2223,20 +2261,6 @@ class SolVideoPipeline(private val context: Context) {
                         isHdr10 = isHdr10Surface
                     )
                     GLES20.glDisable(GLES20.GL_SCISSOR_TEST)
-                } else {
-                    drawOesGameplayQuad(
-                        h = oesHandles,
-                        oesTexId = oesTexId,
-                        mvp = mvpMatrix,
-                        texMatrix = stMatrix,
-                        verts = fullQuadVerts,
-                        texCoords = oesTexCoords,
-                        srcW = srcW,
-                        srcH = srcH,
-                        isBlurPass = true,
-                        isFreshFrame = isFreshGameFrame,
-                        isHdr10 = isHdr10Surface
-                    )
                 }
             }
         }
@@ -2327,7 +2351,7 @@ class SolVideoPipeline(private val context: Context) {
             }
         }
 
-        // 4. Phase 1 (v1.5.0) Pro Broadcast Overlays (drawn ABOVE Privacy Blur so HUD/QR/Avatar stay crisp)
+        // 4. Phase 1 (v1.5.0+) Pro Broadcast Overlays (drawn ABOVE Privacy Blur so HUD/QR/Avatar stay crisp)
         if (hudTexId != 0) {
             val maxH = if (dstIsVertical) 0.042f else 0.062f
             val maxW = if (dstIsVertical) 0.52f else 0.30f
@@ -2906,6 +2930,26 @@ class SolVideoPipeline(private val context: Context) {
         private const val SCREENSHOT_COOLDOWN_MS = 3_000L
         private const val HUD_REFRESH_INTERVAL_MS = 2_000L
         private const val PNGTUBER_TALK_HOLD_MS = 140L
+
+        /**
+         * Unified Vulkan PSS Memory Guard (16:9 Landscape & 9:16 Vertical):
+         * Blocks VirtualDisplay reallocations when the captured target is hidden/unfocused,
+         * blocks redundant identical-size resizes, and blocks temporary portrait resizes during 16:9 streams.
+         */
+        internal fun shouldAcceptCaptureResize(
+            isVerticalPrimary: Boolean,
+            reqW: Int,
+            reqH: Int,
+            isVisible: Boolean,
+            currentCapW: Int,
+            currentCapH: Int
+        ): Boolean {
+            if (reqW < 128 || reqH < 128) return false
+            if (!isVisible) return false
+            if (reqW == currentCapW && reqH == currentCapH) return false
+            if (!isVerticalPrimary && reqW < reqH) return false
+            return true
+        }
 
         /**
          * Clamps clean screenshot dimensions to <=1920 on the longest side (max 1920x1080 = 7.91 MiB RGBA8)
