@@ -87,7 +87,7 @@ data class BenchmarkSnapshot(
 
 object DiagnosticsLogger {
 
-    const val ENGINE_VERSION = "v1.5.0"
+    const val ENGINE_VERSION = "v1.5.1"
 
     private const val MAX_EVENTS = 160
     private const val MAX_CLIPS = 60
@@ -166,6 +166,18 @@ object DiagnosticsLogger {
      */
     internal fun shouldSampleHealthOnReport(isLive: Boolean): Boolean {
         return isLive || sessionStartMs == 0L || !isSessionFinalized
+    }
+
+    /**
+     * Shows "COMPETITOR vs. SOLSTREAM" only when a competitor benchmark actually exists;
+     * otherwise labels the saved SolStream entry clearly as a previous SolStream session.
+     */
+    internal fun resolveBenchmarkSectionHeader(hasCompetitorBenchmark: Boolean): String {
+        return if (hasCompetitorBenchmark) {
+            "--- COMPETITOR vs. SOLSTREAM BENCHMARK COMPARISON ---"
+        } else {
+            "--- PREVIOUS SOLSTREAM SESSION BENCHMARK ---"
+        }
     }
 
     @Synchronized
@@ -247,9 +259,10 @@ object DiagnosticsLogger {
         label: String = "Manual ★ Highlight",
         context: Context? = null
     ): String {
-        val hh = elapsedStreamSec / 3600L
-        val mm = (elapsedStreamSec % 3600L) / 60L
-        val ss = elapsedStreamSec % 60L
+        val safeSec = max(0L, elapsedStreamSec)
+        val hh = safeSec / 3600L
+        val mm = (safeSec % 3600L) / 60L
+        val ss = safeSec % 60L
         val streamStamp = String.format(Locale.US, "%02d:%02d:%02d", hh, mm, ss)
         val wallStamp = formatWallClockNow()
         val index = clipHighlights.size + 1
@@ -587,7 +600,7 @@ object DiagnosticsLogger {
 
     fun readBatteryTempC(context: Context): Float {
         return try {
-            val intent = context.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+            val intent = context.applicationContext.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
             val tenths = intent?.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, 0) ?: 0
             tenths / 10.0f
         } catch (_: Exception) {
@@ -613,7 +626,7 @@ object DiagnosticsLogger {
 
     fun readBatteryPercentage(context: Context): Int {
         return try {
-            val intent = context.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+            val intent = context.applicationContext.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
             val level = intent?.getIntExtra(BatteryManager.EXTRA_LEVEL, -1) ?: -1
             val scale = intent?.getIntExtra(BatteryManager.EXTRA_SCALE, 100) ?: 100
             if (level >= 0 && scale > 0) ((level * 100) / scale).coerceIn(0, 100) else 100
@@ -624,7 +637,7 @@ object DiagnosticsLogger {
 
     fun isBatteryChargingOrPlugged(context: Context): Boolean {
         return try {
-            val intent = context.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+            val intent = context.applicationContext.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
             val plugged = intent?.getIntExtra(BatteryManager.EXTRA_PLUGGED, 0) ?: 0
             plugged != 0
         } catch (_: Exception) {
@@ -684,7 +697,7 @@ object DiagnosticsLogger {
 
     @Synchronized
     fun buildShareableReport(context: Context): String {
-        if (!SolStreamService.isBroadcastLive && events.isEmpty()) {
+        if (!SolStreamService.isBroadcastLive && sessionStartMs == 0L) {
             getRecoveredLiveCheckpointReport(context)?.let { return it }
         }
         return buildShareableReportInternal(context, isLiveCheckpoint = false, skipHealthResample = false)
@@ -789,7 +802,7 @@ object DiagnosticsLogger {
 
         if (lastSol != null || lastGlip != null) {
             sb.appendLine()
-            sb.appendLine("--- COMPETITOR vs. SOLSTREAM BENCHMARK COMPARISON ---")
+            sb.appendLine(resolveBenchmarkSectionHeader(hasCompetitorBenchmark = lastGlip != null))
             lastSol?.let { sb.appendLine("• ${it.toSummaryLine()}") }
             lastGlip?.let { sb.appendLine("• ${it.toSummaryLine()}") }
         }
