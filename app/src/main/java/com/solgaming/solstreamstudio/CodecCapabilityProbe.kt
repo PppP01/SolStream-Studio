@@ -285,17 +285,9 @@ data class DeviceScanSummary(
             val av1Usable = av1Hardware?.takeIf { it.verifiedRealEncode || it.verifiedSurfaceConfigure }
             listOfNotNull(hevcHardware, h264Hardware, av1Usable)
         }
-        val primaryUpper = primaryCodec?.uppercase(Locale.US)
         return orderedPool.filter { report ->
             val supports1080p = report.supports1080p60 || report.supports1080p30
-            if (!supports1080p) return@filter false
-            // Require >=2 concurrent hardware instances on the companion codec itself
-            // (or explicitly exclude any codec with only 1 instance when it matches primaryCodec).
-            if (primaryUpper != null && report.codecKey.equals(primaryUpper, ignoreCase = true)) {
-                report.maxConcurrentInstances >= 2
-            } else {
-                report.maxConcurrentInstances >= 2
-            }
+            supports1080p && report.maxConcurrentInstances >= 2
         }
     }
 
@@ -470,7 +462,8 @@ object CodecCapabilityProbe {
     private const val CACHE_PREFS = "solstream_hw_probe_cache_v3"
     private const val KEY_FINGERPRINT = "cached_fingerprint"
     private const val KEY_PAYLOAD = "cached_scan_json"
-    private const val CACHE_SCHEMA_TAG = "ultra_v140_r1"
+    private const val CACHE_SCHEMA_TAG = "ultra_v151_r1"
+    private const val BYPASS_CURRENT_THRESHOLD_UA = 250_000
 
     private val scanLock = ReentrantLock()
     private val activeHardwareProbeRunning = AtomicBoolean(false)
@@ -509,6 +502,45 @@ object CodecCapabilityProbe {
             gib >= 4.5 -> 6
             gib >= 3.1 -> 4
             else -> 3
+        }
+    }
+
+    /**
+     * Classifies active power source cleanly for Session Reports & Idle Banner:
+     * - Detects Samsung / OEM Pause USB PD Bypass Charging via explicit NOT_CHARGING / DISCHARGING
+     *   status OR low smoothed battery current (<= 250 mA / 250,000 uA) while plugged into AC
+     *   between 15% and 95% battery (avoids false positives on 96-100% trickle or slow PC USB ports).
+     */
+    internal fun resolvePowerSourceLabel(
+        plugged: Int,
+        status: Int,
+        battPct: Int,
+        currentAvgMicroAmps: Int = Int.MIN_VALUE,
+        currentNowMicroAmps: Int = Int.MIN_VALUE
+    ): String {
+        if (plugged == 0) return "Battery"
+
+        val explicitNotCharging = status == BatteryManager.BATTERY_STATUS_NOT_CHARGING ||
+            (status == BatteryManager.BATTERY_STATUS_DISCHARGING && battPct < 99)
+
+        val effectiveMicroAmps = when {
+            currentAvgMicroAmps != Int.MIN_VALUE && currentAvgMicroAmps != 0 -> currentAvgMicroAmps
+            currentNowMicroAmps != Int.MIN_VALUE -> currentNowMicroAmps
+            else -> Int.MIN_VALUE
+        }
+
+        val isAcPlugged = (plugged and BatteryManager.BATTERY_PLUGGED_AC) != 0
+        val lowBypassCurrentOnAc = isAcPlugged &&
+            battPct in 15..95 &&
+            effectiveMicroAmps != Int.MIN_VALUE &&
+            abs(effectiveMicroAmps) <= BYPASS_CURRENT_THRESHOLD_UA
+
+        return when {
+            explicitNotCharging || lowBypassCurrentOnAc -> "Bypass Charging (USB-PD)"
+            isAcPlugged -> "AC Fast Power"
+            (plugged and BatteryManager.BATTERY_PLUGGED_USB) != 0 -> "USB Power"
+            (plugged and BatteryManager.BATTERY_PLUGGED_WIRELESS) != 0 -> "Wireless Power"
+            else -> "External Power"
         }
     }
 
@@ -600,8 +632,8 @@ object CodecCapabilityProbe {
     }
 
     /**
-     * Reads zero-permission live idle/active hardware telemetry (Battery 0.1C temp, 10s rate-limited
-     * PowerManager thermal headroom, available RAM, and estimated Bypass/Pause PD state).
+     * Reads zero-permission live idle/active hardware telemetry (Battery 0.1C temp, 10.5s rate-limited
+     * PowerManager thermal headroom, available RAM, and accurate Bypass Charging USB-PD state).
      */
     fun readLiveHardwareHealth(context: Context): LiveHardwareHealth {
         val appCtx = context.applicationContext
@@ -620,33 +652,28 @@ object CodecCapabilityProbe {
                 val status = intent.getIntExtra(BatteryManager.EXTRA_STATUS, -1)
                 val level = intent.getIntExtra(BatteryManager.EXTRA_LEVEL, 50)
                 val scale = intent.getIntExtra(BatteryManager.EXTRA_SCALE, 100).coerceAtLeast(1)
-                val battPct = (level * 100) / scale
+                val battPct = ((level * 100) / scale).coerceIn(0, 100)
 
-                var pausePdByCurrent = false
-                if (isPlugged && battPct in 15..98) {
+                var curAvg = Int.MIN_VALUE
+                var curNow = Int.MIN_VALUE
+                if (isPlugged) {
                     try {
                         val bm = appCtx.getSystemService(Context.BATTERY_SERVICE) as? BatteryManager
-                        val curNow = bm?.getIntProperty(BatteryManager.BATTERY_PROPERTY_CURRENT_NOW) ?: Int.MIN_VALUE
-                        if (curNow != Int.MIN_VALUE && abs(curNow) <= 45_000) {
-                            pausePdByCurrent = true
+                        if (bm != null) {
+                            curAvg = bm.getIntProperty(BatteryManager.BATTERY_PROPERTY_CURRENT_AVERAGE)
+                            curNow = bm.getIntProperty(BatteryManager.BATTERY_PROPERTY_CURRENT_NOW)
                         }
                     } catch (_: Exception) {
                     }
                 }
 
-                val isBypassPaused = isPlugged && (
-                    status == BatteryManager.BATTERY_STATUS_NOT_CHARGING ||
-                        (status == BatteryManager.BATTERY_STATUS_DISCHARGING && battPct < 99) ||
-                        pausePdByCurrent
-                    )
-
-                powerLabel = when {
-                    isBypassPaused -> "⚡ AC / Bypass PD (Est.)"
-                    (plugged and BatteryManager.BATTERY_PLUGGED_AC) != 0 -> "AC Fast Power"
-                    (plugged and BatteryManager.BATTERY_PLUGGED_USB) != 0 -> "USB Power"
-                    (plugged and BatteryManager.BATTERY_PLUGGED_WIRELESS) != 0 -> "Wireless Power"
-                    else -> "Battery"
-                }
+                powerLabel = resolvePowerSourceLabel(
+                    plugged = plugged,
+                    status = status,
+                    battPct = battPct,
+                    currentAvgMicroAmps = curAvg,
+                    currentNowMicroAmps = curNow
+                )
             }
         } catch (_: Exception) {
         }
@@ -674,7 +701,7 @@ object CodecCapabilityProbe {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
                 val nowMs = SystemClock.elapsedRealtime()
                 synchronized(thermalPollLock) {
-                    if (nowMs - lastThermalHeadroomPollMs >= 10_500L || cachedThermalHeadroomRatio.isNaN()) {
+                    if (lastThermalHeadroomPollMs == 0L || nowMs - lastThermalHeadroomPollMs >= 10_500L) {
                         val sampled = pm.getThermalHeadroom(0)
                         if (!sampled.isNaN() && sampled in 0.05f..2.5f) {
                             cachedThermalHeadroomRatio = sampled
@@ -939,6 +966,8 @@ object CodecCapabilityProbe {
         val hevc1440p60 = hevc?.supports1440p60 == true && hevcEligible
         val hevc1080p60 = hevc?.supports1080p60 == true && hevcEligible
         val h2641080p60 = h264?.supports1080p60 == true && h264Eligible
+        val any1080p = (hevcEligible && (hevc?.supports1080p60 == true || hevc?.supports1080p30 == true)) ||
+            (h264Eligible && (h264?.supports1080p60 == true || h264?.supports1080p30 == true))
 
         val recTier: DeviceTier = when {
             (hevc4k60 || av1Usable) &&
@@ -966,12 +995,19 @@ object CodecCapabilityProbe {
 
         val recW: Int
         val recH: Int
-        if ((recTier == DeviceTier.FLAGSHIP || recTier == DeviceTier.ULTRA) && hevc1440p60) {
-            recW = 2560
-            recH = 1440
-        } else {
-            recW = 1920
-            recH = 1080
+        when {
+            (recTier == DeviceTier.FLAGSHIP || recTier == DeviceTier.ULTRA) && hevc1440p60 -> {
+                recW = 2560
+                recH = 1440
+            }
+            any1080p -> {
+                recW = 1920
+                recH = 1080
+            }
+            else -> {
+                recW = 1280
+                recH = 720
+            }
         }
 
         return DeviceScanSummary(
@@ -1531,8 +1567,6 @@ object CodecCapabilityProbe {
     }
 
     fun listAvailableMicInputs(context: Context): List<MicInputOption> {
-        val am = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
-        val inputs = am.getDevices(AudioManager.GET_DEVICES_INPUTS)
         val result = mutableListOf(
             MicInputOption(
                 deviceId = -1,
@@ -1542,41 +1576,45 @@ object CodecCapabilityProbe {
                 shortPillLabel = "Phone Studio"
             )
         )
-
-        var builtInIndex = 1
-        for (dev in inputs) {
-            if (!dev.isSource) continue
-            val (label, isBt, shortLabel) = when (dev.type) {
-                AudioDeviceInfo.TYPE_BUILTIN_MIC -> {
-                    val addr = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) dev.address else ""
-                    val posHint = when {
-                        addr.contains("bottom", true) || addr.contains("primary", true) -> "Bottom/Primary"
-                        addr.contains("back", true) || addr.contains("top", true) -> "Top/Secondary"
-                        else -> "Mic #$builtInIndex"
+        try {
+            val am = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return result
+            val inputs = am.getDevices(AudioManager.GET_DEVICES_INPUTS)
+            var builtInIndex = 1
+            for (dev in inputs) {
+                if (!dev.isSource) continue
+                val (label, isBt, shortLabel) = when (dev.type) {
+                    AudioDeviceInfo.TYPE_BUILTIN_MIC -> {
+                        val addr = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) dev.address else ""
+                        val posHint = when {
+                            addr.contains("bottom", true) || addr.contains("primary", true) -> "Bottom/Primary"
+                            addr.contains("back", true) || addr.contains("top", true) -> "Top/Secondary"
+                            else -> "Mic #$builtInIndex"
+                        }
+                        val shortPos = when {
+                            posHint.startsWith("Bottom") -> "Phone Bottom"
+                            posHint.startsWith("Top") -> "Phone Top"
+                            else -> "Phone Mic #$builtInIndex"
+                        }
+                        builtInIndex++
+                        Triple("Phone Built-in ($posHint)", false, shortPos)
                     }
-                    val shortPos = when {
-                        posHint.startsWith("Bottom") -> "Phone Bottom"
-                        posHint.startsWith("Top") -> "Phone Top"
-                        else -> "Phone Mic #$builtInIndex"
+                    AudioDeviceInfo.TYPE_BLUETOOTH_SCO -> {
+                        Triple("Bluetooth Hands-Free (${dev.productName})", true, "BT Mic")
                     }
-                    builtInIndex++
-                    Triple("Phone Built-in ($posHint)", false, shortPos)
+                    AudioDeviceInfo.TYPE_BLE_HEADSET -> {
+                        Triple("Bluetooth LE Headset (${dev.productName})", true, "BLE Mic")
+                    }
+                    AudioDeviceInfo.TYPE_WIRED_HEADSET -> {
+                        Triple("Wired Headset Mic (${dev.productName})", false, "Wired Mic")
+                    }
+                    AudioDeviceInfo.TYPE_USB_HEADSET, AudioDeviceInfo.TYPE_USB_DEVICE -> {
+                        Triple("USB-C Mic (${dev.productName})", false, "USB-C Mic")
+                    }
+                    else -> continue
                 }
-                AudioDeviceInfo.TYPE_BLUETOOTH_SCO -> {
-                    Triple("Bluetooth Hands-Free (${dev.productName})", true, "BT Mic")
-                }
-                AudioDeviceInfo.TYPE_BLE_HEADSET -> {
-                    Triple("Bluetooth LE Headset (${dev.productName})", true, "BLE Mic")
-                }
-                AudioDeviceInfo.TYPE_WIRED_HEADSET -> {
-                    Triple("Wired Headset Mic (${dev.productName})", false, "Wired Mic")
-                }
-                AudioDeviceInfo.TYPE_USB_HEADSET, AudioDeviceInfo.TYPE_USB_DEVICE -> {
-                    Triple("USB-C Mic (${dev.productName})", false, "USB-C Mic")
-                }
-                else -> continue
+                result.add(MicInputOption(dev.id, label, isBt, dev, shortLabel))
             }
-            result.add(MicInputOption(dev.id, label, isBt, dev, shortLabel))
+        } catch (_: Exception) {
         }
         return result
     }
