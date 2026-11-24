@@ -243,7 +243,7 @@ class MicDspProcessor(private val sampleRate: Int = 48000) {
 
     // Exact sample-rate-calibrated time constants (at 48 kHz: 8ms=0.00260, 220ms=0.000095, 10ms=0.00208, 130ms=0.000160)
     private val rms20msAlpha = timeConstAlpha(0.020)
-    private val maxImpulseSamples = max(1, (sampleRate * 0.0006).toInt())      // <0.6 ms (29 samples @ 48 kHz)
+    private val maxImpulseSamples = max(1, (sampleRate * 0.0006).toInt())      // <0.6 ms (28 samples @ 48 kHz)
     private val impulseRecoverySamples = max(8, (sampleRate * 0.0020).toInt()) // 2.0 ms (96 samples @ 48 kHz)
     private val expAttackAlpha = timeConstAlpha(0.008)      // 8.0 ms smooth expander attack
     private val expReleaseAlpha = timeConstAlpha(0.220)     // 220 ms smooth expander release
@@ -265,6 +265,7 @@ class MicDspProcessor(private val sampleRate: Int = 48000) {
     private var appliedGender = ""
     private var appliedHwMode: HardwareAcousticMode? = null
     private var appliedRadioStudioMode = false
+    private var wasRawMode = false
 
     // Stage 1 / Mute & Stage 2 (Raised-Cosine Micro-Impulse Clamper) state
     private var muteSmoothGain = 1.0f
@@ -327,6 +328,30 @@ class MicDspProcessor(private val sampleRate: Int = 48000) {
     private fun timeConstAlpha(seconds: Double): Float {
         if (seconds <= 0.0) return 1.0f
         return (1.0 - exp(-1.0 / (sampleRate.toDouble() * seconds))).toFloat().coerceIn(1e-6f, 1.0f)
+    }
+
+    private fun resetBypassedDspStates() {
+        hpfFilter.reset()
+        speechBandFilter.reset()
+        vocalCoreFilter.reset()
+        eqLowWarmth.reset()
+        eqMudCut.reset()
+        eqAntiNasal.reset()
+        eqPresence.reset()
+        eqAirOrBtLpf.reset()
+        lowWarmthExtractor.reset()
+        lowWarmthSmoother.reset()
+        levelerSidechainHpf.reset()
+        sibilanceBand.reset()
+        plosiveLpState = 0.0f
+        plosiveLp2State = 0.0f
+        plosiveDuckSmooth = 0.0f
+        tubeDcState = 0.0f
+        levelerEnv = 0.0f
+        targetLevelerBlockGain = 1.0f
+        levelerGainSmooth = 1.0f
+        sibilanceEnv = 0.0f
+        deEssAttenSmooth = 0.0f
     }
 
     /**
@@ -737,7 +762,7 @@ class MicDspProcessor(private val sampleRate: Int = 48000) {
     }
 
     /**
-     * Zero-allocation 4× Catmull-Rom Cubic Inter-Sample True-Peak Limiter (-1.16 dBTP = 0.875).
+     * Zero-allocation 4× Catmull-Rom Cubic Inter-Sample Peak Limiter (-1.16 dBTP = 0.875).
      * Evaluates inter-sample peaks at t = 0.25, 0.50, 0.75 across a 4-sample window (1-sample latency)
      * so AAC encoding never clips even on hot post-DSP mic boost settings.
      */
@@ -745,7 +770,7 @@ class MicDspProcessor(private val sampleRate: Int = 48000) {
         val x0 = limX0
         val x1 = limX1
         val x2 = limX2
-        val x3 = inSample
+        val x3 = if (inSample.isFinite()) inSample else 0.0f
 
         limX0 = x1
         limX1 = x2
@@ -763,6 +788,7 @@ class MicDspProcessor(private val sampleRate: Int = 48000) {
 
         val ceiling = TRUE_PEAK_CEILING_LINEAR // 0.875f (-1.16 dBTP)
         val desiredGain = if (truePeak > ceiling) (ceiling / truePeak) else 1.0f
+        if (!limGain.isFinite()) limGain = 1.0f
         if (desiredGain < limGain) {
             limGain = desiredGain // Instant peak catch
         } else {
@@ -770,6 +796,7 @@ class MicDspProcessor(private val sampleRate: Int = 48000) {
         }
 
         var out = x1 * limGain
+        if (!out.isFinite()) out = 0.0f
         if (abs(out) > ceiling) {
             if (abs(out) > 0.99f) clipCount++
             out = out.coerceIn(-ceiling, ceiling)
@@ -792,8 +819,12 @@ class MicDspProcessor(private val sampleRate: Int = 48000) {
         val hwMode = cfg.hardwareAcousticMode
         val postDspGain = cfg.micGainLinear
 
-        // === RAW BYPASS MODE: Mute + Post-DSP Volume + 4x True-Peak Safety Limiter ===
+        // === RAW BYPASS MODE: Mute + Post-DSP Volume + 4x Safety Limiter ===
         if (rawMode) {
+            if (!wasRawMode) {
+                wasRawMode = true
+                resetBypassedDspStates()
+            }
             var rawPeak = 0f
             var rawSumSq = 0f
             for (i in 0 until count) {
@@ -815,6 +846,11 @@ class MicDspProcessor(private val sampleRate: Int = 48000) {
             lastVadProbability = if (vadSpeechActive) 0.85f else 0.05f
             excitedCalloutActive = vadSpeechActive && (rawRms > 0.18f)
             return
+        }
+
+        if (wasRawMode) {
+            wasRawMode = false
+            resetBypassedDspStates()
         }
 
         // === PASS 1 (Unity 1.0x Gain): Smooth Mute + Stage 1 (64-Bit HPF) + Stage 2 (Raised-Cosine Micro-Impulse Clamper) ===
@@ -907,19 +943,6 @@ class MicDspProcessor(private val sampleRate: Int = 48000) {
         val speechBandRms = sqrt(speechBandSumSq / count)
 
         val frameHadImpulse = clampedImpulseSamples > (count / 12)
-        val likelyQuiet = if (neuralVadProb >= 0f) {
-            neuralVadProb < 0.25f && preDspRms < noiseFloorEnv * 1.8f && !frameHadImpulse
-        } else {
-            preDspRms < noiseFloorEnv * 1.6f && !frameHadImpulse
-        }
-        if (likelyQuiet) {
-            noiseFloorEnv = 0.96f * noiseFloorEnv + 0.04f * max(preDspRms, 0.00010f)
-            speechBandNoiseFloor = 0.96f * speechBandNoiseFloor + 0.04f * max(speechBandRms, 0.00008f)
-        } else if (!frameHadImpulse) {
-            noiseFloorEnv = min(0.035f, noiseFloorEnv * 1.0003f)
-            speechBandNoiseFloor = min(0.025f, speechBandNoiseFloor * 1.0003f)
-        }
-        lastNoiseFloorDb = linearToDb(noiseFloorEnv)
 
         // Stage 3b: Hybrid 16 kHz-Safe Neural-VAD Trigger + Double-Talk-Safe Speakerphone Reference
         val speakerBleed = if (hwMode == HardwareAcousticMode.SPEAKER_AEC) {
@@ -951,6 +974,27 @@ class MicDspProcessor(private val sampleRate: Int = 48000) {
         val activeSpeech = confirmedSpeech || expanderHoldRemaining > 0
         vadSpeechActive = activeSpeech
         excitedCalloutActive = confirmedSpeech && (preDspRms >= 0.085f)
+
+        // Adaptive Noise-Floor Tracker:
+        // - Frozen during mute (muteSmoothGain < 0.5f) so unmuting never triggers a false SNR spike.
+        // - Strictly frozen during active speech (confirmedSpeech || activeSpeech) so uninterrupted
+        //   sustained speech in LIGHT / HW_NS / OFF modes can never drift the noise floor upward.
+        // - Tracks upward slowly only during confirmed non-speech room noise increases, clamped below current RMS.
+        val unmutedSteady = (muteSmoothGain >= 0.5f) && !frameHadImpulse
+        if (unmutedSteady && !activeSpeech) {
+            val neuralSilent = (neuralVadProb < 0f) || (neuralVadProb < 0.25f)
+            val likelyQuiet = neuralSilent && preDspRms < noiseFloorEnv * 1.8f
+            if (likelyQuiet) {
+                noiseFloorEnv = 0.96f * noiseFloorEnv + 0.04f * max(preDspRms, 0.00010f)
+                speechBandNoiseFloor = 0.96f * speechBandNoiseFloor + 0.04f * max(speechBandRms, 0.00008f)
+            } else if (neuralSilent) {
+                val maxUpNoise = min(0.035f, max(noiseFloorEnv, preDspRms * 0.90f))
+                val maxUpSpeechBand = min(0.025f, max(speechBandNoiseFloor, speechBandRms * 0.90f))
+                noiseFloorEnv = min(maxUpNoise, noiseFloorEnv * 1.0003f)
+                speechBandNoiseFloor = min(maxUpSpeechBand, speechBandNoiseFloor * 1.0003f)
+            }
+        }
+        lastNoiseFloorDb = linearToDb(noiseFloorEnv)
 
         // Pure Single-Pass Rule: NEVER stack Kotlin light spectral cut on top of Native C RNNoise
         val runLightSpectral = (nsLevel > 0 && !ranNativeRnnoise &&
@@ -1166,9 +1210,13 @@ class MicDspProcessor(private val sampleRate: Int = 48000) {
                 if (deEssAttenSmooth > 0.001f) {
                     s -= sibSample * deEssAttenSmooth
                 }
+            } else if (deEssAttenSmooth > 0.001f || sibilanceEnv > 0.0001f) {
+                deEssAttenSmooth = 0.0f
+                sibilanceEnv = 0.0f
+                sibilanceBand.reset()
             }
 
-            // Stage 6c: True Post-DSP Mic Boost (50..250%) -> 4× Catmull-Rom True-Peak Limiter (-1.16 dBTP)
+            // Stage 6c: True Post-DSP Mic Boost (50..250%) -> 4× Catmull-Rom Peak Limiter (-1.16 dBTP)
             s *= postDspGain
             val outS = processTruePeakLimiterSample(s)
 
@@ -1329,7 +1377,7 @@ class MicDspProcessor(private val sampleRate: Int = 48000) {
         }
 
         fun linearToDb(v: Float): Float {
-            if (v <= 0.00003f) return -90f
+            if (!v.isFinite() || v <= 0.00003f) return -90f
             return (20.0 * ln(v.toDouble()) / ln(10.0)).toFloat()
         }
 
