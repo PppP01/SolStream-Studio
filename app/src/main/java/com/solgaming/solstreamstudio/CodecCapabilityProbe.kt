@@ -146,6 +146,18 @@ data class HardwareEncoderReport(
     val supports360p60: Boolean = supports360p,
     val supports360p30: Boolean = supports360p
 ) {
+    fun topResolutionTag(): String = when {
+        supports4k60 -> "4K60"
+        supports4k30 -> "4K30"
+        supports1440p60 -> "1440p60"
+        supports1440p30 -> "1440p30"
+        supports1080p60 -> "1080p60"
+        supports1080p30 -> "1080p30"
+        supports720p60 -> "720p60"
+        supports720p30 -> "720p30"
+        else -> "SD"
+    }
+
     fun alignDimensions(rawWidth: Int, rawHeight: Int): Pair<Int, Int> {
         val wAlign = max(2, if (widthAlignment % 2 == 0) widthAlignment else widthAlignment * 2)
         val hAlign = max(2, if (heightAlignment % 2 == 0) heightAlignment else heightAlignment * 2)
@@ -333,12 +345,7 @@ data class DeviceScanSummary(
         parts.add("Tier: ${recommendedTier.title.uppercase(Locale.US)} (${totalRamGb}GB • ${maxDisplayHz}Hz • $glTag)")
 
         hevcHardware?.let {
-            val topRes = when {
-                it.supports4k60 -> "4K60"
-                it.supports1440p60 -> "1440p60"
-                it.supports1080p60 -> "1080p60"
-                else -> "1080p30"
-            }
+            val topRes = it.topResolutionTag()
             val extras = buildList {
                 if (it.supports10BitHdr) add("HDR10")
                 if (it.supportsRoi) add("ROI")
@@ -348,18 +355,11 @@ data class DeviceScanSummary(
         } ?: parts.add("HEVC: No HW")
 
         h264Hardware?.let {
-            val topH264 = if (it.supports4k60) "4K60" else if (it.supports1440p60) "1440p60" else "1080p60"
-            parts.add("HW H.264 ($topH264)")
+            parts.add("HW H.264 (${it.topResolutionTag()})")
         }
 
         if (av1Hardware != null && (av1Hardware.supports1440p60 || av1Hardware.supports1080p60 || av1Hardware.supports1080p30)) {
-            val topAv1 = when {
-                av1Hardware.supports4k60 -> "4K60"
-                av1Hardware.supports1440p60 -> "1440p60"
-                av1Hardware.supports1080p60 -> "1080p60"
-                else -> "1080p30"
-            }
-            parts.add("HW AV1 ($topAv1)")
+            parts.add("HW AV1 (${av1Hardware.topResolutionTag()})")
         } else {
             parts.add("AV1: No HW Enc (CPU-SW Blocked)")
         }
@@ -435,17 +435,27 @@ data class LiveHardwareHealth(
     val isPluggedIn: Boolean,
     val powerSourceLabel: String
 ) {
+    /** Alias clarifying that this percentage estimates thermal envelope pressure (100% = Severe threshold), not CPU load. */
+    val thermalPressurePercent: Int
+        get() = socThermalLoadPercent
+
     fun tempStateLabel(): String = when {
         batteryTempC >= 43.0f || thermalStatus >= PowerManager.THERMAL_STATUS_SEVERE -> "Hot"
         batteryTempC >= 39.5f || thermalStatus >= PowerManager.THERMAL_STATUS_MODERATE -> "Warm"
-        else -> "Cool"
+        batteryTempC > 0f -> "Cool"
+        thermalStatus == PowerManager.THERMAL_STATUS_LIGHT -> "Warm"
+        else -> "N/A"
     }
 
     fun toIdleStatusBanner(): String {
-        val tempStr = String.format(Locale.US, "%.1f°C (%s)", batteryTempC, tempStateLabel())
+        val tempStr = if (batteryTempC > 0f) {
+            String.format(Locale.US, "%.1f°C (%s)", batteryTempC, tempStateLabel())
+        } else {
+            "N/A"
+        }
         val ramStr = String.format(Locale.US, "%.1f/%dGB", availRamGb, totalRamGb)
         val pwrTag = if (isPluggedIn) " • ⚡ $powerSourceLabel" else ""
-        return "READY • Idle Temp: $tempStr • SoC Load: ${socThermalLoadPercent}% • Free RAM: $ramStr$pwrTag"
+        return "READY • Idle Temp: $tempStr • Thermal Pressure: ${thermalPressurePercent}% • Free RAM: $ramStr$pwrTag"
     }
 }
 
@@ -462,7 +472,7 @@ object CodecCapabilityProbe {
     private const val CACHE_PREFS = "solstream_hw_probe_cache_v3"
     private const val KEY_FINGERPRINT = "cached_fingerprint"
     private const val KEY_PAYLOAD = "cached_scan_json"
-    private const val CACHE_SCHEMA_TAG = "ultra_v151_r1"
+    private const val CACHE_SCHEMA_TAG = "ultra_v152_r1"
     private const val BYPASS_CURRENT_THRESHOLD_UA = 250_000
 
     private val scanLock = ReentrantLock()
@@ -481,7 +491,7 @@ object CodecCapabilityProbe {
      */
     @Volatile var isBroadcastStartingOrLive: Boolean = false
 
-    // 10-second rate-limit cache for PowerManager.getThermalHeadroom() (Android 11-18 requires >=10s interval)
+    // 10.5-second rate-limit cache for PowerManager.getThermalHeadroom() (Android 11-18 requires >=10s interval)
     private val thermalPollLock = Any()
     @Volatile private var lastThermalHeadroomPollMs: Long = 0L
     @Volatile private var cachedThermalHeadroomRatio: Float = Float.NaN
@@ -507,9 +517,9 @@ object CodecCapabilityProbe {
 
     /**
      * Classifies active power source cleanly for Session Reports & Idle Banner:
-     * - Detects Samsung / OEM Pause USB PD Bypass Charging via explicit NOT_CHARGING / DISCHARGING
-     *   status OR low smoothed battery current (<= 250 mA / 250,000 uA) while plugged into AC
-     *   between 15% and 95% battery (avoids false positives on 96-100% trickle or slow PC USB ports).
+     * - Strictly requires AC power (isAcPlugged) before classifying Bypass Charging (USB-PD),
+     *   preventing false positives on slow PC USB ports or weak wireless chargers reporting
+     *   NOT_CHARGING or DISCHARGING, and avoids 99-100% full trickle charge false hits.
      */
     internal fun resolvePowerSourceLabel(
         plugged: Int,
@@ -520,8 +530,11 @@ object CodecCapabilityProbe {
     ): String {
         if (plugged == 0) return "Battery"
 
-        val explicitNotCharging = status == BatteryManager.BATTERY_STATUS_NOT_CHARGING ||
-            (status == BatteryManager.BATTERY_STATUS_DISCHARGING && battPct < 99)
+        val isAcPlugged = (plugged and BatteryManager.BATTERY_PLUGGED_AC) != 0
+        val explicitNotChargingOnAc = isAcPlugged && battPct in 15..98 && (
+            status == BatteryManager.BATTERY_STATUS_NOT_CHARGING ||
+                status == BatteryManager.BATTERY_STATUS_DISCHARGING
+            )
 
         val effectiveMicroAmps = when {
             currentAvgMicroAmps != Int.MIN_VALUE && currentAvgMicroAmps != 0 -> currentAvgMicroAmps
@@ -529,14 +542,13 @@ object CodecCapabilityProbe {
             else -> Int.MIN_VALUE
         }
 
-        val isAcPlugged = (plugged and BatteryManager.BATTERY_PLUGGED_AC) != 0
         val lowBypassCurrentOnAc = isAcPlugged &&
             battPct in 15..95 &&
             effectiveMicroAmps != Int.MIN_VALUE &&
             abs(effectiveMicroAmps) <= BYPASS_CURRENT_THRESHOLD_UA
 
         return when {
-            explicitNotCharging || lowBypassCurrentOnAc -> "Bypass Charging (USB-PD)"
+            explicitNotChargingOnAc || lowBypassCurrentOnAc -> "Bypass Charging (USB-PD)"
             isAcPlugged -> "AC Fast Power"
             (plugged and BatteryManager.BATTERY_PLUGGED_USB) != 0 -> "USB Power"
             (plugged and BatteryManager.BATTERY_PLUGGED_WIRELESS) != 0 -> "Wireless Power"
@@ -632,19 +644,19 @@ object CodecCapabilityProbe {
     }
 
     /**
-     * Reads zero-permission live idle/active hardware telemetry (Battery 0.1C temp, 10.5s rate-limited
-     * PowerManager thermal headroom, available RAM, and accurate Bypass Charging USB-PD state).
+     * Reads zero-permission live idle/active hardware telemetry (Battery 0.1C temp or 0f if unavailable,
+     * 10.5s rate-limited PowerManager thermal headroom, available RAM, and AC-gated Bypass Charging USB-PD state).
      */
     fun readLiveHardwareHealth(context: Context): LiveHardwareHealth {
         val appCtx = context.applicationContext
-        var tempC = 33.0f
+        var tempC = 0f
         var isPlugged = false
         var powerLabel = "Battery"
         try {
             val intent = appCtx.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
             if (intent != null) {
-                val tenths = intent.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, 330)
-                if (tenths in 100..750) {
+                val tenths = intent.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, -1)
+                if (tenths in 50..850) {
                     tempC = tenths / 10.0f
                 }
                 val plugged = intent.getIntExtra(BatteryManager.EXTRA_PLUGGED, 0)
@@ -714,16 +726,20 @@ object CodecCapabilityProbe {
         } catch (_: Exception) {
         }
 
-        val socPercent = if (!headroom.isNaN() && headroom > 0.0f) {
+        val thermalPressurePct = if (!headroom.isNaN() && headroom > 0.0f) {
             (headroom * 100.0f).roundToInt().coerceIn(25, 130)
         } else {
-            val fromTemp = (50.0f + ((tempC - 30.0f) * 3.1f)).roundToInt()
             val statusFloor = when (thermalStatus) {
                 PowerManager.THERMAL_STATUS_NONE -> 35
                 PowerManager.THERMAL_STATUS_LIGHT -> 72
                 PowerManager.THERMAL_STATUS_MODERATE -> 85
                 PowerManager.THERMAL_STATUS_SEVERE -> 96
                 else -> 102
+            }
+            val fromTemp = if (tempC > 0f) {
+                (50.0f + ((tempC - 30.0f) * 3.1f)).roundToInt()
+            } else {
+                statusFloor
             }
             max(fromTemp, statusFloor).coerceIn(30, 125)
         }
@@ -732,7 +748,7 @@ object CodecCapabilityProbe {
             batteryTempC = tempC,
             thermalStatus = thermalStatus,
             thermalHeadroomRatio = headroom,
-            socThermalLoadPercent = socPercent,
+            socThermalLoadPercent = thermalPressurePct,
             availRamGb = availGb,
             totalRamGb = totalGb,
             isPluggedIn = isPlugged,
