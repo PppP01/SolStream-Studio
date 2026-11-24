@@ -9,6 +9,7 @@
 package com.solgaming.solstreamstudio
 
 import android.content.Context
+import android.content.SharedPreferences
 import android.content.pm.PackageManager
 import android.os.Build
 import android.security.keystore.KeyGenParameterSpec
@@ -63,8 +64,8 @@ data class StreamSettings(
     val colorTempFilter: String = "NEUTRAL",      // "NEUTRAL", "WARM", "COOL"
     val gpuSharpen: Boolean = false,              // Stackable Contrast-Adaptive Crisp Sharpen
     val roiMode: String = "AUTO",                 // "OFF", "AUTO", "CENTER", "HUD"
-    val keyframeIntervalSec: Int = 2,             // 1 or 2 seconds
-    val maxBFrames: Int = 0,                      // 0 (lowest latency), 1, or 2
+    val keyframeIntervalSec: Int = 2,             // 1 or 2 seconds (locked to 2s on Twitch/Kick)
+    val maxBFrames: Int = 0,                      // Locked to 0 (RootEncoder 2.8.1 RTMP packetizer writes CTS=0)
     val qpMaxCap: Int = 0,                        // 0 = Auto (14..51), 32, 36, 38, 42
     val lowLatencyCodecHint: Boolean = true,
     val shortsBackdropMode: String = "BLUR",      // "DARK", "BLUR", "POSTER"
@@ -110,7 +111,7 @@ data class StreamSettings(
     val autoBlurKeyboard: Boolean = true,         // Automatically blurs bottom half of stream when IME keyboard opens
     val simulcastSplitEncode: Boolean = false,    // Mode 2: Uses secondary HW encoder for 1080p H.264 simulcast on Flagship/Ultra
 
-    // === Phase 1 (v1.5.0) Pro Broadcast Overlays (Strictly Opt-In, 0 MB VRAM When OFF) ===
+    // === Phase 1 (v1.5.0+) Pro Broadcast Overlays (Strictly Opt-In, 0 MB VRAM When OFF) ===
     val hudTelemetryEnabled: Boolean = false,     // SolHUD™ Live GPU FPS • °C • Mbps badge (visible in Single-App Capture)
     val hudTelemetryCorner: String = "TOP_LEFT",  // "TOP_LEFT", "TOP_RIGHT", "BOTTOM_LEFT", "BOTTOM_RIGHT"
     val qrOverlayEnabled: Boolean = false,        // Pure-Kotlin offline Corner QR (UPI / YouTube / Discord)
@@ -152,10 +153,16 @@ object KeystoreVault {
     private const val KEY_AUTO_SCAN_DONE = "initial_auto_hw_scan_done"
     private const val KEY_PROFILE_SLOT_PREFIX = "studio_profile_slot_v1_"
 
+    private val vaultLock = Any()
     private val invisibleWhitespaceRegex = Regex("[\\s\\u200B\\u200C\\u200D\\uFEFF]+")
     private val validOverlayCorners = setOf("TOP_LEFT", "TOP_RIGHT", "BOTTOM_LEFT", "BOTTOM_RIGHT")
 
     @Volatile private var cachedSecurityLabel: String? = null
+
+    private fun prefs(context: Context): SharedPreferences {
+        val safeCtx = context.applicationContext ?: context
+        return safeCtx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+    }
 
     fun sanitizeOverlayCorner(rawCorner: String?, fallback: String): String {
         val norm = rawCorner?.trim()?.uppercase(Locale.US) ?: ""
@@ -168,6 +175,92 @@ object KeystoreVault {
         "HIGH" -> DeviceTier.HIGH
         "ULTRA" -> DeviceTier.ULTRA
         else -> DeviceTier.FLAGSHIP
+    }
+
+    // === CENTRAL PLATFORM-COMPATIBILITY VALIDATOR (TWITCH / KICK / SINGLE-ENCODE SIMULCAST / B-FRAMES) ===
+
+    fun isSingleEncodeSimulcast(settings: StreamSettings): Boolean {
+        return (settings.simulcastTwitchEnabled || settings.simulcastKickEnabled) && !settings.simulcastSplitEncode
+    }
+
+    fun isTwitchLimited(settings: StreamSettings): Boolean {
+        return settings.platformPreset.equals("TWITCH", ignoreCase = true) ||
+            (isSingleEncodeSimulcast(settings) && settings.simulcastTwitchEnabled)
+    }
+
+    fun isKickLimited(settings: StreamSettings): Boolean {
+        return settings.platformPreset.equals("KICK", ignoreCase = true) ||
+            (isSingleEncodeSimulcast(settings) && settings.simulcastKickEnabled)
+    }
+
+    fun isStrictH264Destination(settings: StreamSettings): Boolean {
+        return isTwitchLimited(settings) || isKickLimited(settings)
+    }
+
+    fun isStrictCbrDestination(settings: StreamSettings): Boolean {
+        return isTwitchLimited(settings) || isKickLimited(settings)
+    }
+
+    fun maxLongSideForDestination(settings: StreamSettings): Int {
+        return if (isStrictH264Destination(settings)) 1920 else 3840
+    }
+
+    fun maxVideoBitrateKbpsForDestination(settings: StreamSettings): Int {
+        return when {
+            isTwitchLimited(settings) -> 6000
+            isKickLimited(settings) -> 8000
+            else -> 100_000
+        }
+    }
+
+    fun maxAudioBitrateKbpsForDestination(settings: StreamSettings): Int {
+        return if (isStrictH264Destination(settings)) 160 else 320
+    }
+
+    /**
+     * Central destination-compatibility enforcer used on preset selection, UI edits, JSON import,
+     * and immediately before encoder start:
+     * - Twitch (primary or single-encode simulcast): H.264, CBR, <=1080p60, <=6,000 kbps, <=160 kbps AAC, 2s keyframe, HDR10 OFF.
+     * - Kick (primary or single-encode simulcast): H.264, CBR, <=1080p60, <=8,000 kbps, <=160 kbps AAC, 2s keyframe, HDR10 OFF.
+     * - All destinations: maxBFrames locked to 0 (RootEncoder 2.8.1 packetizer writes CTS=0).
+     */
+    fun enforcePlatformLimits(settings: StreamSettings): Pair<StreamSettings, Boolean> {
+        val strictDest = isStrictH264Destination(settings)
+        val normCodec = when (settings.codec.trim().uppercase(Locale.US)) {
+            "HEVC", "H264", "AV1" -> settings.codec.trim().uppercase(Locale.US)
+            else -> "HEVC"
+        }
+        val finalCodec = if (strictDest) "H264" else normCodec
+
+        var longDim = max(settings.width, settings.height).coerceIn(360, 3840)
+        var shortDim = min(settings.width, settings.height).coerceIn(360, 2160)
+        val maxLong = maxLongSideForDestination(settings)
+        if (longDim > maxLong) {
+            longDim = 1920
+            shortDim = 1080
+        }
+
+        val finalFps = if (settings.fps <= 30) 30 else 60
+        val finalBitrate = settings.targetBitrateKbps.coerceIn(500, maxVideoBitrateKbpsForDestination(settings))
+        val finalAudioBitrate = settings.audioBitrateKbps.coerceIn(64, maxAudioBitrateKbpsForDestination(settings))
+        val finalUseVbr = if (strictDest) false else settings.useVbr
+        val finalHdr10 = if (strictDest) false else settings.hdr10Enabled
+        val finalKeyframe = if (strictDest) 2 else settings.keyframeIntervalSec.coerceIn(1, 4)
+        val finalBFrames = 0
+
+        val enforced = settings.copy(
+            codec = finalCodec,
+            width = longDim,
+            height = shortDim,
+            fps = finalFps,
+            targetBitrateKbps = finalBitrate,
+            audioBitrateKbps = finalAudioBitrate,
+            useVbr = finalUseVbr,
+            hdr10Enabled = finalHdr10,
+            keyframeIntervalSec = finalKeyframe,
+            maxBFrames = finalBFrames
+        )
+        return enforced to (enforced != settings)
     }
 
     /**
@@ -263,10 +356,10 @@ object KeystoreVault {
 
     // === PRIMARY & SHORTS STREAM KEY VAULT (RETURNS TRUE ONLY WHEN ENCRYPTION + STORAGE SUCCEED) ===
     fun saveEndpointAndKey(context: Context, rtmpsUrl: String, plainStreamKey: String): Boolean {
-        val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        val sp = prefs(context)
         val normUrl = normalizeIngestUrl(rtmpsUrl)
         val cleanKey = sanitizeStreamKeyInput(plainStreamKey)
-        val editor = prefs.edit().putString(KEY_INGEST_URL, normUrl)
+        val editor = sp.edit().putString(KEY_INGEST_URL, normUrl)
         if (cleanKey.isEmpty()) {
             editor.remove(KEY_ENC_STREAM_KEY)
             return editor.commit()
@@ -277,28 +370,23 @@ object KeystoreVault {
     }
 
     fun getRtmpsUrl(context: Context): String {
-        val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        val raw = prefs.getString(KEY_INGEST_URL, DEFAULT_YOUTUBE_RTMPS) ?: DEFAULT_YOUTUBE_RTMPS
+        val raw = prefs(context).getString(KEY_INGEST_URL, DEFAULT_YOUTUBE_RTMPS) ?: DEFAULT_YOUTUBE_RTMPS
         return normalizeIngestUrl(raw)
     }
 
     fun getStreamKey(context: Context): String {
-        val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        val blob = prefs.getString(KEY_ENC_STREAM_KEY, null) ?: return ""
+        val blob = prefs(context).getString(KEY_ENC_STREAM_KEY, null) ?: return ""
         return decryptSecret(blob)
     }
 
     fun clearStreamKey(context: Context) {
-        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-            .edit()
-            .remove(KEY_ENC_STREAM_KEY)
-            .apply()
+        prefs(context).edit().remove(KEY_ENC_STREAM_KEY).apply()
     }
 
     fun saveShortsStreamKey(context: Context, shortsKey: String): Boolean {
-        val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        val sp = prefs(context)
         val clean = sanitizeStreamKeyInput(shortsKey)
-        val edit = prefs.edit()
+        val edit = sp.edit()
         if (clean.isEmpty()) {
             edit.remove(KEY_ENC_SHORTS_KEY)
             return edit.commit()
@@ -309,15 +397,14 @@ object KeystoreVault {
     }
 
     fun getShortsStreamKey(context: Context): String {
-        val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        val blob = prefs.getString(KEY_ENC_SHORTS_KEY, null) ?: return ""
+        val blob = prefs(context).getString(KEY_ENC_SHORTS_KEY, null) ?: return ""
         return decryptSecret(blob)
     }
 
     // === MULTI-PLATFORM SIMULCAST VAULT (TWITCH, KICK & CUSTOM RTMP) ===
     fun saveTwitchUrlAndKey(context: Context, url: String, key: String): Boolean {
-        val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        val edit = prefs.edit().putString(KEY_TWITCH_URL, normalizeIngestUrl(url.ifBlank { DEFAULT_TWITCH_RTMPS }))
+        val sp = prefs(context)
+        val edit = sp.edit().putString(KEY_TWITCH_URL, normalizeIngestUrl(url.ifBlank { DEFAULT_TWITCH_RTMPS }))
         val clean = sanitizeStreamKeyInput(key)
         if (clean.isEmpty()) {
             edit.remove(KEY_ENC_TWITCH_KEY)
@@ -329,20 +416,18 @@ object KeystoreVault {
     }
 
     fun getTwitchUrl(context: Context): String {
-        val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        val raw = prefs.getString(KEY_TWITCH_URL, DEFAULT_TWITCH_RTMPS) ?: DEFAULT_TWITCH_RTMPS
+        val raw = prefs(context).getString(KEY_TWITCH_URL, DEFAULT_TWITCH_RTMPS) ?: DEFAULT_TWITCH_RTMPS
         return normalizeIngestUrl(raw)
     }
 
     fun getTwitchStreamKey(context: Context): String {
-        val blob = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-            .getString(KEY_ENC_TWITCH_KEY, null) ?: return ""
+        val blob = prefs(context).getString(KEY_ENC_TWITCH_KEY, null) ?: return ""
         return decryptSecret(blob)
     }
 
     fun saveKickUrlAndKey(context: Context, url: String, key: String): Boolean {
-        val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        val edit = prefs.edit().putString(KEY_KICK_URL, normalizeIngestUrl(url.ifBlank { DEFAULT_KICK_RTMPS }))
+        val sp = prefs(context)
+        val edit = sp.edit().putString(KEY_KICK_URL, normalizeIngestUrl(url.ifBlank { DEFAULT_KICK_RTMPS }))
         val clean = sanitizeStreamKeyInput(key)
         if (clean.isEmpty()) {
             edit.remove(KEY_ENC_KICK_KEY)
@@ -354,14 +439,12 @@ object KeystoreVault {
     }
 
     fun getKickUrl(context: Context): String {
-        val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        val raw = prefs.getString(KEY_KICK_URL, DEFAULT_KICK_RTMPS) ?: DEFAULT_KICK_RTMPS
+        val raw = prefs(context).getString(KEY_KICK_URL, DEFAULT_KICK_RTMPS) ?: DEFAULT_KICK_RTMPS
         return normalizeIngestUrl(raw)
     }
 
     fun getKickStreamKey(context: Context): String {
-        val blob = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-            .getString(KEY_ENC_KICK_KEY, null) ?: return ""
+        val blob = prefs(context).getString(KEY_ENC_KICK_KEY, null) ?: return ""
         return decryptSecret(blob)
     }
 
@@ -427,10 +510,8 @@ object KeystoreVault {
     ): StreamSettings {
         val matchedHpf = resolveDefaultHpfForProfile(current.voiceGenderProfile)
         val resolvedHpf = if (current.hpfAutoMode) matchedHpf else current.hpfCutoffHz
-        val isTwitchPrimary = current.platformPreset.equals("TWITCH", ignoreCase = true)
-        val isKickPrimary = current.platformPreset.equals("KICK", ignoreCase = true)
-        val singleEncodeSimulcastActive = (current.simulcastTwitchEnabled || current.simulcastKickEnabled) &&
-            !current.simulcastSplitEncode
+        val twitchRestricted = isTwitchLimited(current)
+        val kickRestricted = isKickLimited(current)
 
         val hevcReport = scan?.hevcHardware
         val h264Report = scan?.h264Hardware
@@ -444,19 +525,20 @@ object KeystoreVault {
         val resolvedAudioKbps: Int
 
         val h264Supports1080p = h264Report == null || h264Report.supports1080p60 || h264Report.supports1080p30
+        val h264Supports1080p60 = h264Report == null || h264Report.supports1080p60
 
-        if (isTwitchPrimary || (singleEncodeSimulcastActive && current.simulcastTwitchEnabled)) {
+        if (twitchRestricted) {
             resolvedCodec = "H264"
             resolvedW = if (tier == DeviceTier.LITE && !h264Supports1080p) 1280 else 1920
             resolvedH = if (resolvedW == 1280) 720 else 1080
-            resolvedFps = if (tier == DeviceTier.LITE) 30 else 60
+            resolvedFps = if (tier == DeviceTier.LITE || !h264Supports1080p60) 30 else 60
             resolvedBitrateKbps = if (tier == DeviceTier.LITE) 4500 else 6000
             resolvedAudioKbps = if (tier == DeviceTier.LITE) 128 else 160
-        } else if (isKickPrimary || (singleEncodeSimulcastActive && current.simulcastKickEnabled)) {
+        } else if (kickRestricted) {
             resolvedCodec = "H264"
             resolvedW = if (tier == DeviceTier.LITE && !h264Supports1080p) 1280 else 1920
             resolvedH = if (resolvedW == 1280) 720 else 1080
-            resolvedFps = if (tier == DeviceTier.LITE) 30 else 60
+            resolvedFps = if (tier == DeviceTier.LITE || !h264Supports1080p60) 30 else 60
             resolvedBitrateKbps = if (tier == DeviceTier.LITE) 5000 else 8000
             resolvedAudioKbps = 160
         } else {
@@ -504,7 +586,7 @@ object KeystoreVault {
             }
         }
 
-        return current.copy(
+        val built = current.copy(
             deviceTier = tier.id,
             codec = resolvedCodec,
             width = resolvedW,
@@ -535,18 +617,20 @@ object KeystoreVault {
             slowAgcEnabled = true,
             speakerAecEnabled = false
         )
+        return enforcePlatformLimits(built).first
     }
 
     /**
-     * Smart Cross-Phone Preset Clamping: validates an imported JSON preset against the
-     * receiving phone's hardware scan and adapts unsupported codecs/resolutions/bitrates cleanly.
+     * Smart Cross-Phone & Destination Preset Clamping: validates an imported JSON preset against both
+     * the receiving phone's hardware scan and the active destination's streaming limits (Twitch / Kick / Simulcast).
      */
     fun clampImportedSettingsToHardware(
         imported: StreamSettings,
         scan: DeviceScanSummary
     ): Pair<StreamSettings, Boolean> {
-        var changed = false
-        var codec = imported.codec.uppercase(Locale.US)
+        val (destClamped, destChanged) = enforcePlatformLimits(imported)
+        var changed = destChanged
+        var codec = destClamped.codec.uppercase(Locale.US)
         if (codec == "AV1" && scan.av1Hardware == null) {
             codec = if (scan.hevcHardware != null) "HEVC" else "H264"
             changed = true
@@ -555,15 +639,11 @@ object KeystoreVault {
             codec = "H264"
             changed = true
         }
-        if ((imported.simulcastTwitchEnabled || imported.simulcastKickEnabled) && !imported.simulcastSplitEncode && codec != "H264") {
-            codec = "H264"
-            changed = true
-        }
 
         val report = scan.findReport(codec) ?: scan.hevcHardware ?: scan.h264Hardware
-        var longDim = max(imported.width, imported.height)
-        var shortDim = min(imported.width, imported.height)
-        var fps = imported.fps
+        var longDim = max(destClamped.width, destClamped.height)
+        var shortDim = min(destClamped.width, destClamped.height)
+        var fps = destClamped.fps
 
         if (report != null) {
             if (longDim >= 3840 && !(if (fps >= 60) report.supports4k60 else (report.supports4k30 || report.supports4k60))) {
@@ -576,28 +656,36 @@ object KeystoreVault {
                 shortDim = 1080
                 changed = true
             }
-            if (longDim >= 1920 && fps >= 60 && !report.supports1080p60) {
-                if (report.supports1080p30) {
-                    fps = 30
-                } else {
-                    longDim = 1280
-                    shortDim = 720
+            if (longDim >= 1920) {
+                val ok1080AtFps = if (fps >= 60) report.supports1080p60 else (report.supports1080p30 || report.supports1080p60)
+                if (!ok1080AtFps) {
+                    if (fps >= 60 && report.supports1080p30) {
+                        fps = 30
+                    } else {
+                        longDim = 1280
+                        shortDim = 720
+                    }
+                    changed = true
                 }
+            }
+            if (longDim == 1280 && fps >= 60 && !report.supports720p60 && report.supports720p30) {
+                fps = 30
                 changed = true
             }
         }
 
         val maxChipKbps = ((report?.maxBitrateMbps ?: 50) * 1000).coerceIn(4000, 100_000)
-        val clampedBps = imported.targetBitrateKbps.coerceIn(500, maxChipKbps)
-        if (clampedBps != imported.targetBitrateKbps) changed = true
+        val effectiveMaxKbps = min(maxChipKbps, maxVideoBitrateKbpsForDestination(destClamped))
+        val clampedBps = destClamped.targetBitrateKbps.coerceIn(500, effectiveMaxKbps)
+        if (clampedBps != destClamped.targetBitrateKbps) changed = true
 
-        val hdrOk = imported.hdr10Enabled && (report?.supports10BitHdr == true)
-        if (hdrOk != imported.hdr10Enabled) changed = true
+        val hdrOk = destClamped.hdr10Enabled && (report?.supports10BitHdr == true)
+        if (hdrOk != destClamped.hdr10Enabled) changed = true
 
-        val dualOk = imported.dualFormatCompanionEnabled && scan.supportsDualFormatCompanion()
-        if (dualOk != imported.dualFormatCompanionEnabled) changed = true
+        val dualOk = destClamped.dualFormatCompanionEnabled && scan.supportsDualFormatCompanion(primaryCodec = codec)
+        if (dualOk != destClamped.dualFormatCompanionEnabled) changed = true
 
-        return imported.copy(
+        val finalCandidate = destClamped.copy(
             codec = codec,
             width = longDim,
             height = shortDim,
@@ -605,7 +693,9 @@ object KeystoreVault {
             targetBitrateKbps = clampedBps,
             hdr10Enabled = hdrOk,
             dualFormatCompanionEnabled = dualOk
-        ) to changed
+        )
+        val (enforcedFinal, finalChanged) = enforcePlatformLimits(finalCandidate)
+        return enforcedFinal to (changed || finalChanged)
     }
 
     // === 4 ONE-TAP HARDWARE-ADAPTED STUDIO PROFILES (SECRET-FREE: NEVER STORES STREAM KEYS) ===
@@ -661,7 +751,7 @@ object KeystoreVault {
         val finalSettings = if (scan != null) {
             clampImportedSettingsToHardware(rawSettings, scan).first
         } else {
-            rawSettings
+            enforcePlatformLimits(rawSettings).first
         }
         return StudioProfile(
             slotIndex = safeSlot,
@@ -715,11 +805,11 @@ object KeystoreVault {
         val profile = StudioProfile(
             slotIndex = safeSlot,
             name = name.trim().ifBlank { "Profile ${safeSlot + 1}" }.take(20),
-            settings = settings,
+            settings = enforcePlatformLimits(settings).first,
             isUserCustomized = true
         )
         return try {
-            context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            prefs(context)
                 .edit()
                 .putString("$KEY_PROFILE_SLOT_PREFIX$safeSlot", exportStudioProfileJson(profile))
                 .commit()
@@ -735,15 +825,14 @@ object KeystoreVault {
         scan: DeviceScanSummary?
     ): StudioProfile {
         val safeSlot = slotIndex.coerceIn(0, STUDIO_PROFILE_COUNT - 1)
-        val raw = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-            .getString("$KEY_PROFILE_SLOT_PREFIX$safeSlot", null)
+        val raw = prefs(context).getString("$KEY_PROFILE_SLOT_PREFIX$safeSlot", null)
         if (!raw.isNullOrBlank()) {
             val imported = importStudioProfileJson(safeSlot, raw, current)
             if (imported != null) {
                 val clamped = if (scan != null) {
                     clampImportedSettingsToHardware(imported.settings, scan).first
                 } else {
-                    imported.settings
+                    enforcePlatformLimits(imported.settings).first
                 }
                 return imported.copy(settings = clamped)
             }
@@ -763,34 +852,36 @@ object KeystoreVault {
 
     fun resetStudioProfile(context: Context, slotIndex: Int) {
         val safeSlot = slotIndex.coerceIn(0, STUDIO_PROFILE_COUNT - 1)
-        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-            .edit()
-            .remove("$KEY_PROFILE_SLOT_PREFIX$safeSlot")
-            .apply()
+        prefs(context).edit().remove("$KEY_PROFILE_SLOT_PREFIX$safeSlot").apply()
     }
 
     // === HARDWARE KEYSTORE AES-256-GCM ===
     fun getKeySecurityDescription(): String {
         cachedSecurityLabel?.let { return it }
-        val desc = try {
-            val ks = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
-            val key = (ks.getKey(MASTER_KEY_ALIAS, null) as? SecretKey) ?: return "Android Keystore Ready"
-            val factory = SecretKeyFactory.getInstance(key.algorithm, ANDROID_KEYSTORE)
-            val info = factory.getKeySpec(key, KeyInfo::class.java) as KeyInfo
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                when (info.securityLevel) {
-                    KeyProperties.SECURITY_LEVEL_STRONGBOX -> "Hardware-Backed (StrongBox)"
-                    KeyProperties.SECURITY_LEVEL_TRUSTED_ENVIRONMENT -> "Hardware-Backed (TEE)"
-                    else -> "OS Keystore Protected"
+        val desc = synchronized(vaultLock) {
+            cachedSecurityLabel?.let { return@synchronized it }
+            try {
+                val ks = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
+                val key = (ks.getKey(MASTER_KEY_ALIAS, null) as? SecretKey) ?: return@synchronized "Android Keystore Ready"
+                val factory = SecretKeyFactory.getInstance(key.algorithm, ANDROID_KEYSTORE)
+                val info = factory.getKeySpec(key, KeyInfo::class.java) as KeyInfo
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                    when (info.securityLevel) {
+                        KeyProperties.SECURITY_LEVEL_STRONGBOX -> "Hardware-Backed (StrongBox)"
+                        KeyProperties.SECURITY_LEVEL_TRUSTED_ENVIRONMENT -> "Hardware-Backed (TEE)"
+                        else -> "OS Keystore Protected"
+                    }
+                } else {
+                    @Suppress("DEPRECATION")
+                    if (info.isInsideSecureHardware) "Hardware-Backed (TEE)" else "OS Keystore Protected"
                 }
-            } else {
-                @Suppress("DEPRECATION")
-                if (info.isInsideSecureHardware) "Hardware-Backed (TEE)" else "OS Keystore Protected"
+            } catch (_: Exception) {
+                "Android Keystore Protected"
             }
-        } catch (_: Exception) {
-            "Android Keystore Protected"
         }
-        cachedSecurityLabel = desc
+        if (desc != "Android Keystore Ready") {
+            cachedSecurityLabel = desc
+        }
         return desc
     }
 
@@ -798,8 +889,9 @@ object KeystoreVault {
         val ks = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
         (ks.getKey(MASTER_KEY_ALIAS, null) as? SecretKey)?.let { return it }
 
+        val appCtx = context.applicationContext ?: context
         val hasStrongBox = Build.VERSION.SDK_INT >= Build.VERSION_CODES.P &&
-            context.packageManager.hasSystemFeature(PackageManager.FEATURE_STRONGBOX_KEYSTORE)
+            appCtx.packageManager.hasSystemFeature(PackageManager.FEATURE_STRONGBOX_KEYSTORE)
 
         if (hasStrongBox && Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
             try {
@@ -845,7 +937,7 @@ object KeystoreVault {
         return false
     }
 
-    private fun encryptSecret(context: Context, plain: String): String? {
+    private fun encryptSecret(context: Context, plain: String): String? = synchronized(vaultLock) {
         for (attempt in 0..1) {
             try {
                 val cipher = Cipher.getInstance("AES/GCM/NoPadding")
@@ -855,7 +947,7 @@ object KeystoreVault {
                     cipher.doFinal(plain.toByteArray(StandardCharsets.UTF_8)),
                     Base64.NO_WRAP
                 )
-                return "$iv:$ct"
+                return@synchronized "$iv:$ct"
             } catch (e: Exception) {
                 // Non-Destructive Keystore Recovery: only delete/regenerate master key on permanent invalidation
                 if (attempt == 0 && isPermanentKeyInvalidation(e)) {
@@ -866,21 +958,21 @@ object KeystoreVault {
                     } catch (_: Exception) {
                     }
                 } else {
-                    return null
+                    return@synchronized null
                 }
             }
         }
-        return null
+        null
     }
 
-    private fun decryptSecret(encodedBlob: String): String {
-        return try {
+    private fun decryptSecret(encodedBlob: String): String = synchronized(vaultLock) {
+        try {
             val parts = encodedBlob.split(':')
-            if (parts.size != 2) return ""
+            if (parts.size != 2) return@synchronized ""
             val iv = Base64.decode(parts[0], Base64.NO_WRAP)
             val ct = Base64.decode(parts[1], Base64.NO_WRAP)
             val ks = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
-            val key = (ks.getKey(MASTER_KEY_ALIAS, null) as? SecretKey) ?: return ""
+            val key = (ks.getKey(MASTER_KEY_ALIAS, null) as? SecretKey) ?: return@synchronized ""
             val cipher = Cipher.getInstance("AES/GCM/NoPadding")
             cipher.init(Cipher.DECRYPT_MODE, key, GCMParameterSpec(128, iv))
             String(cipher.doFinal(ct), StandardCharsets.UTF_8)
@@ -899,39 +991,39 @@ object KeystoreVault {
 
     // === SETTINGS PERSISTENCE & SECRET-FREE PRESET SHARE/IMPORT ===
     fun saveSettings(context: Context, s: StreamSettings) {
-        val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        prefs.edit().putString(KEY_SETTINGS_JSON, exportPresetJson(s)).apply()
+        val safe = enforcePlatformLimits(s).first
+        prefs(context).edit().putString(KEY_SETTINGS_JSON, exportPresetJson(safe)).apply()
     }
 
     fun loadSettings(context: Context): StreamSettings {
-        val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        val raw = prefs.getString(KEY_SETTINGS_JSON, null) ?: return StreamSettings()
+        val raw = prefs(context).getString(KEY_SETTINGS_JSON, null) ?: return StreamSettings()
         return importPresetJson(raw, StreamSettings()) ?: StreamSettings()
     }
 
     fun exportPresetJson(s: StreamSettings): String {
+        val safe = enforcePlatformLimits(s).first
         return JSONObject().apply {
             put("solPresetSchema", 5)
-            put("deviceTier", s.deviceTier)
-            put("platformPreset", s.platformPreset)
-            put("useShortsKeySlot", s.useShortsKeySlot)
-            put("simulcastTwitchEnabled", s.simulcastTwitchEnabled)
-            put("simulcastKickEnabled", s.simulcastKickEnabled)
-            put("dualFormatCompanionEnabled", s.dualFormatCompanionEnabled)
-            put("dualFormatBitrateKbps", s.dualFormatBitrateKbps)
+            put("deviceTier", safe.deviceTier)
+            put("platformPreset", safe.platformPreset)
+            put("useShortsKeySlot", safe.useShortsKeySlot)
+            put("simulcastTwitchEnabled", safe.simulcastTwitchEnabled)
+            put("simulcastKickEnabled", safe.simulcastKickEnabled)
+            put("dualFormatCompanionEnabled", safe.dualFormatCompanionEnabled)
+            put("dualFormatBitrateKbps", safe.dualFormatBitrateKbps)
 
-            put("codec", s.codec)
-            put("width", s.width)
-            put("height", s.height)
-            put("fps", s.fps)
-            put("isVertical", s.isVertical)
-            put("landscapeFlip", s.landscapeFlip)
-            put("targetBitrateKbps", s.targetBitrateKbps)
-            put("useVbr", s.useVbr)
-            put("adaptiveBitrate", s.adaptiveBitrate)
-            put("framingMode", s.framingMode)
+            put("codec", safe.codec)
+            put("width", safe.width)
+            put("height", safe.height)
+            put("fps", safe.fps)
+            put("isVertical", safe.isVertical)
+            put("landscapeFlip", safe.landscapeFlip)
+            put("targetBitrateKbps", safe.targetBitrateKbps)
+            put("useVbr", safe.useVbr)
+            put("adaptiveBitrate", safe.adaptiveBitrate)
+            put("framingMode", safe.framingMode)
             // Snap legacy orphan zoom values (like 104%) to the nearest valid step (108%)
-            val clampedZoom = when (s.smartZoomPercent) {
+            val clampedZoom = when (safe.smartZoomPercent) {
                 in 100..106 -> 100
                 in 107..111 -> 108
                 in 112..120 -> 115
@@ -941,73 +1033,73 @@ object KeystoreVault {
                 in 163..187 -> 175
                 in 188..212 -> 200
                 in 213..237 -> 225
-                else -> if (s.smartZoomPercent > 237) 250 else s.smartZoomPercent
+                else -> if (safe.smartZoomPercent > 237) 250 else safe.smartZoomPercent
             }.coerceIn(100, 250)
             put("smartZoomPercent", clampedZoom)
 
-            put("glEngineMode", s.glEngineMode)
-            put("upscalerMode", s.upscalerMode)
-            put("hdr10Enabled", s.hdr10Enabled)
-            put("cinematicFilmic", s.cinematicFilmic)
-            put("amoledVivid", s.amoledVivid)
-            put("shadowBoost", s.shadowBoost)
-            put("colorTempFilter", s.colorTempFilter)
-            put("gpuSharpen", s.gpuSharpen)
-            put("roiMode", s.roiMode)
-            put("keyframeIntervalSec", s.keyframeIntervalSec)
-            put("maxBFrames", s.maxBFrames)
-            put("qpMaxCap", s.qpMaxCap)
-            put("lowLatencyCodecHint", s.lowLatencyCodecHint)
-            put("shortsBackdropMode", s.shortsBackdropMode)
-            put("overlayImageEnabled", s.overlayImageEnabled)
-            put("liveBannerEnabled", s.liveBannerEnabled)
-            put("liveBannerText", s.liveBannerText)
-            put("liveBannerPosition", s.liveBannerPosition)
-            put("minimapShieldEnabled", s.minimapShieldEnabled)
-            put("minimapShieldCorner", s.minimapShieldCorner)
+            put("glEngineMode", safe.glEngineMode)
+            put("upscalerMode", safe.upscalerMode)
+            put("hdr10Enabled", safe.hdr10Enabled)
+            put("cinematicFilmic", safe.cinematicFilmic)
+            put("amoledVivid", safe.amoledVivid)
+            put("shadowBoost", safe.shadowBoost)
+            put("colorTempFilter", safe.colorTempFilter)
+            put("gpuSharpen", safe.gpuSharpen)
+            put("roiMode", safe.roiMode)
+            put("keyframeIntervalSec", safe.keyframeIntervalSec)
+            put("maxBFrames", 0)
+            put("qpMaxCap", safe.qpMaxCap)
+            put("lowLatencyCodecHint", safe.lowLatencyCodecHint)
+            put("shortsBackdropMode", safe.shortsBackdropMode)
+            put("overlayImageEnabled", safe.overlayImageEnabled)
+            put("liveBannerEnabled", safe.liveBannerEnabled)
+            put("liveBannerText", safe.liveBannerText)
+            put("liveBannerPosition", safe.liveBannerPosition)
+            put("minimapShieldEnabled", safe.minimapShieldEnabled)
+            put("minimapShieldCorner", safe.minimapShieldCorner)
 
-            put("micDeviceId", s.micDeviceId)
-            put("micAudioSource", s.micAudioSource)
-            put("audioBitrateKbps", s.audioBitrateKbps)
-            put("voiceGenderProfile", s.voiceGenderProfile)
-            put("voicePreset", s.voicePreset)
-            put("noiseSuppressMode", s.noiseSuppressMode)
-            put("rnnoiseLevel", s.rnnoiseLevel)
-            put("hpfCutoffHz", s.hpfCutoffHz)
-            put("hpfAutoMode", s.hpfAutoMode)
-            put("transientTamerEnabled", s.transientTamerEnabled)
-            put("noiseGateEnabled", s.noiseGateEnabled)
-            put("voiceEqEnabled", s.voiceEqEnabled)
-            put("deEsserEnabled", s.deEsserEnabled)
-            put("velvetWarmthEnabled", s.velvetWarmthEnabled)
-            put("compressorEnabled", s.compressorEnabled)
-            put("whisperLiftEnabled", s.whisperLiftEnabled)
-            put("slowAgcEnabled", s.slowAgcEnabled)
-            put("speakerAecEnabled", s.speakerAecEnabled)
-            put("micGainPercent", s.micGainPercent)
-            put("gameGainPercent", s.gameGainPercent)
-            put("gameCinemaWideEnabled", s.gameCinemaWideEnabled)
-            put("gameSubPunchEnabled", s.gameSubPunchEnabled)
-            put("gameFootstepFocusEnabled", s.gameFootstepFocusEnabled)
-            put("gameBlastTamerEnabled", s.gameBlastTamerEnabled)
-            put("vadDuckingPercent", s.vadDuckingPercent)
-            put("micSyncDelayMs", s.micSyncDelayMs)
+            put("micDeviceId", safe.micDeviceId)
+            put("micAudioSource", safe.micAudioSource)
+            put("audioBitrateKbps", safe.audioBitrateKbps)
+            put("voiceGenderProfile", safe.voiceGenderProfile)
+            put("voicePreset", safe.voicePreset)
+            put("noiseSuppressMode", safe.noiseSuppressMode)
+            put("rnnoiseLevel", safe.rnnoiseLevel)
+            put("hpfCutoffHz", safe.hpfCutoffHz)
+            put("hpfAutoMode", safe.hpfAutoMode)
+            put("transientTamerEnabled", safe.transientTamerEnabled)
+            put("noiseGateEnabled", safe.noiseGateEnabled)
+            put("voiceEqEnabled", safe.voiceEqEnabled)
+            put("deEsserEnabled", safe.deEsserEnabled)
+            put("velvetWarmthEnabled", safe.velvetWarmthEnabled)
+            put("compressorEnabled", safe.compressorEnabled)
+            put("whisperLiftEnabled", safe.whisperLiftEnabled)
+            put("slowAgcEnabled", safe.slowAgcEnabled)
+            put("speakerAecEnabled", safe.speakerAecEnabled)
+            put("micGainPercent", safe.micGainPercent)
+            put("gameGainPercent", safe.gameGainPercent)
+            put("gameCinemaWideEnabled", safe.gameCinemaWideEnabled)
+            put("gameSubPunchEnabled", safe.gameSubPunchEnabled)
+            put("gameFootstepFocusEnabled", safe.gameFootstepFocusEnabled)
+            put("gameBlastTamerEnabled", safe.gameBlastTamerEnabled)
+            put("vadDuckingPercent", safe.vadDuckingPercent)
+            put("micSyncDelayMs", safe.micSyncDelayMs)
 
-            put("brbMuteMicToo", s.brbMuteMicToo)
-            put("wifiLowLatencyLock", s.wifiLowLatencyLock)
-            put("overlayPosition", s.overlayPosition)
-            put("autoBlurKeyboard", s.autoBlurKeyboard)
-            put("simulcastSplitEncode", s.simulcastSplitEncode)
+            put("brbMuteMicToo", safe.brbMuteMicToo)
+            put("wifiLowLatencyLock", safe.wifiLowLatencyLock)
+            put("overlayPosition", safe.overlayPosition)
+            put("autoBlurKeyboard", safe.autoBlurKeyboard)
+            put("simulcastSplitEncode", safe.simulcastSplitEncode)
 
-            // Phase 1 (v1.5.0) Pro Broadcast Overlays
-            put("hudTelemetryEnabled", s.hudTelemetryEnabled)
-            put("hudTelemetryCorner", sanitizeOverlayCorner(s.hudTelemetryCorner, "TOP_LEFT"))
-            put("qrOverlayEnabled", s.qrOverlayEnabled)
-            put("qrOverlayText", s.qrOverlayText.trim().take(MAX_QR_OVERLAY_CHARS))
-            put("qrOverlayCorner", sanitizeOverlayCorner(s.qrOverlayCorner, "BOTTOM_RIGHT"))
-            put("pngTuberEnabled", s.pngTuberEnabled)
-            put("pngTuberCorner", sanitizeOverlayCorner(s.pngTuberCorner, "BOTTOM_LEFT"))
-            put("pngTuberSizePercent", s.pngTuberSizePercent.coerceIn(12, 30))
+            // Phase 1 (v1.5.0+) Pro Broadcast Overlays
+            put("hudTelemetryEnabled", safe.hudTelemetryEnabled)
+            put("hudTelemetryCorner", sanitizeOverlayCorner(safe.hudTelemetryCorner, "TOP_LEFT"))
+            put("qrOverlayEnabled", safe.qrOverlayEnabled)
+            put("qrOverlayText", safe.qrOverlayText.trim().take(MAX_QR_OVERLAY_CHARS))
+            put("qrOverlayCorner", sanitizeOverlayCorner(safe.qrOverlayCorner, "BOTTOM_RIGHT"))
+            put("pngTuberEnabled", safe.pngTuberEnabled)
+            put("pngTuberCorner", sanitizeOverlayCorner(safe.pngTuberCorner, "BOTTOM_LEFT"))
+            put("pngTuberSizePercent", safe.pngTuberSizePercent.coerceIn(12, 30))
         }.toString()
     }
 
@@ -1045,7 +1137,7 @@ object KeystoreVault {
                 else -> if (rawZoom > 237) 250 else rawZoom
             }.coerceIn(100, 250)
 
-            StreamSettings(
+            val parsed = StreamSettings(
                 deviceTier = j.optString("deviceTier", fallback.deviceTier),
                 platformPreset = j.optString("platformPreset", fallback.platformPreset),
                 useShortsKeySlot = j.optBoolean("useShortsKeySlot", fallback.useShortsKeySlot),
@@ -1076,7 +1168,7 @@ object KeystoreVault {
                 gpuSharpen = j.optBoolean("gpuSharpen", fallback.gpuSharpen),
                 roiMode = j.optString("roiMode", fallback.roiMode),
                 keyframeIntervalSec = j.optInt("keyframeIntervalSec", fallback.keyframeIntervalSec).coerceIn(1, 4),
-                maxBFrames = j.optInt("maxBFrames", fallback.maxBFrames).coerceIn(0, 2),
+                maxBFrames = 0,
                 qpMaxCap = j.optInt("qpMaxCap", fallback.qpMaxCap).coerceIn(0, 51),
                 lowLatencyCodecHint = j.optBoolean("lowLatencyCodecHint", fallback.lowLatencyCodecHint),
                 shortsBackdropMode = j.optString("shortsBackdropMode", fallback.shortsBackdropMode),
@@ -1138,20 +1230,17 @@ object KeystoreVault {
                 ),
                 pngTuberSizePercent = j.optInt("pngTuberSizePercent", fallback.pngTuberSizePercent).coerceIn(12, 30)
             )
+            enforcePlatformLimits(parsed).first
         } catch (_: Exception) {
             null
         }
     }
 
     fun hasCompletedInitialAutoScan(context: Context): Boolean {
-        return context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-            .getBoolean(KEY_AUTO_SCAN_DONE, false)
+        return prefs(context).getBoolean(KEY_AUTO_SCAN_DONE, false)
     }
 
     fun markInitialAutoScanDone(context: Context) {
-        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-            .edit()
-            .putBoolean(KEY_AUTO_SCAN_DONE, true)
-            .apply()
+        prefs(context).edit().putBoolean(KEY_AUTO_SCAN_DONE, true).apply()
     }
 }
