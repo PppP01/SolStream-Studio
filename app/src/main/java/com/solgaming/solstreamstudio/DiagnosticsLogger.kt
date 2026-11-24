@@ -47,7 +47,11 @@ data class BenchmarkSnapshot(
     val reconnects: Int
 ) {
     fun toSummaryLine(): String {
-        val tempSpan = String.format(Locale.US, "%.1f°C -> Peak %.1f°C", startBatteryTempC, peakBatteryTempC)
+        val tempSpan = if (startBatteryTempC > 0f && peakBatteryTempC > 0f) {
+            String.format(Locale.US, "%.1f°C -> Peak %.1f°C", startBatteryTempC, peakBatteryTempC)
+        } else {
+            "N/A"
+        }
         val therm = DiagnosticsLogger.thermalStatusName(worstThermalStatus)
         return "$label (${durationMinutes}m): Start $tempSpan | Worst Thermal: $therm | App PSS: ${peakPssMb} MB | Sender Drops: $droppedFrames | Reconnects: $reconnects"
     }
@@ -87,7 +91,7 @@ data class BenchmarkSnapshot(
 
 object DiagnosticsLogger {
 
-    const val ENGINE_VERSION = "v1.5.1"
+    const val ENGINE_VERSION = "v1.5.2"
 
     private const val MAX_EVENTS = 160
     private const val MAX_CLIPS = 60
@@ -137,6 +141,7 @@ object DiagnosticsLogger {
     @Volatile var lastNativeHeapMb: Int = 0
 
     @Volatile var droppedVideoFrames: Int = 0
+    @Volatile var droppedAudioFrames: Int = 0
     @Volatile var reconnectAttempts: Int = 0
     @Volatile var lastBitrateKbps: Int = 0
     @Volatile private var bitrateSamplesSumKbps: Long = 0L
@@ -148,8 +153,9 @@ object DiagnosticsLogger {
     @Volatile var lastQueueBytes: Long = 0L
     @Volatile var lastQueueFrames: Int = 0
     @Volatile var lastQueueCapacity: Int = 60
-    @Volatile var lastSendLatencyMs: Long = 1L
+    @Volatile var lastSendLatencyMs: Long = 0L
     @Volatile var lastRttMs: Long = -1L
+    @Volatile var lastRttSourceLabel: String = ""
     @Volatile var avDriftMs: Long = 0L
     @Volatile var micStatusLabel: String = "Ready"
     @Volatile var lastActiveAudioPolicySnapshot: String = ""
@@ -158,6 +164,10 @@ object DiagnosticsLogger {
         synchronized(timeFmtLock) {
             return timeFmt.format(Date())
         }
+    }
+
+    private fun formatTempOrNa(tempC: Float): String {
+        return if (tempC > 0f) String.format(Locale.US, "%.1f°C", tempC) else "N/A"
     }
 
     /**
@@ -180,12 +190,29 @@ object DiagnosticsLogger {
         }
     }
 
+    /**
+     * Verifies a sysfs /sys/class/thermal/thermal_zoneN/type string represents a real CPU/SoC/GPU
+     * silicon sensor and explicitly rejects battery, charger, USB, skin, and RF sensors.
+     */
+    internal fun isVerifiedSocThermalZoneType(rawType: String): Boolean {
+        val t = rawType.trim().lowercase(Locale.US)
+        if (t.isEmpty()) return false
+        val excluded = listOf("batt", "battery", "usb", "chg", "charger", "skin", "quiet", "pa_therm", "xo_therm", "pmic", "flash", "camera")
+        if (excluded.any { t.contains(it) }) return false
+        val socMarkers = listOf("cpu", "soc", "gpu", "g3d", "big", "little", "mid", "prime", "cluster", "tsens", "ap_", "exynos", "mtktscpu")
+        return socMarkers.any { t.contains(it) }
+    }
+
     @Synchronized
     internal fun resetSessionLifecycleForTests() {
         sessionStartMs = 0L
         sessionEndMs = 0L
         isSessionFinalized = false
         activeOverlaysDesc = "None"
+        droppedVideoFrames = 0
+        droppedAudioFrames = 0
+        lastRttMs = -1L
+        lastRttSourceLabel = ""
         events.clear()
         clipHighlights.clear()
     }
@@ -302,7 +329,7 @@ object DiagnosticsLogger {
     fun clearSavedClips(context: Context) {
         clipHighlights.clear()
         try {
-            context.getSharedPreferences(PREFS_BENCH, Context.MODE_PRIVATE)
+            context.applicationContext.getSharedPreferences(PREFS_BENCH, Context.MODE_PRIVATE)
                 .edit()
                 .remove(KEY_SAVED_CLIPS_JSON)
                 .apply()
@@ -367,12 +394,7 @@ object DiagnosticsLogger {
         try {
             persistSavedClips(context)
             val durMin = max(1, ((System.currentTimeMillis() - sessionStartMs) / 60_000L).toInt())
-            val label = String.format(
-                Locale.US,
-                "SolStream (%dm • Peak %.1f°C • LIVE / INCOMPLETE)",
-                durMin,
-                peakTempC
-            )
+            val label = "SolStream (${durMin}m • Peak ${formatTempOrNa(peakTempC)} • LIVE / INCOMPLETE)"
             val reportText = buildShareableReportInternal(
                 context = context,
                 isLiveCheckpoint = true,
@@ -462,6 +484,7 @@ object DiagnosticsLogger {
         peakTotalPssMb = 0
         sampleMemoryFootprint(forcePssWalk = true)
         droppedVideoFrames = 0
+        droppedAudioFrames = 0
         reconnectAttempts = 0
         lastBitrateKbps = 0
         bitrateSamplesSumKbps = 0L
@@ -473,15 +496,16 @@ object DiagnosticsLogger {
         lastQueueBytes = 0L
         lastQueueFrames = 0
         lastQueueCapacity = 60
-        lastSendLatencyMs = 1L
+        lastSendLatencyMs = 0L
         lastRttMs = -1L
+        lastRttSourceLabel = ""
         avDriftMs = 0L
         lastActiveAudioPolicySnapshot = ""
         captureLiveAudioPolicySnapshot(context)
         log(
             "SESSION",
             "$modeTitle started ($pipelineDesc).",
-            "startTemp=${String.format(Locale.US, "%.1f", temp)}°C batt=${lastBatteryPercent}% power=$startPowerSourceLabel thermal=${thermalStatusName(worstThermalState)}"
+            "startTemp=${formatTempOrNa(temp)} batt=${lastBatteryPercent}% power=$startPowerSourceLabel thermal=${thermalStatusName(worstThermalState)}"
         )
         saveLiveCheckpoint(context, skipHealthResample = true)
     }
@@ -527,7 +551,7 @@ object DiagnosticsLogger {
         val t = health.batteryTempC
         val s = health.thermalStatus
         if (t > peakTempC) peakTempC = t
-        if (startTempC == 0f && t > 0f) startTempC = t
+        if (startTempC <= 0f && t > 0f) startTempC = t
         val socT = readOptionalSocTempC()
         if (socT > peakSocTempC) peakSocTempC = socT
         if (s > worstThermalState) worstThermalState = s
@@ -590,7 +614,7 @@ object DiagnosticsLogger {
             droppedFrames = droppedVideoFrames,
             reconnects = reconnectAttempts
         )
-        val prefs = context.getSharedPreferences(PREFS_BENCH, Context.MODE_PRIVATE)
+        val prefs = context.applicationContext.getSharedPreferences(PREFS_BENCH, Context.MODE_PRIVATE)
         prefs.edit()
             .putString(if (isGlipBaseline) KEY_LAST_GLIP_BENCH else KEY_LAST_SOL_BENCH, snap.toJson().toString())
             .apply()
@@ -601,24 +625,35 @@ object DiagnosticsLogger {
     fun readBatteryTempC(context: Context): Float {
         return try {
             val intent = context.applicationContext.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
-            val tenths = intent?.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, 0) ?: 0
-            tenths / 10.0f
+            val tenths = intent?.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, -1) ?: -1
+            if (tenths in 50..850) tenths / 10.0f else 0f
         } catch (_: Exception) {
             0f
         }
     }
 
+    /**
+     * Reads peak temperature across verified CPU/SoC/GPU thermal zones only (checking each zone's `type`
+     * file first). Returns -1f if SELinux blocks /sys/class/thermal or no verified SoC zone is readable.
+     */
     private fun readOptionalSocTempC(): Float {
         return try {
-            for (idx in 0..5) {
-                val f = File("/sys/class/thermal/thermal_zone$idx/temp")
-                if (f.canRead()) {
-                    val raw = f.readText().trim().toLongOrNull() ?: continue
-                    val degC = if (raw > 1000L) raw / 1000.0f else raw.toFloat()
-                    if (degC in 20.0f..115.0f) return degC
+            var maxSocTemp = -1f
+            for (idx in 0..25) {
+                val typeFile = File("/sys/class/thermal/thermal_zone$idx/type")
+                if (!typeFile.canRead()) continue
+                val zoneType = typeFile.readText().trim()
+                if (!isVerifiedSocThermalZoneType(zoneType)) continue
+
+                val tempFile = File("/sys/class/thermal/thermal_zone$idx/temp")
+                if (!tempFile.canRead()) continue
+                val raw = tempFile.readText().trim().toLongOrNull() ?: continue
+                val degC = if (raw > 1000L) raw / 1000.0f else raw.toFloat()
+                if (degC in 20.0f..115.0f && degC > maxSocTemp) {
+                    maxSocTemp = degC
                 }
             }
-            -1f
+            maxSocTemp
         } catch (_: Throwable) {
             -1f
         }
@@ -713,7 +748,7 @@ object DiagnosticsLogger {
         }
         loadPersistedClipsIfEmpty(context)
         val scan = CodecCapabilityProbe.peekCachedOrPlaceholder(context)
-        val prefs = context.getSharedPreferences(PREFS_BENCH, Context.MODE_PRIVATE)
+        val prefs = context.applicationContext.getSharedPreferences(PREFS_BENCH, Context.MODE_PRIVATE)
         val lastSol = BenchmarkSnapshot.fromJson(prefs.getString(KEY_LAST_SOL_BENCH, null))
         val lastGlip = BenchmarkSnapshot.fromJson(prefs.getString(KEY_LAST_GLIP_BENCH, null))
         val lastCrash = prefs.getString(KEY_LAST_CRASH, null)
@@ -761,17 +796,19 @@ object DiagnosticsLogger {
         val avgMbps = String.format(Locale.US, "%.2f Mbps", getSessionAverageBitrateKbps() / 1000.0)
         val safeQFrames = max(0, lastQueueFrames)
         val safeQCap = max(30, lastQueueCapacity)
-        val safeSendMs = max(0L, lastSendLatencyMs)
+        val safeEnqueueMs = max(0L, lastSendLatencyMs)
         val queueStr = if (lastQueueBytes > 0L) {
-            "$safeQFrames/$safeQCap frames (${lastQueueBytes / 1024} KB, ${safeSendMs}ms send)"
+            "$safeQFrames/$safeQCap frames (${lastQueueBytes / 1024} KB, ${safeEnqueueMs}ms enqueue)"
         } else {
-            "$safeQFrames/$safeQCap frames (${safeSendMs}ms send)"
+            "$safeQFrames/$safeQCap frames (${safeEnqueueMs}ms enqueue)"
         }
+        val rttLabel = if (lastRttSourceLabel.isNotBlank()) "Ingest RTT ($lastRttSourceLabel)" else "Ingest RTT"
         val rttStr = if (lastRttMs > 0L) "${lastRttMs} ms" else "N/A"
         val qpStr = if (lastAverageQp >= 0) "$lastAverageQp" else "N/A"
+        val audioDropStr = if (droppedAudioFrames > 0) " | Audio Drops: $droppedAudioFrames" else ""
 
         sb.appendLine(
-            "Latest Live Metrics: $latestMbps (Session Avg: $avgMbps) | Out FPS: $lastEncodedFps (Fresh Game FPS: $freshCaptureFps, Repeat Paced: $repeatedFramesCount, Avg QP: $qpStr) | Send Queue: $queueStr | Ingest RTT: $rttStr | A/V Sync Offset: ${avDriftMs} ms | Mic: $effectiveMicLabel"
+            "Latest Live Metrics: $latestMbps (Session Avg: $avgMbps) | Out FPS: $lastEncodedFps (Fresh Game FPS: $freshCaptureFps, Repeat Paced: $repeatedFramesCount, Avg QP: $qpStr) | Media Queue (A+V): $queueStr | $rttLabel: $rttStr | A/V Sync Offset: ${avDriftMs} ms$audioDropStr | Mic: $effectiveMicLabel"
         )
 
         val headroomStr = if (lastThermalHeadroom > 0f) {
@@ -780,12 +817,12 @@ object DiagnosticsLogger {
             ""
         }
         val socTempStr = if (peakSocTempC > 0f) {
-            String.format(Locale.US, " | Peak SoC Sensor: %.1f°C", peakSocTempC)
+            String.format(Locale.US, " | Peak Verified SoC Sensor: %.1f°C", peakSocTempC)
         } else {
             ""
         }
         sb.appendLine(
-            "Battery Temp & Memory: Start ${String.format(Locale.US, "%.1f°C", startTempC)} -> Peak ${String.format(Locale.US, "%.1f°C", peakTempC)}$socTempStr | Worst SoC Thermal: ${thermalStatusName(worstThermalState)}$headroomStr | App Process PSS: ${peakTotalPssMb} MB (Java Heap: ${lastJavaHeapMb} MB | Native Heap: ${lastNativeHeapMb} MB)"
+            "Battery Temp & Memory: Start ${formatTempOrNa(startTempC)} -> Peak ${formatTempOrNa(peakTempC)}$socTempStr | Worst Thermal State: ${thermalStatusName(worstThermalState)}$headroomStr | App Process PSS: ${peakTotalPssMb} MB (Java Heap: ${lastJavaHeapMb} MB | Native Heap: ${lastNativeHeapMb} MB)"
         )
         sb.appendLine("Active Audio Policy: ${buildActiveAudioPolicySummary(context)}")
         if (!lastCrash.isNullOrBlank()) {
