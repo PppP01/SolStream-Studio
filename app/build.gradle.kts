@@ -21,6 +21,8 @@ val keystoreKeyAlias = System.getenv("SIGNING_KEY_ALIAS")?.trim()
 val keystoreKeyPass = System.getenv("SIGNING_KEY_PASSWORD")?.trim()
 val requestedNdkVersion = System.getenv("SOL_NDK_VERSION")?.trim().orEmpty().ifBlank { "28.2.13676358" }
 val isPullRequestEvent = System.getenv("GITHUB_EVENT_NAME")?.trim() == "pull_request"
+val requireXiphRnnoise = System.getenv("SOL_REQUIRE_XIPH_RNNOISE")?.equals("true", ignoreCase = true) == true ||
+    System.getenv("GITHUB_ACTIONS")?.equals("true", ignoreCase = true) == true
 
 val hasReleaseKeystore = !keystoreBase64.isNullOrBlank() &&
     !keystoreStorePass.isNullOrBlank() &&
@@ -51,8 +53,8 @@ android {
         applicationId = "com.solgaming.solstreamstudio"
         minSdk = 29
         targetSdk = 36
-        versionCode = 13
-        versionName = "1.5.1"
+        versionCode = 14
+        versionName = "1.5.2"
 
         ndk {
             abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64")
@@ -62,7 +64,8 @@ android {
             cmake {
                 arguments += listOf(
                     "-DANDROID_STL=none",
-                    "-DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON"
+                    "-DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON",
+                    "-DSOL_REQUIRE_XIPH_RNNOISE=${if (requireXiphRnnoise) "ON" else "OFF"}"
                 )
             }
         }
@@ -166,6 +169,7 @@ dependencies {
     implementation("androidx.core:core-ktx:1.15.0")
     implementation("androidx.appcompat:appcompat:1.7.0")
     implementation("com.google.android.material:material:1.12.0")
+    implementation("androidx.exifinterface:exifinterface:1.4.2")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.2")
     testImplementation("junit:junit:4.13.2")
 }
