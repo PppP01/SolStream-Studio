@@ -10,8 +10,6 @@ package com.solgaming.solstreamstudio
 
 import android.Manifest
 import android.app.Activity
-import android.content.ClipData
-import android.content.ClipDescription
 import android.content.ClipboardManager
 import android.content.ComponentName
 import android.content.Context
@@ -29,7 +27,6 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
-import android.os.PersistableBundle
 import android.os.PowerManager
 import android.os.SystemClock
 import android.provider.Settings
@@ -55,18 +52,10 @@ import androidx.core.content.ContextCompat
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
 import com.solgaming.solstreamstudio.recorder.SolHudAndQrRenderer
-import org.json.JSONObject
-import java.net.InetAddress
-import java.net.InetSocketAddress
-import java.net.Socket
-import java.net.URI
-import java.net.URL
+import com.solgaming.solstreamstudio.ui.DashboardDialogs
 import java.nio.charset.StandardCharsets
 import java.util.Locale
 import java.util.concurrent.atomic.AtomicBoolean
-import javax.net.ssl.HttpsURLConnection
-import javax.net.ssl.SSLSocket
-import javax.net.ssl.SSLSocketFactory
 import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
@@ -90,7 +79,6 @@ class MainActivity : AppCompatActivity() {
 
     private val uiHandler = Handler(Looper.getMainLooper())
     private val micTestBusy = AtomicBoolean(false)
-    private val netTestBusy = AtomicBoolean(false)
     private val hwScanBusy = AtomicBoolean(false)
 
     // Responsive Layout Containers (Android 10–18 Phones, Foldables & Tablets)
@@ -354,7 +342,7 @@ class MainActivity : AppCompatActivity() {
         appVersionName = readAppVersionName()
 
         scanSummary = CodecCapabilityProbe.peekCachedOrPlaceholder(this)
-        settings = KeystoreVault.loadSettings(this)
+        settings = KeystoreVault.enforcePlatformLimits(KeystoreVault.loadSettings(this)).first
         micOptions = CodecCapabilityProbe.listAvailableMicInputs(this)
 
         setContentView(buildDashboardUi())
@@ -362,7 +350,7 @@ class MainActivity : AppCompatActivity() {
         SolStreamService.onStateChangedListener = {
             runOnUiThread {
                 if (!isFinishing && !isDestroyed) {
-                    settings = KeystoreVault.loadSettings(this)
+                    settings = KeystoreVault.enforcePlatformLimits(KeystoreVault.loadSettings(this)).first
                     refreshAllUi()
                 }
             }
@@ -393,7 +381,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onResume() {
         super.onResume()
-        settings = KeystoreVault.loadSettings(this)
+        settings = KeystoreVault.enforcePlatformLimits(KeystoreVault.loadSettings(this)).first
         micOptions = CodecCapabilityProbe.listAvailableMicInputs(this)
         refreshAllUi()
         uiHandler.removeCallbacks(idleTelemetryRefreshRunnable)
@@ -435,9 +423,9 @@ class MainActivity : AppCompatActivity() {
                 @Suppress("DEPRECATION")
                 packageManager.getPackageInfo(packageName, 0)
             }
-            info.versionName?.removeSuffix("-debug") ?: "1.5.1"
+            info.versionName?.removeSuffix("-debug") ?: "1.5.2"
         } catch (_: Exception) {
-            "1.5.1"
+            "1.5.2"
         }
     }
 
@@ -461,22 +449,6 @@ class MainActivity : AppCompatActivity() {
             rightPad,
             max(dp(28), lastInsetBottom + dp(20))
         )
-    }
-
-    private fun buildBrandAntiKillOneLiner(): String {
-        val mfr = "${Build.MANUFACTURER} ${Build.BRAND}".lowercase(Locale.US)
-        return when {
-            mfr.contains("samsung") ->
-                "Samsung Tip: Set Battery → Unrestricted, add SolStream & your game to Device Care → Memory → Excluded apps, and keep RAM Plus OFF."
-            mfr.contains("xiaomi") || mfr.contains("redmi") || mfr.contains("poco") ->
-                "HyperOS/MIUI Tip: Set Battery → No restrictions, enable Autostart, and lock SolStream in Recents."
-            mfr.contains("oneplus") || mfr.contains("oppo") || mfr.contains("realme") ->
-                "ColorOS/OxygenOS Tip: Turn ON Allow Background Activity and lock SolStream in Recents."
-            mfr.contains("vivo") || mfr.contains("iqoo") ->
-                "Vivo/iQOO Tip: Allow High Background Power Consumption, lock in Recents, and keep Game Frame Interpolation OFF."
-            else ->
-                "Android Tip: Set Battery → Unrestricted in App Info so Android never cuts long broadcasts."
-        }
     }
 
     private fun buildDashboardUi(): View {
@@ -564,7 +536,7 @@ class MainActivity : AppCompatActivity() {
             typeface = Typeface.DEFAULT_BOLD
             setPadding(dp(11), dp(6), dp(11), dp(6))
             background = roundedDrawable("#0E2A47", "#00E5FF")
-            setOnClickListener { showPlainEnglishGlossaryDialog() }
+            setOnClickListener { openGlossaryGuide() }
         }
 
         titleRow.addView(logoIconView)
@@ -594,7 +566,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         val topHelperRow = buttonRow(
-            actionButton("📖 User Guide & Privacy", "#0D3652") { showPlainEnglishGlossaryDialog() },
+            actionButton("📖 User Guide & Privacy", "#0D3652") { openGlossaryGuide() },
             actionButton("Copy Preset", "#111C2F") { copyPresetToClipboard() },
             actionButton("Import Preset", "#111C2F") { importPresetFromClipboard() }
         )
@@ -650,7 +622,7 @@ class MainActivity : AppCompatActivity() {
             setOnClickListener {
                 val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
                 if (pm.isIgnoringBatteryOptimizations(packageName)) {
-                    showAllBrandSetupGuide()
+                    openAllBrandSetupGuide()
                 } else {
                     openBatteryUnrestricted()
                 }
@@ -660,14 +632,14 @@ class MainActivity : AppCompatActivity() {
         protectTopRow.addView(btnProtectAction)
 
         tvProtectTip = TextView(this).apply {
-            text = buildBrandAntiKillOneLiner()
+            text = DashboardDialogs.buildBrandAntiKillOneLiner()
             setTextColor(Color.parseColor("#CBD5E1"))
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 10.8f)
             setPadding(0, dp(5), 0, 0)
         }
         boxProtectBanner.addView(protectTopRow)
         boxProtectBanner.addView(tvProtectTip)
-        boxProtectBanner.setOnClickListener { showAllBrandSetupGuide() }
+        boxProtectBanner.setOnClickListener { openAllBrandSetupGuide() }
         container.addView(boxProtectBanner)
 
         // === LIVE IDLE / ACTIVE TELEMETRY BANNER ===
@@ -813,7 +785,7 @@ class MainActivity : AppCompatActivity() {
         boxPreflightButtonsContainer.addView(buttonRow(btnTapAccessibilityFirst, btnUnlockRestricted))
         boxPreflightButtonsContainer.addView(
             actionButton("🛡️ All-Brand Anti-Kill, Excluded Apps & Cool-Stream Guide", "#152844") {
-                showAllBrandSetupGuide()
+                openAllBrandSetupGuide()
             }
         )
         cardPreflight.addView(boxPreflightButtonsContainer)
@@ -858,7 +830,7 @@ class MainActivity : AppCompatActivity() {
         }
         cardStream.addView(profileRow)
 
-        cardStream.addView(labelText("Broadcast Platform (Auto-configures Codec, Max Mbps & AAC):"))
+        cardStream.addView(labelText("Broadcast Platform (Enforces Official Codec, Res, CBR, Bitrate & AAC Limits):"))
         val platRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             layoutParams = LinearLayout.LayoutParams(
@@ -972,7 +944,7 @@ class MainActivity : AppCompatActivity() {
             labelText("Multi-Platform Simulcast (Twitch, Kick, Rooter, Loco, TikTok Live or Custom RTMP):")
         )
         btnSimulcastMode = actionButton("", "#13284A") {
-            updateSetting(settings.copy(simulcastSplitEncode = !settings.simulcastSplitEncode), requiresRestartIfLive = true)
+            toggleSimulcastSplitMode()
         }
         boxSimulcastDrawer.addView(btnSimulcastMode)
 
@@ -1026,7 +998,15 @@ class MainActivity : AppCompatActivity() {
             "Tip: Keep 'Turn on manual settings' OFF in YouTube Studio so one Default Stream Key works automatically for both 16:9 Landscape & 9:16 Shorts. Adaptive RTMP chunking uses 64 KB on Wi-Fi and 4 KB on Mobile Data / Custom relays."
         )
         btnNetTest = actionButton("Test Internet: Download, Upload, RTT & Bitrate Advisor", "#153969") {
-            runRtmpsNetworkCheck()
+            saveVaultInputs(showToast = false)
+            DashboardDialogs.runRtmpsNetworkCheck(
+                activity = this,
+                rawIngestUrl = etRtmpsUrl.text?.toString() ?: KeystoreVault.DEFAULT_YOUTUBE_RTMPS,
+                settings = settings
+            ) { running, statusText ->
+                btnNetTest.isEnabled = !running && !SolStreamService.isBroadcastLive
+                tvNetTestResult.text = statusText
+            }
         }
         cardStream.addView(
             buttonRow(
@@ -1079,9 +1059,7 @@ class MainActivity : AppCompatActivity() {
                 layoutParams = LinearLayout.LayoutParams(0, dp(38), 1f).apply {
                     if (idx > 0) marginStart = dp(4)
                 }
-                setOnClickListener {
-                    updateSetting(settings.copy(width = longW, height = shortH), requiresRestartIfLive = true)
-                }
+                setOnClickListener { selectResolutionDirect(longW, shortH) }
             }
             resPillButtons[longW] = b
             resRow.addView(b)
@@ -1171,9 +1149,7 @@ class MainActivity : AppCompatActivity() {
         btnBitrateCycle = actionButton("", "#0D3652") { stepBitrate(+1) }
         btnBitrateUp = actionButton("+ Mbps", "#153969") { stepBitrate(+1) }
 
-        btnRateControl = actionButton("", "#13284A") {
-            updateSetting(settings.copy(useVbr = !settings.useVbr), requiresRestartIfLive = true)
-        }
+        btnRateControl = actionButton("", "#13284A") { toggleRateControl() }
         btnAbr = actionButton("", "#101929") {
             updateSetting(settings.copy(adaptiveBitrate = !settings.adaptiveBitrate))
         }
@@ -1246,7 +1222,7 @@ class MainActivity : AppCompatActivity() {
         boxSceneProDrawer.addView(etQrOverlayText)
         boxSceneProDrawer.addView(buttonRow(btnQrOverlayToggle, btnQrOverlayCorner))
 
-        boxSceneProDrawer.addView(labelText("Zero-Camera 2-PNG PNGTuber Avatar (Syncs to Mic Voice • Built-In Cyber Fallback):"))
+        boxSceneProDrawer.addView(labelText("Zero-Camera 2-PNG PNGTuber Avatar (Syncs to Mic Voice • Built-In Striker Default):"))
         btnPickPngTuberIdle = actionButton("", "#13284A") {
             pendingAssetPickSlot = SolSceneAssetStore.AssetSlot.PNGTUBER_IDLE
             imageAssetPickerLauncher.launch("image/*")
@@ -1286,7 +1262,7 @@ class MainActivity : AppCompatActivity() {
             updateSetting(settings.copy(overlayImageEnabled = false))
             Toast.makeText(
                 this,
-                "Cleared custom scenes, logo & avatar PNGs (reverted to built-in slates/cyber avatar).",
+                "Cleared custom scenes, logo & avatar PNGs (reverted to built-in slates/default avatar).",
                 Toast.LENGTH_SHORT
             ).show()
         }
@@ -1324,11 +1300,9 @@ class MainActivity : AppCompatActivity() {
 
         boxSceneProDrawer.addView(labelText("SolCodec™ Silicon & OpenGL ES 3.0 Fast-FP16 Controls:"))
         btnGlEngine = actionButton("", "#13284A") { cycleGlEngine() }
-        btnHdr10 = actionButton("", "#101929") {
-            updateSetting(settings.copy(hdr10Enabled = !settings.hdr10Enabled), requiresRestartIfLive = true)
-        }
+        btnHdr10 = actionButton("", "#101929") { toggleHdr10() }
         btnRoiMode = actionButton("", "#101929") { cycleRoiMode() }
-        btnKeyframeAndBFrames = actionButton("", "#13284A") { cycleKeyframeAndBFrames() }
+        btnKeyframeAndBFrames = actionButton("", "#13284A") { cycleKeyframeInterval() }
         btnQpAndLatency = actionButton("", "#13284A") { cycleQpAndLatency() }
 
         boxSceneProDrawer.addView(buttonRow(btnGlEngine, btnHdr10))
@@ -1346,7 +1320,7 @@ class MainActivity : AppCompatActivity() {
             badgeHex = "#8B5CF6"
         )
         cardAudio.addView(
-            bodyText("6-Stage 64-Bit Pure Condenser Chain: 55/68/85Hz Gender HPF, <0.6ms Raised-Cosine Impulse Clamper, Native C 48kHz RNNoise + Hybrid VAD Expander, Split-Band Plosive Guard, 4×3 Condenser EQ & 4× True-Peak Limiter.")
+            bodyText("6-Stage 64-Bit Pure Condenser Chain: 55/68/85Hz Gender HPF, <0.6ms Raised-Cosine Impulse Clamper, Native C 48kHz RNNoise + Hybrid VAD Expander, Split-Band Plosive Guard, 4×3 Condenser EQ & 4× Peak Limiter.")
         )
 
         btnMicDevice = actionButton("", "#13284A") { cycleMicInputDevice() }
@@ -1378,7 +1352,7 @@ class MainActivity : AppCompatActivity() {
         cardAudio.addView(btnVoicePreset)
         cardAudio.addView(buttonRow(btnNoiseSuppressMode, btnNoiseSuppressLevel))
 
-        cardAudio.addView(labelText("Post-DSP Mic Boost (50%–250% • Protected by 4× True-Peak Limiter):"))
+        cardAudio.addView(labelText("Post-DSP Mic Boost (50%–250% • Protected by 4× Peak Limiter):"))
         btnMicGain = actionButton("", "#0D3652") { cycleMicGain() }
         val micSliderRow = buildVolumeSeekBarRow(
             minPct = 50,
@@ -1398,7 +1372,7 @@ class MainActivity : AppCompatActivity() {
         cardAudio.addView(btnMicGain)
         cardAudio.addView(micSliderRow.first)
 
-        cardAudio.addView(labelText("Internal Stereo Game Mix (0%–250% • Protected by 4× True-Peak Limiter):"))
+        cardAudio.addView(labelText("Internal Stereo Game Mix (0%–250% • Protected by 4× Peak Limiter):"))
         btnGameGain = actionButton("", "#153969") { cycleGameGain() }
         val gameSliderRow = buildVolumeSeekBarRow(
             minPct = 0,
@@ -1545,9 +1519,11 @@ class MainActivity : AppCompatActivity() {
         }
         cardLaunch.addView(btnGoLive)
 
-        btnReportsQuick = actionButton("Session Reports & History", "#153969") { showDiagnosticsDialog() }
+        btnReportsQuick = actionButton("Session Reports & History", "#153969") {
+            DashboardDialogs.showDiagnosticsDialog(this, showingArchived = false) { refreshAllUi() }
+        }
         btnSavedClipsQuick = actionButton("★ Saved Clips & AI Highlights", "#4C1D95") {
-            showSavedClipsDialog()
+            DashboardDialogs.showSavedClipsDialog(this) { refreshAllUi() }
         }
         btnGlipBench = actionButton("Benchmark Other App", "#152338") {
             toggleCompetitorBenchmark()
@@ -1558,7 +1534,9 @@ class MainActivity : AppCompatActivity() {
             buttonRow(
                 btnGlipBench,
                 actionButton("Refresh Mics / HW Scan", "#152338") { refreshHardwareAndMicsAsync() },
-                actionButton("Check GitHub Update", "#152338") { checkGitHubReleaseUpdate() }
+                actionButton("Check GitHub Update", "#152338") {
+                    DashboardDialogs.checkGitHubReleaseUpdate(this, appVersionName)
+                }
             )
         )
         cardLaunch.addView(
@@ -1584,6 +1562,28 @@ class MainActivity : AppCompatActivity() {
         outerRoot.addView(rootScroll)
         applyResponsiveContainerPadding()
         return outerRoot
+    }
+
+    private fun openGlossaryGuide() {
+        DashboardDialogs.showPlainEnglishGlossaryDialog(
+            activity = this,
+            appVersionName = appVersionName,
+            onOpenBatteryUnrestricted = { openBatteryUnrestricted() }
+        )
+    }
+
+    private fun openAllBrandSetupGuide() {
+        DashboardDialogs.showAllBrandSetupGuide(
+            activity = this,
+            onOpenBatteryUnrestricted = { openBatteryUnrestricted() },
+            onOpenAccessibilityDisclosure = { showPlayStoreCompliantAccessibilityDisclosure(allowSkipToStream = false) }
+        )
+    }
+
+    private fun activeStrictDestinationName(): String = when {
+        KeystoreVault.isTwitchLimited(settings) -> "Twitch"
+        KeystoreVault.isKickLimited(settings) -> "Kick"
+        else -> settings.platformPreset
     }
 
     private fun makeStatusChip(
@@ -1825,8 +1825,10 @@ class MainActivity : AppCompatActivity() {
             longDim >= 800 -> "480p"
             else -> "360p"
         }
-        val singleEncodeSimLock = (settings.simulcastTwitchEnabled || settings.simulcastKickEnabled) && !settings.simulcastSplitEncode
-        val effectiveActiveCodec = if (singleEncodeSimLock) "H264" else settings.codec.uppercase(Locale.US)
+        val strictDest = KeystoreVault.isStrictH264Destination(settings)
+        val destMaxLong = KeystoreVault.maxLongSideForDestination(settings)
+        val destMaxMbps = KeystoreVault.maxVideoBitrateKbpsForDestination(settings) / 1000
+        val effectiveActiveCodec = if (strictDest) "H264" else settings.codec.uppercase(Locale.US)
 
         // Glanceable Header Chips & Live Protect Long Streams Banner
         tvChipAudio.text = "SolLuxe 3.0 • ${settings.voicePreset}"
@@ -1840,7 +1842,7 @@ class MainActivity : AppCompatActivity() {
             tvProtectTitle.text = "🛡️ Long-Stream Protection: Unrestricted ✓"
             tvProtectTitle.setTextColor(Color.parseColor("#A7F3D0"))
             tvProtectTip.visibility = View.VISIBLE
-            tvProtectTip.text = buildBrandAntiKillOneLiner()
+            tvProtectTip.text = DashboardDialogs.buildBrandAntiKillOneLiner()
             btnProtectAction.text = "Tips"
             btnProtectAction.setTextColor(Color.parseColor("#A7F3D0"))
             btnProtectAction.background = roundedDrawable("#0D3329", "#10B981")
@@ -1853,7 +1855,7 @@ class MainActivity : AppCompatActivity() {
             tvProtectTitle.text = "🛡️ Long-Stream Protection: Setup Needed"
             tvProtectTitle.setTextColor(Color.parseColor("#FDE68A"))
             tvProtectTip.visibility = View.VISIBLE
-            tvProtectTip.text = buildBrandAntiKillOneLiner()
+            tvProtectTip.text = DashboardDialogs.buildBrandAntiKillOneLiner()
             btnProtectAction.text = "Protect"
             btnProtectAction.setTextColor(Color.parseColor("#050A14"))
             btnProtectAction.background = roundedDrawable("#F59E0B", "#FDE68A")
@@ -1985,23 +1987,26 @@ class MainActivity : AppCompatActivity() {
 
         btnCompanionBitrate.text =
             "9:16 Companion Bitrate: ${formatBitrateMbps(settings.dualFormatBitrateKbps)} (Tap to step 2–20 Mbps)"
-        btnNetTest.isEnabled = !isLive && !netTestBusy.get()
+        btnNetTest.isEnabled = !isLive && !DashboardDialogs.isNetworkTestRunning
         btnNetTest.text = if (isLive) {
             "Speed Test Locked While Live (See Floating Pill Net Tab)"
         } else {
             "Test Internet: Download, Upload, RTT & Bitrate Advisor"
         }
 
-        // Card 3: Direct-Tap Pills & Video Engine
+        // Card 3: Direct-Tap Pills & Video Engine (with clear destination lock dimming)
         val restartSuffix = if (isLive) " [Next]" else ""
         val av1Available = scanSummary.av1Hardware != null &&
             (scanSummary.av1Hardware?.supports1440p60 == true || scanSummary.av1Hardware?.supports1080p60 == true)
 
         resPillButtons.forEach { (wKey, btn) ->
             styleToggleBtn(btn, isOn = (longDim == wKey))
+            btn.alpha = if (wKey > destMaxLong) 0.42f else 1.0f
         }
         codecPillButtons.forEach { (cKey, btn) ->
             styleToggleBtn(btn, isOn = (cKey == effectiveActiveCodec))
+            val blocked = (strictDest && cKey != "H264") || (cKey == "AV1" && !av1Available)
+            btn.alpha = if (blocked) 0.42f else 1.0f
         }
         fpsPillButtons.forEach { (fVal, btn) ->
             styleToggleBtn(btn, isOn = (settings.fps == fVal))
@@ -2010,12 +2015,16 @@ class MainActivity : AppCompatActivity() {
             styleToggleBtn(btn, isOn = settings.framingMode.equals(fKey, ignoreCase = true))
         }
 
-        btnCodec.text = if (singleEncodeSimLock) {
-            "Codec: H264 (Locked for Single-Encode Simulcast)$restartSuffix"
+        btnCodec.text = if (strictDest) {
+            "Codec: H264 (Locked for ${activeStrictDestinationName()})$restartSuffix"
         } else {
             "Codec: ${settings.codec}" + (if (!av1Available && settings.codec != "AV1") " (AV1: No HW)" else "") + restartSuffix
         }
-        btnResolution.text = "Res: $heroResShort$restartSuffix"
+        btnResolution.text = if (strictDest) {
+            "Res: $heroResShort (Max 1080p)$restartSuffix"
+        } else {
+            "Res: $heroResShort$restartSuffix"
+        }
         btnFps.text = "Stream: ${settings.fps} FPS$restartSuffix" +
             (if (longDim <= 864 && settings.fps == 60) " (YT 480p plays @30)" else "")
         btnOrientationFlip.text = if (settings.isVertical) {
@@ -2024,8 +2033,16 @@ class MainActivity : AppCompatActivity() {
             "Format: 16:9 Wide (${settings.landscapeFlip}° USB-C Flip)"
         }
 
-        btnBitrateCycle.text = "Target: $mbpsStr"
-        btnRateControl.text = "Rate: ${if (settings.useVbr) "VBR (Test)" else "CBR (Rec)"}$restartSuffix"
+        btnBitrateCycle.text = if (strictDest) {
+            "Target: $mbpsStr (Cap ${destMaxMbps}M)"
+        } else {
+            "Target: $mbpsStr"
+        }
+        btnRateControl.text = if (strictDest) {
+            "Rate: CBR (Locked for ${activeStrictDestinationName()})$restartSuffix"
+        } else {
+            "Rate: ${if (settings.useVbr) "VBR (Test)" else "CBR (Rec)"}$restartSuffix"
+        }
         btnAbr.text = "Ping Guard ABR 2.0: ${onOff(settings.adaptiveBitrate)}"
         styleToggleBtn(btnAbr, isOn = settings.adaptiveBitrate)
 
@@ -2068,9 +2085,9 @@ class MainActivity : AppCompatActivity() {
 
         val hasPngIdle = SolSceneAssetStore.hasCustomAsset(this, SolSceneAssetStore.AssetSlot.PNGTUBER_IDLE)
         val hasPngTalk = SolSceneAssetStore.hasCustomAsset(this, SolSceneAssetStore.AssetSlot.PNGTUBER_TALK)
-        btnPickPngTuberIdle.text = "Idle PNG (${if (hasPngIdle) "Saved" else "Cyber Default"})"
+        btnPickPngTuberIdle.text = "Idle PNG (${if (hasPngIdle) "Saved" else "Striker Default"})"
         styleToggleBtn(btnPickPngTuberIdle, isOn = hasPngIdle, activeFillHex = "#13284A", activeStrokeHex = "#38BDF8")
-        btnPickPngTuberTalk.text = "Talk PNG (${if (hasPngTalk) "Saved" else "Cyber Default"})"
+        btnPickPngTuberTalk.text = "Talk PNG (${if (hasPngTalk) "Saved" else "Striker Default"})"
         styleToggleBtn(btnPickPngTuberTalk, isOn = hasPngTalk, activeFillHex = "#13284A", activeStrokeHex = "#38BDF8")
         btnPngTuberToggle.text = "Avatar: ${onOff(settings.pngTuberEnabled)}"
         styleToggleBtn(btnPngTuberToggle, isOn = settings.pngTuberEnabled)
@@ -2127,14 +2144,18 @@ class MainActivity : AppCompatActivity() {
         val glDisp = if (settings.glEngineMode == "ES20") "ES 2.0" else "ES 3.0 Fast-FP16"
         btnGlEngine.text = "OpenGL Engine: ${settings.glEngineMode} ($glDisp • Max: ES ${scanSummary.maxGlEsVersion})$restartSuffix"
         val hdrSupported = scanSummary.hevcHardware?.supports10BitHdr == true
-        btnHdr10.text = "True 10-Bit HDR10 (HLG): ${onOff(settings.hdr10Enabled)}" +
-            (if (!hdrSupported) " (HW 8-Bit Only)" else "") + restartSuffix
-        styleToggleBtn(btnHdr10, isOn = settings.hdr10Enabled)
+        btnHdr10.text = when {
+            strictDest -> "10-Bit HDR10: OFF (SDR Only on ${activeStrictDestinationName()})"
+            !hdrSupported -> "True 10-Bit HDR10 (HLG): ${onOff(settings.hdr10Enabled)} (HW 8-Bit Only)$restartSuffix"
+            else -> "True 10-Bit HDR10 (HLG): ${onOff(settings.hdr10Enabled)}$restartSuffix"
+        }
+        styleToggleBtn(btnHdr10, isOn = settings.hdr10Enabled && !strictDest)
 
         btnRoiMode.text = "Hardware ROI Focus: ${settings.roiMode} (Crosshair/Minimap QP Boost)"
         styleToggleBtn(btnRoiMode, isOn = settings.roiMode != "OFF")
 
-        btnKeyframeAndBFrames.text = "IDR Keyframe: ${settings.keyframeIntervalSec}s | B-Frames: ${settings.maxBFrames}$restartSuffix"
+        val kfTag = if (strictDest) "${settings.keyframeIntervalSec}s (Locked)" else "${settings.keyframeIntervalSec}s"
+        btnKeyframeAndBFrames.text = "IDR Keyframe: $kfTag | B-Frames: 0 (RTMP Safe)$restartSuffix"
         val qpLabel = when (settings.qpMaxCap) {
             0 -> "Auto (14..51)"
             32 -> "14..32 (Ultra Crisp)"
@@ -2156,7 +2177,8 @@ class MainActivity : AppCompatActivity() {
             else -> "AUTO (48kHz Studio Wideband)"
         }
         btnMicSource.text = "Source: $srcName"
-        btnAudioBitrate.text = "Master AAC: ${settings.audioBitrateKbps} kbps$restartSuffix"
+        val aacCapSuffix = if (strictDest) " (Max 160k)" else ""
+        btnAudioBitrate.text = "Master AAC: ${settings.audioBitrateKbps} kbps$aacCapSuffix$restartSuffix"
 
         val gProf = settings.voiceGenderProfile.uppercase(Locale.US)
         styleToggleBtn(btnGenderNeutral, isOn = (gProf == "NEUTRAL"))
@@ -2189,7 +2211,7 @@ class MainActivity : AppCompatActivity() {
         btnNoiseSuppressLevel.text = "Strength: $nsLvlDesc"
         styleToggleBtn(btnNoiseSuppressLevel, isOn = denoiserActive)
 
-        btnMicGain.text = "🎙️ Mic Boost: ${settings.micGainPercent}% (Post-DSP + True-Peak Limiter)"
+        btnMicGain.text = "🎙️ Mic Boost: ${settings.micGainPercent}% (Post-DSP + 4× Limiter)"
         btnGameGain.text = "🎮 Game Mix: ${settings.gameGainPercent}% (Up to 250%)"
         suppressSeekBarCallback = true
         seekMicGain.progress = ((settings.micGainPercent.coerceIn(50, 250) - 50) / 5)
@@ -2265,7 +2287,7 @@ class MainActivity : AppCompatActivity() {
             "Session Reports & History"
         }
 
-        val clipsCount = DiagnosticsLogger.getClipHighlightCount()
+        val clipsCount = DiagnosticsLogger.getSavedClipsList(this).size
         btnSavedClipsQuick.text = if (clipsCount > 0) {
             "★ Saved Clips & AI Highlights ($clipsCount)"
         } else {
@@ -2304,7 +2326,8 @@ class MainActivity : AppCompatActivity() {
         userToggledSharp: Boolean = false
     ) {
         userModifiedSettingsBeforeScan = true
-        settings = newSettings
+        val (enforced, _) = KeystoreVault.enforcePlatformLimits(newSettings)
+        settings = enforced
         KeystoreVault.saveSettings(this, settings)
         if (SolStreamService.isBroadcastLive) {
             SolStreamService.instance?.applyDashboardSettingsLive(settings)
@@ -2334,7 +2357,7 @@ class MainActivity : AppCompatActivity() {
     // === PHASE 1 (v1.5.0+) STUDIO PROFILES & PRO OVERLAY HANDLERS ===
     private fun loadStudioProfileSlot(slotIndex: Int) {
         val loaded = KeystoreVault.loadStudioProfile(this, slotIndex, settings, scanSummary)
-        val next = loaded.settings
+        val next = KeystoreVault.enforcePlatformLimits(loaded.settings).first
         val needsRestart = next.codec != settings.codec ||
             next.width != settings.width ||
             next.height != settings.height ||
@@ -2445,7 +2468,7 @@ class MainActivity : AppCompatActivity() {
         updateSetting(settings.copy(pngTuberSizePercent = nextSize))
     }
 
-    // === PLATFORM, SIMULCAST & VIDEO PILL HANDLERS ===
+    // === PLATFORM, SIMULCAST & VIDEO PILL HANDLERS (STRICT DESTINATION ENFORCEMENT) ===
     private fun selectPlatformPreset(platformKey: String) {
         val p = platformKey.uppercase(Locale.US)
         val prevPlat = settings.platformPreset.uppercase(Locale.US)
@@ -2459,26 +2482,8 @@ class MainActivity : AppCompatActivity() {
         saveVaultInputs(showToast = false)
 
         val updated = when (p) {
-            "TWITCH" -> settings.copy(
-                platformPreset = "TWITCH",
-                codec = "H264",
-                width = min(settings.width, 1920),
-                height = min(settings.height, 1080),
-                targetBitrateKbps = min(settings.targetBitrateKbps, 6000),
-                audioBitrateKbps = min(settings.audioBitrateKbps, 160),
-                useVbr = false,
-                hdr10Enabled = false
-            )
-            "KICK" -> settings.copy(
-                platformPreset = "KICK",
-                codec = "H264",
-                width = min(settings.width, 1920),
-                height = min(settings.height, 1080),
-                targetBitrateKbps = min(settings.targetBitrateKbps, 8000),
-                audioBitrateKbps = min(settings.audioBitrateKbps, 160),
-                useVbr = false,
-                hdr10Enabled = false
-            )
+            "TWITCH" -> KeystoreVault.enforcePlatformLimits(settings.copy(platformPreset = "TWITCH")).first
+            "KICK" -> KeystoreVault.enforcePlatformLimits(settings.copy(platformPreset = "KICK")).first
             "YOUTUBE" -> {
                 if (prevPlat in setOf("TWITCH", "KICK") && settings.targetBitrateKbps <= 8000) {
                     KeystoreVault.applyPlatformAndVoiceAwareTierPreset(
@@ -2490,7 +2495,7 @@ class MainActivity : AppCompatActivity() {
                     val hevcOk = scanSummary.hevcHardware != null
                     settings.copy(
                         platformPreset = "YOUTUBE",
-                        codec = if (hevcOk && !settings.simulcastTwitchEnabled && !settings.simulcastKickEnabled) "HEVC" else settings.codec
+                        codec = if (hevcOk && !KeystoreVault.isSingleEncodeSimulcast(settings)) "HEVC" else settings.codec
                     )
                 }
             }
@@ -2499,31 +2504,29 @@ class MainActivity : AppCompatActivity() {
         updateSetting(updated, requiresRestartIfLive = true)
     }
 
+    private fun toggleSimulcastSplitMode() {
+        val nextSplit = !settings.simulcastSplitEncode
+        val splitSupported = scanSummary.selectCompanionEncoder(primaryCodec = settings.codec, requireH264Only = true) != null
+        if (nextSplit && !splitSupported) {
+            Toast.makeText(
+                this,
+                "Dual-Encode Split Quality requires 8GB+ RAM and 2+ concurrent H.264 hardware encoder instances. Staying on Single-Encode Cool Mode.",
+                Toast.LENGTH_LONG
+            ).show()
+            return
+        }
+        updateSetting(settings.copy(simulcastSplitEncode = nextSplit), requiresRestartIfLive = true)
+    }
+
     private fun toggleSimulcastTarget(isTwitch: Boolean) {
         val newTwitch = if (isTwitch) !settings.simulcastTwitchEnabled else settings.simulcastTwitchEnabled
         val newKick = if (!isTwitch) !settings.simulcastKickEnabled else settings.simulcastKickEnabled
-        val anySim = newTwitch || newKick
-        val singleEncode = anySim && !settings.simulcastSplitEncode
-
-        val updated = if (singleEncode) {
-            val capKbps = if (newTwitch) min(settings.targetBitrateKbps, 6000) else min(settings.targetBitrateKbps, 8000)
-            settings.copy(
-                simulcastTwitchEnabled = newTwitch,
-                simulcastKickEnabled = newKick,
-                codec = "H264",
-                width = min(settings.width, 1920),
-                height = min(settings.height, 1080),
-                targetBitrateKbps = capKbps,
-                audioBitrateKbps = min(settings.audioBitrateKbps, 160),
-                useVbr = false,
-                hdr10Enabled = false
-            )
-        } else {
+        val updated = KeystoreVault.enforcePlatformLimits(
             settings.copy(
                 simulcastTwitchEnabled = newTwitch,
                 simulcastKickEnabled = newKick
             )
-        }
+        ).first
         updateSetting(updated, requiresRestartIfLive = true)
     }
 
@@ -2558,12 +2561,20 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun selectCodecDirect(codecKey: String) {
+        if (KeystoreVault.isStrictH264Destination(settings) && codecKey != "H264") {
+            Toast.makeText(
+                this,
+                "${activeStrictDestinationName()} standard RTMP requires H.264 — codec is locked to H.264.",
+                Toast.LENGTH_LONG
+            ).show()
+            return
+        }
         val av1Ok = scanSummary.av1Hardware != null &&
             (scanSummary.av1Hardware?.supports1440p60 == true || scanSummary.av1Hardware?.supports1080p60 == true)
         if (codecKey == "AV1" && !av1Ok) {
             Toast.makeText(
                 this,
-                "This processor has no Hardware AV1 Encoder (CPU-SW AV1 is blocked to protect 120 FPS gaming). Using Hardware HEVC!",
+                "This processor has no Hardware AV1 Encoder (CPU-SW AV1 is blocked to protect game FPS). Using Hardware HEVC!",
                 Toast.LENGTH_LONG
             ).show()
             return
@@ -2572,6 +2583,14 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun cycleCodec() {
+        if (KeystoreVault.isStrictH264Destination(settings)) {
+            Toast.makeText(
+                this,
+                "Codec is locked to H.264 for ${activeStrictDestinationName()} compatibility.",
+                Toast.LENGTH_SHORT
+            ).show()
+            return
+        }
         val av1Ok = scanSummary.av1Hardware != null &&
             (scanSummary.av1Hardware?.supports1440p60 == true || scanSummary.av1Hardware?.supports1080p60 == true)
         val order = if (av1Ok) listOf("HEVC", "H264", "AV1") else listOf("HEVC", "H264")
@@ -2579,7 +2598,21 @@ class MainActivity : AppCompatActivity() {
         updateSetting(settings.copy(codec = next), requiresRestartIfLive = true)
     }
 
+    private fun selectResolutionDirect(longW: Int, shortH: Int) {
+        val maxLong = KeystoreVault.maxLongSideForDestination(settings)
+        if (longW > maxLong) {
+            Toast.makeText(
+                this,
+                "${activeStrictDestinationName()} standard RTMP caps resolution at 1080p.",
+                Toast.LENGTH_SHORT
+            ).show()
+            return
+        }
+        updateSetting(settings.copy(width = longW, height = shortH), requiresRestartIfLive = true)
+    }
+
     private fun cycleResolution() {
+        val maxLong = KeystoreVault.maxLongSideForDestination(settings)
         val tiers = listOf(
             640 to 360,
             854 to 480,
@@ -2587,9 +2620,9 @@ class MainActivity : AppCompatActivity() {
             1920 to 1080,
             2560 to 1440,
             3840 to 2160
-        )
+        ).filter { it.first <= maxLong }
         val curLong = max(settings.width, settings.height)
-        val curIdx = tiers.indexOfFirst { it.first == curLong }.let { if (it < 0) 4 else it }
+        val curIdx = tiers.indexOfFirst { it.first == curLong }.let { if (it < 0) tiers.lastIndex else it }
         val (nextW, nextH) = tiers[(curIdx + 1) % tiers.size]
         updateSetting(settings.copy(width = nextW, height = nextH), requiresRestartIfLive = true)
     }
@@ -2611,11 +2644,45 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun stepBitrate(delta: Int) {
-        val ladder = SolStreamService.MASTER_BITRATE_LADDER_KBPS
+        val destMaxKbps = KeystoreVault.maxVideoBitrateKbpsForDestination(settings)
+        val ladder = SolStreamService.MASTER_BITRATE_LADDER_KBPS.filter { it <= destMaxKbps }
+        if (ladder.isEmpty()) return
         val cur = settings.targetBitrateKbps
-        val nearestIdx = ladder.indices.minByOrNull { abs(ladder[it] - cur) } ?: 13
+        val nearestIdx = ladder.indices.minByOrNull { abs(ladder[it] - cur) } ?: 0
+        if (delta > 0 && nearestIdx == ladder.lastIndex && KeystoreVault.isStrictH264Destination(settings)) {
+            Toast.makeText(
+                this,
+                "${activeStrictDestinationName()} standard RTMP caps video bitrate at ${destMaxKbps / 1000} Mbps.",
+                Toast.LENGTH_SHORT
+            ).show()
+            return
+        }
         val nextIdx = (nearestIdx + delta).coerceIn(0, ladder.lastIndex)
         updateSetting(settings.copy(targetBitrateKbps = ladder[nextIdx]))
+    }
+
+    private fun toggleRateControl() {
+        if (KeystoreVault.isStrictCbrDestination(settings)) {
+            Toast.makeText(
+                this,
+                "${activeStrictDestinationName()} requires CBR rate control (VBR disabled).",
+                Toast.LENGTH_SHORT
+            ).show()
+            return
+        }
+        updateSetting(settings.copy(useVbr = !settings.useVbr), requiresRestartIfLive = true)
+    }
+
+    private fun toggleHdr10() {
+        if (KeystoreVault.isStrictH264Destination(settings)) {
+            Toast.makeText(
+                this,
+                "10-Bit HDR10 requires YouTube HEVC/AV1 — unavailable on ${activeStrictDestinationName()}.",
+                Toast.LENGTH_SHORT
+            ).show()
+            return
+        }
+        updateSetting(settings.copy(hdr10Enabled = !settings.hdr10Enabled), requiresRestartIfLive = true)
     }
 
     private fun cycleUpscaler() {
@@ -2643,10 +2710,6 @@ class MainActivity : AppCompatActivity() {
         updateSetting(settings.copy(colorTempFilter = next))
     }
 
-    /**
-     * Unified Logo Overlay cycler synced 1:1 with the Floating Pill:
-     * OFF -> FULL -> TOP_LEFT -> TOP_RIGHT -> BOTTOM_LEFT -> BOTTOM_RIGHT -> OFF.
-     */
     private fun cycleUnifiedOverlayLogo() {
         val order = SolStreamService.OVERLAY_POSITION_ORDER
         if (!settings.overlayImageEnabled) {
@@ -2693,14 +2756,17 @@ class MainActivity : AppCompatActivity() {
         updateSetting(settings.copy(roiMode = next))
     }
 
-    private fun cycleKeyframeAndBFrames() {
-        val (kf, bf) = when {
-            settings.keyframeIntervalSec == 2 && settings.maxBFrames == 0 -> 1 to 0
-            settings.keyframeIntervalSec == 1 && settings.maxBFrames == 0 -> 2 to 1
-            settings.keyframeIntervalSec == 2 && settings.maxBFrames == 1 -> 2 to 2
-            else -> 2 to 0
+    private fun cycleKeyframeInterval() {
+        if (KeystoreVault.isStrictH264Destination(settings)) {
+            Toast.makeText(
+                this,
+                "${activeStrictDestinationName()} requires a 2-second IDR keyframe interval (B-Frames locked to 0).",
+                Toast.LENGTH_SHORT
+            ).show()
+            return
         }
-        updateSetting(settings.copy(keyframeIntervalSec = kf, maxBFrames = bf), requiresRestartIfLive = true)
+        val nextKf = if (settings.keyframeIntervalSec == 2) 1 else 2
+        updateSetting(settings.copy(keyframeIntervalSec = nextKf, maxBFrames = 0), requiresRestartIfLive = true)
     }
 
     private fun cycleQpAndLatency() {
@@ -2734,8 +2800,10 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun cycleAudioBitrate() {
-        val rates = listOf(64, 96, 128, 160, 192, 256, 320)
-        val next = rates[(rates.indexOf(settings.audioBitrateKbps) + 1) % rates.size]
+        val maxAac = KeystoreVault.maxAudioBitrateKbpsForDestination(settings)
+        val rates = listOf(64, 96, 128, 160, 192, 256, 320).filter { it <= maxAac }
+        val curIdx = rates.indexOf(settings.audioBitrateKbps).let { if (it < 0) rates.lastIndex else it }
+        val next = rates[(curIdx + 1) % rates.size]
         updateSetting(settings.copy(audioBitrateKbps = next), requiresRestartIfLive = true)
     }
 
@@ -2798,25 +2866,10 @@ class MainActivity : AppCompatActivity() {
         updateSetting(settings.copy(brbMuteMicToo = brbMute, wifiLowLatencyLock = wifiLow))
     }
 
-    // === CLIPBOARD HELPER ===
-    private fun copyPlainTextToClipboard(label: String, text: String) {
-        val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-        val clip = ClipData.newPlainText(label, text)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            try {
-                clip.description.extras = PersistableBundle().apply {
-                    putBoolean(ClipDescription.EXTRA_IS_SENSITIVE, false)
-                }
-            } catch (_: Exception) {
-            }
-        }
-        cm.setPrimaryClip(clip)
-    }
-
     // === PRESET SHARE & SMART HARDWARE CLAMPING ===
     private fun copyPresetToClipboard() {
         val json = KeystoreVault.exportPresetJson(settings)
-        copyPlainTextToClipboard("SolStream Ultra Preset", json)
+        DashboardDialogs.copyPlainTextToClipboard(this, "SolStream Ultra Preset", json)
         Toast.makeText(
             this,
             "Settings Preset copied! (Stream Keys are NEVER included — safe to share with friends!)",
@@ -2837,7 +2890,7 @@ class MainActivity : AppCompatActivity() {
             activeStudioProfileSlot = -1
             updateSetting(clamped, requiresRestartIfLive = true)
             val msg = if (wasAdapted) {
-                "Preset imported & auto-adapted to your phone's verified hardware capabilities!"
+                "Preset imported & auto-adapted to your phone's verified hardware and destination limits!"
             } else {
                 "Preset imported and applied!"
             }
@@ -2845,159 +2898,6 @@ class MainActivity : AppCompatActivity() {
         } else {
             Toast.makeText(this, "Clipboard does not contain a valid SolStream Preset JSON.", Toast.LENGTH_LONG).show()
         }
-    }
-
-    // === VISUAL NUMBERED CARD IN-APP USER GUIDE, ANTI-KILL CHECKLIST & PRIVACY / LICENSES ===
-    private fun makeGuideCard(
-        badgeText: String,
-        titleText: String,
-        bodyContent: String,
-        accentHex: String
-    ): LinearLayout {
-        return LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            background = cardDrawable("#0B1324", accentHex)
-            setPadding(dp(14), dp(12), dp(14), dp(12))
-            layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT
-            ).apply { bottomMargin = dp(10) }
-
-            val badge = TextView(this@MainActivity).apply {
-                text = badgeText
-                setTextColor(Color.parseColor(accentHex))
-                setTextSize(TypedValue.COMPLEX_UNIT_SP, 9.5f)
-                typeface = Typeface.DEFAULT_BOLD
-                letterSpacing = 0.08f
-            }
-            val title = TextView(this@MainActivity).apply {
-                text = titleText
-                setTextColor(Color.parseColor("#F8FAFC"))
-                setTextSize(TypedValue.COMPLEX_UNIT_SP, 13.5f)
-                typeface = Typeface.DEFAULT_BOLD
-                setPadding(0, dp(2), 0, dp(5))
-            }
-            val body = TextView(this@MainActivity).apply {
-                text = bodyContent
-                setTextColor(Color.parseColor("#CBD5E1"))
-                setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.4f)
-                setLineSpacing(dp(2).toFloat(), 1.0f)
-                setTextIsSelectable(true)
-            }
-            addView(badge)
-            addView(title)
-            addView(body)
-        }
-    }
-
-    private fun showPlainEnglishGlossaryDialog() {
-        val mfr = "${Build.MANUFACTURER} ${Build.BRAND}".lowercase(Locale.US)
-        val detectedAntiKillBlock = when {
-            mfr.contains("samsung") ->
-                "★ YOUR DEVICE: SAMSUNG (${Build.MODEL})\n" +
-                    "1. App Info → Battery → Unrestricted.\n" +
-                    "2. Device Care → Memory → Excluded apps → add BOTH SolStream Studio and your game.\n" +
-                    "3. Device Care → Memory → RAM Plus → OFF (prevents background disk-swap freezes on 8 GB phones).\n" +
-                    "4. Game Booster → Enable 'Pause USB PD charging when gaming' with a 25W+ PPS charger for 2–4°C cooler sessions."
-            mfr.contains("xiaomi") || mfr.contains("redmi") || mfr.contains("poco") ->
-                "★ YOUR DEVICE: XIAOMI / POCO / REDMI (${Build.MODEL})\n" +
-                    "1. App Info → Battery Saver → No restrictions.\n" +
-                    "2. Enable Autostart and Lock SolStream Studio in Recents.\n" +
-                    "3. Sideloaded APK Unlock: Scroll to bottom of App Info → 'Allow restricted settings'."
-            mfr.contains("vivo") || mfr.contains("iqoo") ->
-                "★ YOUR DEVICE: VIVO / iQOO (${Build.MODEL})\n" +
-                    "1. Enable High Background Power Consumption & lock SolStream in Recents.\n" +
-                    "2. Ultra Game Mode: Keep 'Game Frame Interpolation' OFF (use Native 90/120 FPS) for smooth 60 FPS capture."
-            mfr.contains("oneplus") || mfr.contains("oppo") || mfr.contains("realme") ->
-                "★ YOUR DEVICE: ONEPLUS / OPPO / REALME (${Build.MODEL})\n" +
-                    "1. App Info → Battery Usage → turn ON 'Allow background activity'.\n" +
-                    "2. Lock SolStream Studio in Recents so memory cleaner skips it."
-            else ->
-                "★ YOUR DEVICE: ${Build.MANUFACTURER.uppercase(Locale.US)} ${Build.MODEL}\n" +
-                    "1. App Info → Battery → Unrestricted (keeps 3+ hour streams uninterrupted)."
-        }
-
-        val guideContainer = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setBackgroundColor(Color.parseColor("#050A14"))
-            setPadding(dp(12), dp(12), dp(12), dp(12))
-        }
-
-        guideContainer.addView(
-            makeGuideCard(
-                badgeText = "CARD 1 • 3-STEP QUICK START",
-                titleText = "Go Live in Under 60 Seconds",
-                bodyContent = "1. Paste your YouTube, Twitch, or Kick Stream Key in Card 2 (AES-256 Hardware Keystore encrypted).\n" +
-                    "2. Pick your Device Tier (Card 0), One-Tap Studio Profile (Card 2), and Gender Voice Profile (Card 4) — HPF, bitrate, and codecs auto-sync.\n" +
-                    "3. Tap GO LIVE. In YouTube Studio, keep 'Turn on manual settings' OFF so one key works for both 16:9 and 9:16 Shorts.",
-                accentHex = "#00E5FF"
-            )
-        )
-
-        guideContainer.addView(
-            makeGuideCard(
-                badgeText = "CARD 2 • SOLLUXE™ 3.0 PURE AUDIO",
-                titleText = "Voice Presets at a Glance",
-                bodyContent = "• SOL_LUXE: Full 6-stage pure condenser chain — deep chest warmth, surgical mud cleanup, silky 4.5–5.1 kHz presence, clean 8.5/9.0 kHz air shelf & smooth VAD leveling.\n" +
-                    "• RADIO STUDIO: Shifts presence to 2.9–3.5 kHz (+1.6 dB) with tighter 3.2:1 leveling to cut through intense gunfights.\n" +
-                    "• VELVET: Warm natural tone with subtle low-band warmth and gentle 2.0:1 leveling.\n" +
-                    "• CLEAN / NEURAL: Noise removal + HPF + smooth leveling with zero EQ coloration.\n" +
-                    "• RAW: Dry uncolored mic bypass (only Mute, Mic Boost & 4× True-Peak safety limiter).\n\n" +
-                    "Bluetooth Earphones stay in HD Stereo (A2DP) for footsteps while SolStream captures your phone's 48 kHz studio mic.",
-                accentHex = "#8B5CF6"
-            )
-        )
-
-        val antiKillCard = makeGuideCard(
-            badgeText = "CARD 3 • PREVENT 3-HOUR STREAM CUTS",
-            titleText = "Long-Stream Anti-Kill Checklist",
-            bodyContent = "$detectedAntiKillBlock\n\n" +
-                "• 60-Second Auto-Checkpoint: Even if Android forcefully kills the process, your live telemetry and ★ Saved Clips are safely checkpointed every 60 seconds without overwriting past report history.",
-            accentHex = "#10B981"
-        )
-        antiKillCard.addView(
-            actionButton("Open Battery / App Info Settings", "#0D3652") {
-                openBatteryUnrestricted()
-            }
-        )
-        guideContainer.addView(antiKillCard)
-
-        guideContainer.addView(
-            makeGuideCard(
-                badgeText = "CARD 4 • CONTROLS, PRO OVERLAYS & VIDEO",
-                titleText = "Floating Pill, SolHUD™, QR, PNGTuber & Thumbnails",
-                bodyContent = "• Floating Pill: Double-tap or hold the compact pill to open 3 tabs (Audio, Video, Bitrate/Net). Tap 📸 Shot in Video tab to save a clean pill-free 1080p YouTube thumbnail to Pictures/SolStream/.\n" +
-                    "• Pro Overlays (Opt-In, 0 MB VRAM When OFF): Turn on SolHUD™ (live FPS • °C • Mbps visible even in Single-App Capture), offline Corner QR (UPI / YouTube / Discord), or zero-camera 2-PNG PNGTuber Avatar.\n" +
-                    "• Studio Profiles: Tap any of the 4 profiles in Card 2 to switch setups in 1 tap; long-press any slot to save & rename your current setup.\n" +
-                    "• Safe Notification Shade: Exactly 3 quick actions (Mute Mic, Scene/BRB, ★ Clip) — Stop is safely locked inside the app & Floating Pill with 2-tap confirm.",
-                accentHex = "#38BDF8"
-            )
-        )
-
-        guideContainer.addView(
-            makeGuideCard(
-                badgeText = "CARD 5 • PRIVACY POLICY & OPEN-SOURCE LICENSES",
-                titleText = "Data Safety, Accessibility & Credits",
-                bodyContent = "• Zero Data Collection: All video/audio processing runs locally on-device and streams solely to your configured RTMP/RTMPS ingest. Zero developer servers, zero analytics, zero ads.\n" +
-                    "• Hardware Keystore: Stream keys are encrypted via Android Keystore (AES-256-GCM) and auto-redacted ([REDACTED_KEY]) from logs.\n" +
-                    "• AccessibilityService Policy: Used optionally for the assistive floating dock and continuous mic routing alongside game voice chat. Strictly sets isAccessibilityTool=\"false\", canRetrieveWindowContent=\"false\", and canPerformGestures=\"false\" — cannot read screen text or passwords.\n\n" +
-                    "Open-Source Credits:\n" +
-                    "1. RootEncoder (Pedro Sánchez / pedroSG94) — Apache-2.0\n" +
-                    "2. Xiph RNNoise v0.1.1 (Xiph.Org & Jean-Marc Valin) — BSD 3-Clause\n" +
-                    "3. AndroidX, Material & Kotlin Coroutines — Apache-2.0",
-                accentHex = "#64748B"
-            )
-        )
-
-        val scroll = ScrollView(this).apply {
-            setBackgroundColor(Color.parseColor("#050A14"))
-            addView(guideContainer)
-        }
-        AlertDialog.Builder(this)
-            .setTitle("📖 SolStream Studio v$appVersionName Guide")
-            .setView(scroll)
-            .setPositiveButton("Got It", null)
-            .show()
     }
 
     // === VAULT & KEY VISIBILITY ACTIONS ===
@@ -3076,7 +2976,7 @@ class MainActivity : AppCompatActivity() {
             }
         }
         if (settingsChanged) {
-            settings = updatedSettings
+            settings = KeystoreVault.enforcePlatformLimits(updatedSettings).first
             KeystoreVault.saveSettings(this, settings)
             if (SolStreamService.isBroadcastLive) {
                 SolStreamService.instance?.applyDashboardSettingsLive(settings)
@@ -3200,32 +3100,13 @@ class MainActivity : AppCompatActivity() {
             openAccessibilitySettingsDirect()
             return
         }
-        val msg = "SolStream Studio optionally uses the Android AccessibilityService API to:\n\n" +
-            "1. Display an assistive floating in-game broadcast control dock (TYPE_ACCESSIBILITY_OVERLAY) for one-tap microphone mute, privacy blur shield, scene switching, and clip markers over full-screen games.\n" +
-            "2. Maintain continuous microphone audio routing alongside internal game audio when multiplayer games activate in-game squad voice chat.\n\n" +
-            "Privacy & Security Guarantee:\n" +
-            "• SolStream Studio CANNOT read your screen text, passwords, messages, or personal data (isAccessibilityTool is false, canRetrieveWindowContent is strictly false, and canPerformGestures is false).\n" +
-            "• Zero audio, video, or personal data is ever collected, stored, or shared with developer servers; all streams are sent directly to your own configured RTMP/RTMPS server.\n\n" +
-            "Sideloaded APK Note (Android 13–18): If SolStream Studio is greyed out in Accessibility, tap it once -> tap 'Step 4: App Info (⋮)' -> tap ⋮ at top-right -> 'Allow restricted settings'."
-
-        val builder = AlertDialog.Builder(this)
-            .setTitle("Assistive Broadcast Dock & Voice Routing Disclosure")
-            .setMessage(msg)
-            .setPositiveButton("Accept & Open Settings") { _, _ ->
-                openAccessibilitySettingsDirect()
-            }
-            .setNeutralButton("Step 4: App Info (⋮)") { _, _ ->
-                openAppInfoForRestrictedSettings()
-            }
-
-        if (allowSkipToStream) {
-            builder.setNegativeButton("No Thanks (Stream Without Overlay)") { _, _ ->
-                requestScreenCaptureAndGoLive()
-            }
-        } else {
-            builder.setNegativeButton("No Thanks (Use Standard Mic)", null)
-        }
-        builder.show()
+        DashboardDialogs.showAccessibilityDisclosureDialog(
+            activity = this,
+            allowSkipToStream = allowSkipToStream,
+            onAcceptOpenSettings = { openAccessibilitySettingsDirect() },
+            onOpenAppInfoRestricted = { openAppInfoForRestrictedSettings() },
+            onSkipToStream = { requestScreenCaptureAndGoLive() }
+        )
     }
 
     private fun openAccessibilitySettingsDirect() {
@@ -3239,7 +3120,10 @@ class MainActivity : AppCompatActivity() {
             }
             startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
         } catch (_: Exception) {
-            startActivity(Intent(Settings.ACTION_SETTINGS))
+            try {
+                startActivity(Intent(Settings.ACTION_SETTINGS))
+            } catch (_: Exception) {
+            }
         }
     }
 
@@ -3295,6 +3179,13 @@ class MainActivity : AppCompatActivity() {
         if (!saveVaultInputs(showToast = false)) {
             return
         }
+        val (enforced, wasClamped) = KeystoreVault.enforcePlatformLimits(settings)
+        if (wasClamped) {
+            settings = enforced
+            KeystoreVault.saveSettings(this, enforced)
+            refreshAllUi()
+        }
+
         if (KeystoreVault.buildActivePrimaryEndpoint(this, settings).isNullOrBlank()) {
             Toast.makeText(this, "Please paste or type your Stream Key first!", Toast.LENGTH_LONG).show()
             return
@@ -3338,6 +3229,20 @@ class MainActivity : AppCompatActivity() {
         requestScreenCaptureAndGoLive()
     }
 
+    private fun launchScreenCapturePromptSafely() {
+        try {
+            val mpm = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+            projectionLauncher.launch(mpm.createScreenCaptureIntent())
+        } catch (e: Exception) {
+            CodecCapabilityProbe.isBroadcastStartingOrLive = false
+            Toast.makeText(
+                this,
+                "Could not open Android screen capture prompt (${e.javaClass.simpleName}).",
+                Toast.LENGTH_LONG
+            ).show()
+        }
+    }
+
     private fun requestScreenCaptureAndGoLive() {
         CodecCapabilityProbe.isBroadcastStartingOrLive = true
         if (CodecCapabilityProbe.isHardwareProbeCurrentlyRunning()) {
@@ -3354,8 +3259,7 @@ class MainActivity : AppCompatActivity() {
                 }
                 runOnUiThread {
                     if (!isFinishing && !isDestroyed && !SolStreamService.isBroadcastLive) {
-                        val mpm = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-                        projectionLauncher.launch(mpm.createScreenCaptureIntent())
+                        launchScreenCapturePromptSafely()
                     } else {
                         CodecCapabilityProbe.isBroadcastStartingOrLive = false
                     }
@@ -3363,8 +3267,7 @@ class MainActivity : AppCompatActivity() {
             }, "SolWaitProbeBeforeLive").start()
             return
         }
-        val mpm = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-        projectionLauncher.launch(mpm.createScreenCaptureIntent())
+        launchScreenCapturePromptSafely()
     }
 
     private fun runTenSecMicCalibration() {
@@ -3445,476 +3348,6 @@ class MainActivity : AppCompatActivity() {
             .show()
     }
 
-    // === 5-METRIC PRO NETWORK ANALYZER ===
-    private fun parseIngestHostPort(rawUrl: String): Triple<Boolean, String, Int> {
-        val clean = KeystoreVault.normalizeIngestUrl(rawUrl)
-        return try {
-            val uri = URI(clean)
-            val scheme = (uri.scheme ?: "rtmps").lowercase(Locale.US)
-            val isTls = scheme == "rtmps"
-            val host = uri.host?.takeIf { it.isNotBlank() } ?: "a.rtmps.youtube.com"
-            val port = if (uri.port > 0) uri.port else if (isTls) 443 else 1935
-            Triple(isTls, host, port)
-        } catch (_: Exception) {
-            Triple(true, "a.rtmps.youtube.com", 443)
-        }
-    }
-
-    private fun measureSingleTcpRttMs(addr: InetSocketAddress, timeoutMs: Int = 3000): Long {
-        val sock = Socket()
-        return try {
-            sock.tcpNoDelay = true
-            val t0 = System.nanoTime()
-            sock.connect(addr, timeoutMs)
-            (System.nanoTime() - t0) / 1_000_000L
-        } finally {
-            try { sock.close() } catch (_: Exception) {}
-        }
-    }
-
-    private fun runRtmpsNetworkCheck() {
-        if (SolStreamService.isBroadcastLive) {
-            Toast.makeText(this, "Speed test is locked while streaming live so packets never compete with your stream!", Toast.LENGTH_LONG).show()
-            return
-        }
-        if (!netTestBusy.compareAndSet(false, true)) {
-            Toast.makeText(this, "Network analyzer already running...", Toast.LENGTH_SHORT).show()
-            return
-        }
-        saveVaultInputs(showToast = false)
-        val (isTls, host, port) = parseIngestHostPort(etRtmpsUrl.text?.toString() ?: KeystoreVault.DEFAULT_YOUTUBE_RTMPS)
-        val activePlat = settings.platformPreset.uppercase(Locale.US)
-        btnNetTest.isEnabled = false
-        tvNetTestResult.text = "Step 1/4: Verifying DNS & ${if (isTls) "TLS" else "TCP"} handshake to $host:$port..."
-
-        Thread({
-            try {
-                val dnsStartNs = System.nanoTime()
-                val resolvedIp = InetAddress.getByName(host)
-                val dnsMs = (System.nanoTime() - dnsStartNs) / 1_000_000L
-                val targetAddr = InetSocketAddress(resolvedIp, port)
-
-                var tlsInfo = "Plain RTMP"
-                if (isTls) {
-                    val rawSock = Socket()
-                    var sslSock: SSLSocket? = null
-                    try {
-                        val t0 = System.nanoTime()
-                        rawSock.connect(targetAddr, 3500)
-                        val factory = SSLSocketFactory.getDefault() as SSLSocketFactory
-                        val createdSsl = factory.createSocket(rawSock, host, port, true) as SSLSocket
-                        sslSock = createdSsl
-                        val params = createdSsl.sslParameters
-                        params.endpointIdentificationAlgorithm = "HTTPS"
-                        createdSsl.sslParameters = params
-                        createdSsl.soTimeout = 4500
-                        createdSsl.startHandshake()
-                        val hsMs = (System.nanoTime() - t0) / 1_000_000L
-                        tlsInfo = "${createdSsl.session.protocol} (${hsMs}ms)"
-                    } finally {
-                        try { sslSock?.close() } catch (_: Exception) {}
-                        try { rawSock.close() } catch (_: Exception) {}
-                    }
-                }
-
-                val idleSamples = mutableListOf<Long>()
-                repeat(4) {
-                    idleSamples.add(measureSingleTcpRttMs(targetAddr, 3000))
-                }
-                val idleAvgMs = idleSamples.average().toLong()
-                val idleJitterMs = (idleSamples.maxOrNull() ?: idleAvgMs) - (idleSamples.minOrNull() ?: idleAvgMs)
-
-                runOnUiThread {
-                    if (!isFinishing && !isDestroyed) {
-                        tvNetTestResult.text = "Step 2/4: Ingest TCP Handshake RTT ${idleAvgMs}ms (Jitter ${idleJitterMs}ms) — measuring Download Mbps..."
-                    }
-                }
-
-                var downloadMbps = -1.0
-                var downConn: HttpsURLConnection? = null
-                try {
-                    val downBytesTarget = 2_500_000
-                    downConn = (URL("https://speed.cloudflare.com/__down?bytes=$downBytesTarget").openConnection() as HttpsURLConnection).apply {
-                        requestMethod = "GET"
-                        useCaches = false
-                        connectTimeout = 4000
-                        readTimeout = 7000
-                    }
-                    val downStartNs = System.nanoTime()
-                    var totalRead = 0L
-                    val buf = ByteArray(32 * 1024)
-                    downConn.inputStream.use { ins ->
-                        while (true) {
-                            val r = ins.read(buf)
-                            if (r <= 0) break
-                            totalRead += r
-                        }
-                    }
-                    val downSec = max(0.05, (System.nanoTime() - downStartNs) / 1_000_000_000.0)
-                    if (totalRead > 100_000L) {
-                        downloadMbps = (totalRead * 8.0) / (downSec * 1_000_000.0)
-                    }
-                } catch (_: Exception) {
-                } finally {
-                    try { downConn?.disconnect() } catch (_: Exception) {}
-                }
-
-                runOnUiThread {
-                    if (!isFinishing && !isDestroyed) {
-                        val dlTag = if (downloadMbps > 0) String.format(Locale.US, "%.1f Mbps", downloadMbps) else "N/A"
-                        tvNetTestResult.text = "Step 3/4: Download $dlTag — testing Sustained Upload Mbps & Router Bufferbloat..."
-                    }
-                }
-
-                var uploadMbps = -1.0
-                var loadedRttMs = -1L
-                val probeDone = AtomicBoolean(false)
-
-                val loadedPingThread = Thread({
-                    val loadedList = mutableListOf<Long>()
-                    try {
-                        Thread.sleep(220)
-                        while (!probeDone.get() && loadedList.size < 3) {
-                            loadedList.add(measureSingleTcpRttMs(targetAddr, 2500))
-                            Thread.sleep(200)
-                        }
-                    } catch (_: Exception) {
-                    }
-                    if (loadedList.isNotEmpty()) {
-                        loadedRttMs = loadedList.average().toLong()
-                    }
-                }, "SolBloatPing")
-
-                var upConn: HttpsURLConnection? = null
-                try {
-                    val totalBytes = 2 * 1024 * 1024
-                    val chunk = ByteArray(16 * 1024) { 0x5A.toByte() }
-                    upConn = (URL("https://speed.cloudflare.com/__up").openConnection() as HttpsURLConnection).apply {
-                        requestMethod = "POST"
-                        doOutput = true
-                        useCaches = false
-                        connectTimeout = 4000
-                        readTimeout = 8000
-                        setRequestProperty("Content-Type", "application/octet-stream")
-                        setFixedLengthStreamingMode(totalBytes)
-                    }
-                    loadedPingThread.start()
-                    val upStartNs = System.nanoTime()
-                    upConn.outputStream.use { os ->
-                        var sent = 0
-                        while (sent < totalBytes) {
-                            val toWrite = if (totalBytes - sent < chunk.size) totalBytes - sent else chunk.size
-                            os.write(chunk, 0, toWrite)
-                            sent += toWrite
-                        }
-                        os.flush()
-                    }
-                    val code = upConn.responseCode
-                    val upSec = max(0.05, (System.nanoTime() - upStartNs) / 1_000_000_000.0)
-                    if (code in 200..299) {
-                        uploadMbps = (totalBytes * 8.0) / (upSec * 1_000_000.0)
-                    }
-                } catch (_: Exception) {
-                } finally {
-                    probeDone.set(true)
-                    try { loadedPingThread.join(1200) } catch (_: Exception) {}
-                    try { upConn?.disconnect() } catch (_: Exception) {}
-                }
-
-                val bloatDeltaMs = if (loadedRttMs > 0L) max(0L, loadedRttMs - idleAvgMs) else -1L
-                val bloatGrade = when {
-                    bloatDeltaMs < 0L -> "N/A"
-                    bloatDeltaMs <= 15L -> "+${bloatDeltaMs}ms (Grade A+ Zero Bufferbloat)"
-                    bloatDeltaMs <= 45L -> "+${bloatDeltaMs}ms (Grade B Mild)"
-                    else -> "+${bloatDeltaMs}ms (⚠️ Router Bufferbloat — Keep ABR ON)"
-                }
-
-                val rawSafeMbps = if (uploadMbps > 0.0) (uploadMbps * 0.60).roundToInt().coerceIn(1, 50) else 16
-                val platformCappedMbps = when {
-                    activePlat == "TWITCH" || (settings.simulcastTwitchEnabled && !settings.simulcastSplitEncode) -> min(rawSafeMbps, 6)
-                    activePlat == "KICK" || (settings.simulcastKickEnabled && !settings.simulcastSplitEncode) -> min(rawSafeMbps, 8)
-                    else -> min(rawSafeMbps, 24)
-                }
-
-                val advice = when {
-                    activePlat == "TWITCH" ->
-                        "Twitch Active: Safe up to $platformCappedMbps Mbps (1080p60 H.264 • 6 Mbps Twitch Cap)."
-                    activePlat == "KICK" ->
-                        "Kick Active: Safe up to $platformCappedMbps Mbps (1080p60 H.264 • 8 Mbps Kick Cap)."
-                    uploadMbps > 0.0 && uploadMbps < 6.0 ->
-                        "Low Upload: Use 720p/480p HEVC @ ${platformCappedMbps} Mbps + Ping Guard ABR ON."
-                    uploadMbps >= 24.0 && bloatDeltaMs in 0..35 ->
-                        "Grade A+ Fiber! Safe for 18–22 Mbps 1440p60 HEVC (Single) or 16M + 8M (Dual Companion)."
-                    else ->
-                        "Recommended Safe Stream Bitrate: Up to $platformCappedMbps Mbps with Ping Guard ABR ON."
-                }
-
-                val summary = buildString {
-                    val dlStr = if (downloadMbps > 0.0) String.format(Locale.US, "%.1f Mbps", downloadMbps) else "N/A"
-                    val ulStr = if (uploadMbps > 0.0) String.format(Locale.US, "%.1f Mbps", uploadMbps) else "N/A"
-                    append("Download: $dlStr | Upload: $ulStr | TCP Handshake RTT: ${idleAvgMs}ms (Jitter ${idleJitterMs}ms)\n")
-                    append("TLS: $tlsInfo (DNS ${dnsMs}ms) | Bufferbloat: $bloatGrade\n")
-                    append("-> $advice")
-                }
-
-                DiagnosticsLogger.log("NET_CHECK", summary.replace('\n', ' '))
-                runOnUiThread {
-                    netTestBusy.set(false)
-                    if (!isFinishing && !isDestroyed) {
-                        btnNetTest.isEnabled = !SolStreamService.isBroadcastLive
-                        tvNetTestResult.text = summary
-                    }
-                }
-            } catch (e: Exception) {
-                runOnUiThread {
-                    netTestBusy.set(false)
-                    if (!isFinishing && !isDestroyed) {
-                        btnNetTest.isEnabled = !SolStreamService.isBroadcastLive
-                        tvNetTestResult.text =
-                            "Ingest check failed (${e.javaClass.simpleName}: ${e.message ?: "check internet"}). Verify URL & 5GHz Wi-Fi."
-                    }
-                }
-            }
-        }, "SolNetProbe").start()
-    }
-
-    // === DEDICATED PLAIN-ENGLISH SAVED CLIPS & AI HIGHLIGHTS VIEWER ===
-    private fun showSavedClipsDialog() {
-        val summary = DiagnosticsLogger.buildSavedClipsPlainEnglishSummary(this)
-        val clipCount = DiagnosticsLogger.getClipHighlightCount()
-
-        val tv = TextView(this).apply {
-            text = summary
-            setTextColor(Color.parseColor("#ECEFF1"))
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f)
-            typeface = Typeface.MONOSPACE
-            setPadding(dp(14), dp(12), dp(14), dp(12))
-            setTextIsSelectable(true)
-        }
-        val scroll = ScrollView(this).apply {
-            setBackgroundColor(Color.parseColor("#050A14"))
-            addView(tv)
-        }
-        val builder = AlertDialog.Builder(this)
-            .setTitle("★ Saved Stream Clips & AI Highlights ($clipCount)")
-            .setView(scroll)
-            .setPositiveButton("Copy Clip Times") { _, _ ->
-                copyPlainTextToClipboard("SolStream Saved Clips", summary)
-                Toast.makeText(this, "★ Saved Clip Timestamps copied to clipboard!", Toast.LENGTH_LONG).show()
-            }
-            .setNegativeButton("Close", null)
-
-        if (clipCount > 0) {
-            builder.setNeutralButton("Clear Clips") { _, _ ->
-                DiagnosticsLogger.clearSavedClips(this)
-                refreshAllUi()
-                Toast.makeText(this, "Saved clip list cleared.", Toast.LENGTH_SHORT).show()
-            }
-        }
-        builder.show()
-    }
-
-    // === MULTI-DAY SESSION REPORT VIEWER & ARCHIVE MANAGER ===
-    private fun showDiagnosticsDialog(showingArchived: Boolean = false) {
-        val archiveList = SolStreamService.loadLocalReportArchive(this)
-        val archivedCount = archiveList.size
-        val reportText = if (showingArchived) {
-            if (archiveList.isEmpty()) {
-                "No past session reports archived yet. Complete a live stream or benchmark session first."
-            } else {
-                archiveList.mapIndexed { idx, (hdr, body) ->
-                    "=== SAVED SESSION #${idx + 1}: $hdr ===\n$body"
-                }.joinToString("\n\n--------------------------------------------\n\n")
-            }
-        } else {
-            DiagnosticsLogger.buildShareableReport(this)
-        }
-        val checkpointHint = if (!showingArchived && !SolStreamService.isBroadcastLive && DiagnosticsLogger.hasUnfinishedLiveCheckpoint(this)) {
-            " • Recovered 60s"
-        } else {
-            ""
-        }
-        val dialogTitle = if (showingArchived) {
-            "Archived Past Reports ($archivedCount Saved)"
-        } else {
-            "Current Session Report (History: $archivedCount$checkpointHint)"
-        }
-
-        val tv = TextView(this).apply {
-            text = reportText
-            setTextColor(Color.parseColor("#ECEFF1"))
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
-            typeface = Typeface.MONOSPACE
-            setPadding(dp(14), dp(12), dp(14), dp(12))
-            setTextIsSelectable(true)
-        }
-        val scroll = ScrollView(this).apply {
-            setBackgroundColor(Color.parseColor("#050A14"))
-            addView(tv)
-        }
-        AlertDialog.Builder(this)
-            .setTitle(dialogTitle)
-            .setView(scroll)
-            .setPositiveButton("Copy Report") { _, _ ->
-                copyPlainTextToClipboard("SolStream Report", reportText)
-                Toast.makeText(this, "Report copied! Safe to paste anywhere.", Toast.LENGTH_LONG).show()
-            }
-            .setNeutralButton(
-                if (showingArchived) "Current Report" else "★ View Saved Clips (${DiagnosticsLogger.getClipHighlightCount()})"
-            ) { _, _ ->
-                if (showingArchived) {
-                    showDiagnosticsDialog(showingArchived = false)
-                } else {
-                    showSavedClipsDialog()
-                }
-            }
-            .setNegativeButton(
-                if (!showingArchived && archivedCount > 0) "Past History ($archivedCount)"
-                else if (showingArchived && archivedCount > 0) "Delete History"
-                else "Close"
-            ) { _, _ ->
-                if (!showingArchived && archivedCount > 0) {
-                    showDiagnosticsDialog(showingArchived = true)
-                } else if (showingArchived && archivedCount > 0) {
-                    SolStreamService.clearLocalReportArchive(this)
-                    DiagnosticsLogger.clearLiveCheckpoint(this)
-                    refreshAllUi()
-                    Toast.makeText(this, "Archived session history deleted.", Toast.LENGTH_SHORT).show()
-                }
-            }
-            .show()
-    }
-
-    private fun isRemoteVersionNewer(remoteRaw: String, localRaw: String): Boolean {
-        val rParts = remoteRaw.trim().removePrefix("v").substringBefore('-').split('.').map { it.toIntOrNull() ?: 0 }
-        val lParts = localRaw.trim().removePrefix("v").substringBefore('-').split('.').map { it.toIntOrNull() ?: 0 }
-        val count = max(rParts.size, lParts.size)
-        for (i in 0 until count) {
-            val rv = rParts.getOrElse(i) { 0 }
-            val lv = lParts.getOrElse(i) { 0 }
-            if (rv != lv) return rv > lv
-        }
-        return false
-    }
-
-    private fun checkGitHubReleaseUpdate() {
-        Toast.makeText(this, "Checking PppP01/SolStream-Studio releases...", Toast.LENGTH_SHORT).show()
-        Thread({
-            var conn: HttpsURLConnection? = null
-            try {
-                conn = (URL("https://api.github.com/repos/PppP01/SolStream-Studio/releases/latest")
-                    .openConnection() as HttpsURLConnection).apply {
-                    connectTimeout = 5000
-                    readTimeout = 5000
-                    setRequestProperty("Accept", "application/vnd.github+json")
-                }
-                if (conn.responseCode != 200) {
-                    runOnUiThread {
-                        if (!isFinishing && !isDestroyed) {
-                            Toast.makeText(
-                                this,
-                                "No newer GitHub Release found (running v$appVersionName).",
-                                Toast.LENGTH_LONG
-                            ).show()
-                        }
-                    }
-                    return@Thread
-                }
-                val body = conn.inputStream.bufferedReader().use { it.readText() }
-                val json = JSONObject(body)
-                val latestTag = json.optString("tag_name", "").removePrefix("v")
-                var downloadUrl = json.optString("html_url", "https://github.com/PppP01/SolStream-Studio/releases")
-                val assets = json.optJSONArray("assets")
-                if (assets != null && assets.length() > 0) {
-                    var chosenAssetUrl: String? = null
-                    for (i in 0 until assets.length()) {
-                        val obj = assets.getJSONObject(i)
-                        val name = obj.optString("name", "")
-                        if (name.endsWith(".apk", ignoreCase = true) && !name.contains("debug", ignoreCase = true)) {
-                            chosenAssetUrl = obj.optString("browser_download_url", "")
-                            break
-                        }
-                    }
-                    downloadUrl = chosenAssetUrl?.takeIf { it.isNotBlank() }
-                        ?: assets.getJSONObject(0).optString("browser_download_url", downloadUrl)
-                }
-                runOnUiThread {
-                    if (isFinishing || isDestroyed) return@runOnUiThread
-                    if (latestTag.isNotBlank() && isRemoteVersionNewer(latestTag, appVersionName)) {
-                        AlertDialog.Builder(this)
-                            .setTitle("Update Available: v$latestTag")
-                            .setMessage("You are on v$appVersionName. Download signed update from your GitHub Releases?")
-                            .setPositiveButton("Download APK") { _, _ ->
-                                startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(downloadUrl)))
-                            }
-                            .setNegativeButton("Later", null)
-                            .show()
-                    } else {
-                        Toast.makeText(this, "You are on the latest version (v$appVersionName)!", Toast.LENGTH_SHORT).show()
-                    }
-                }
-            } catch (e: Exception) {
-                runOnUiThread {
-                    if (!isFinishing && !isDestroyed) {
-                        Toast.makeText(this, "Update check failed: ${e.javaClass.simpleName}", Toast.LENGTH_SHORT).show()
-                    }
-                }
-            } finally {
-                try { conn?.disconnect() } catch (_: Exception) {}
-            }
-        }, "SolUpdateCheck").start()
-    }
-
-    private fun showAllBrandSetupGuide() {
-        val mfr = Build.MANUFACTURER.lowercase(Locale.US)
-        val detectedBrandTip = when {
-            mfr.contains("samsung") ->
-                "★ DETECTED PHONE: SAMSUNG ONE UI (${Build.MODEL})\n" +
-                    "• Memory Exclusion (Prevents 2–3h Kills): Settings → Device Care → Memory → Excluded apps → add BOTH SolStream Studio and your game.\n" +
-                    "• RAM Plus: Keep Device Care → Memory → RAM Plus OFF on 8 GB phones to prevent background disk-swap freezes.\n" +
-                    "• Game Booster: Enable 'Pause USB PD charging when gaming' with a 25W+ PPS charger for 2–4°C cooler sessions."
-            mfr.contains("xiaomi") || mfr.contains("redmi") || mfr.contains("poco") ->
-                "★ DETECTED PHONE: XIAOMI / REDMI / POCO (HyperOS / MIUI)\n" +
-                    "• Unlocking Restricted Settings: Open App Info → scroll to the VERY BOTTOM → tap 'Allow restricted settings'.\n" +
-                    "• Background Lock: Set Battery Saver to 'No restrictions', enable Autostart, and lock SolStream Studio in Recents."
-            mfr.contains("vivo") || mfr.contains("iqoo") ->
-                "★ DETECTED PHONE: VIVO / iQOO (FuntouchOS / OriginOS)\n" +
-                    "• Q1/Q2 Chip Tip: In Ultra Game Mode, keep 'Game Frame Interpolation' OFF (use Native 90/120 FPS) while streaming.\n" +
-                    "• Background Lock: Enable 'High Background Power Consumption' and lock SolStream in Recents."
-            mfr.contains("oneplus") || mfr.contains("realme") || mfr.contains("oppo") ->
-                "★ DETECTED PHONE: ONEPLUS / REALME / OPPO (OxygenOS / ColorOS / Realme UI)\n" +
-                    "• Battery Lock: App Info → Battery Usage → turn ON 'Allow background activity' and lock SolStream in Recents.\n" +
-                    "• HyperBoost: Keep Balanced thermal mode for 3+ hour streams."
-            else ->
-                "★ DETECTED PHONE: ${Build.MANUFACTURER.uppercase(Locale.US)} ${Build.MODEL}\n" +
-                    "• Set Battery to 'Unrestricted' in App Info so Android never pauses your background broadcast."
-        }
-
-        val msg = "$detectedBrandTip\n\n" +
-            "1. LONG-STREAM BATTERY PROTECTION (Zero Extra Permissions):\n" +
-            "• Tap 'Battery / App Info' below → Battery → select 'Unrestricted'.\n\n" +
-            "2. ENABLE ACCESSIBILITY DOCK (Play Store & Sideloaded APK):\n" +
-            "• Play Store install: Tap 'Step 3: Accessibility' and switch SolStream Studio ON in 1 tap.\n" +
-            "• Sideloaded GitHub APK (Android 13–18):\n" +
-            "  a) Tap 'Step 3: Accessibility' → Installed apps → tap greyed-out SolStream Studio once & press OK.\n" +
-            "  b) Tap 'Step 4: App Info (⋮)' → tap ⋮ at top-right → 'Allow restricted settings', then switch ON.\n\n" +
-            "3. EARPHONES, WIRED & USB-C MICS (SolLuxe™ 3.0 Pure 4×3 Matrix):\n" +
-            "• Bluetooth Earphones stay in 100% HD Stereo (A2DP) for footsteps while SolStream captures your phone's 48 kHz studio mic.\n" +
-            "• Plugging in a Wired 3.5mm or USB-C mic auto-switches from Far-Field to Close-Talk tuning and forces hardware Speaker AEC OFF."
-
-        AlertDialog.Builder(this)
-            .setTitle("🛡️ All-Brand Anti-Kill & Setup Guide")
-            .setMessage(msg)
-            .setPositiveButton("Battery / App Info") { _, _ ->
-                openBatteryUnrestricted()
-            }
-            .setNeutralButton("Step 3: Accessibility") { _, _ ->
-                showPlayStoreCompliantAccessibilityDisclosure(allowSkipToStream = false)
-            }
-            .setNegativeButton("Got It", null)
-            .show()
-    }
-
     private fun requestRuntimePermissions() {
         val perms = mutableListOf(Manifest.permission.RECORD_AUDIO)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -3923,11 +3356,6 @@ class MainActivity : AppCompatActivity() {
         permissionLauncher.launch(perms.toTypedArray())
     }
 
-    /**
-     * 100% Play-Store-Safe Battery Unrestricted Guide (Zero REQUEST_IGNORE_BATTERY_OPTIMIZATIONS permission):
-     * - If still restricted: opens standard App Info (Battery -> Unrestricted) with clear instructions.
-     * - If already Unrestricted: opens OEM background guard on Vivo/iQOO/Xiaomi/OnePlus or confirms ready.
-     */
     private fun openBatteryUnrestricted() {
         try {
             val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
