@@ -354,7 +354,7 @@ class SolStreamUnitTests {
         assertFalse(ytFlagship.useVbr)
 
         val twitchFlagship = KeystoreVault.applyPlatformAndVoiceAwareTierPreset(
-            ytFlagship.copy(platformPreset = "TWITCH"),
+            ytFlagship.copy(platformPreset = "TWITCH", hdr10Enabled = true),
             DeviceTier.FLAGSHIP,
             scan
         )
@@ -363,15 +363,17 @@ class SolStreamUnitTests {
         assertEquals(1080, twitchFlagship.height)
         assertEquals(6000, twitchFlagship.targetBitrateKbps)
         assertEquals(160, twitchFlagship.audioBitrateKbps)
+        assertFalse(twitchFlagship.hdr10Enabled)
 
         val kickFlagship = KeystoreVault.applyPlatformAndVoiceAwareTierPreset(
-            ytFlagship.copy(platformPreset = "KICK"),
+            ytFlagship.copy(platformPreset = "KICK", hdr10Enabled = true),
             DeviceTier.FLAGSHIP,
             scan
         )
         assertEquals("H264", kickFlagship.codec)
         assertEquals(8000, kickFlagship.targetBitrateKbps)
         assertEquals(160, kickFlagship.audioBitrateKbps)
+        assertFalse(kickFlagship.hdr10Enabled)
     }
 
     @Test
@@ -1014,11 +1016,11 @@ class SolStreamUnitTests {
         assertEquals("SOL LUXE 3.0 (Pure Condenser)", MicDspProcessor.presetDisplayName("SOL_LUXE"))
     }
 
-    // === PHASE 1 (v1.5.0 / v1.5.1) UNIT TESTS ===
+    // === PHASE 1 (v1.5.0 / v1.5.1 / v1.5.2) UNIT TESTS ===
 
     @Test
     fun diagnosticsReportFreeze_stopsResamplingAfterSessionFinalized() {
-        assertEquals("v1.5.1", DiagnosticsLogger.ENGINE_VERSION)
+        assertEquals("v1.5.2", DiagnosticsLogger.ENGINE_VERSION)
         try {
             DiagnosticsLogger.resetSessionLifecycleForTests()
             // Before any session starts -> allowed to sample idle hardware health
@@ -1397,7 +1399,7 @@ class SolStreamUnitTests {
         assertEquals(30, applied.fps)
     }
 
-    // === v1.5.1 POLISH & PLAY STORE RELEASE UNIT TESTS ===
+    // === v1.5.1 / v1.5.2 PLAY STORE HARDENING UNIT TESTS ===
 
     @Test
     fun powerSourceClassifier_detectsBypassChargingAndAvoidsFalsePositives() {
@@ -1459,7 +1461,7 @@ class SolStreamUnitTests {
             )
         )
 
-        // Trickle charge near full (98%) must NOT falsely report Bypass Charging
+        // Trickle charge near full (98%) or 100% NOT_CHARGING must NOT falsely report Bypass Charging
         assertEquals(
             "AC Fast Power",
             CodecCapabilityProbe.resolvePowerSourceLabel(
@@ -1470,8 +1472,18 @@ class SolStreamUnitTests {
                 currentNowMicroAmps = 140_000
             )
         )
+        assertEquals(
+            "AC Fast Power",
+            CodecCapabilityProbe.resolvePowerSourceLabel(
+                plugged = BatteryManager.BATTERY_PLUGGED_AC,
+                status = BatteryManager.BATTERY_STATUS_NOT_CHARGING,
+                battPct = 100,
+                currentAvgMicroAmps = 0,
+                currentNowMicroAmps = 0
+            )
+        )
 
-        // Slow PC USB port (180 mA) must report USB Power, not Bypass Charging
+        // USB port reporting CHARGING, NOT_CHARGING, or DISCHARGING must NEVER report Bypass Charging (USB-PD)
         assertEquals(
             "USB Power",
             CodecCapabilityProbe.resolvePowerSourceLabel(
@@ -1480,6 +1492,48 @@ class SolStreamUnitTests {
                 battPct = 55,
                 currentAvgMicroAmps = 180_000,
                 currentNowMicroAmps = 180_000
+            )
+        )
+        assertEquals(
+            "USB Power",
+            CodecCapabilityProbe.resolvePowerSourceLabel(
+                plugged = BatteryManager.BATTERY_PLUGGED_USB,
+                status = BatteryManager.BATTERY_STATUS_NOT_CHARGING,
+                battPct = 60,
+                currentAvgMicroAmps = 0,
+                currentNowMicroAmps = 0
+            )
+        )
+        assertEquals(
+            "USB Power",
+            CodecCapabilityProbe.resolvePowerSourceLabel(
+                plugged = BatteryManager.BATTERY_PLUGGED_USB,
+                status = BatteryManager.BATTERY_STATUS_DISCHARGING,
+                battPct = 60,
+                currentAvgMicroAmps = -150_000,
+                currentNowMicroAmps = -150_000
+            )
+        )
+
+        // Wireless pad reporting NOT_CHARGING or DISCHARGING must NEVER report Bypass Charging (USB-PD)
+        assertEquals(
+            "Wireless Power",
+            CodecCapabilityProbe.resolvePowerSourceLabel(
+                plugged = BatteryManager.BATTERY_PLUGGED_WIRELESS,
+                status = BatteryManager.BATTERY_STATUS_NOT_CHARGING,
+                battPct = 65,
+                currentAvgMicroAmps = 0,
+                currentNowMicroAmps = 0
+            )
+        )
+        assertEquals(
+            "Wireless Power",
+            CodecCapabilityProbe.resolvePowerSourceLabel(
+                plugged = BatteryManager.BATTERY_PLUGGED_WIRELESS,
+                status = BatteryManager.BATTERY_STATUS_DISCHARGING,
+                battPct = 65,
+                currentAvgMicroAmps = -200_000,
+                currentNowMicroAmps = -200_000
             )
         )
     }
@@ -1582,5 +1636,192 @@ class SolStreamUnitTests {
         val blurLabel = MainActivity.formatShortsBackdropButtonLabel("BLUR")
         assertTrue(blurLabel.contains("BLUR"))
         assertTrue(blurLabel.contains("40% Cooler Scissor Blur"))
+    }
+
+    @Test
+    fun platformDestinationEnforcer_clampsTwitchKickSimulcastAndLocksBFramesZero() {
+        // Twitch primary must enforce H264, <=1080p, <=6000 kbps, CBR, <=160k AAC, 2s keyframe, HDR10 OFF, B-frames 0
+        val badTwitch = StreamSettings(
+            platformPreset = "TWITCH",
+            codec = "HEVC",
+            width = 2560,
+            height = 1440,
+            targetBitrateKbps = 20000,
+            audioBitrateKbps = 320,
+            useVbr = true,
+            hdr10Enabled = true,
+            keyframeIntervalSec = 1,
+            maxBFrames = 2
+        )
+        val (fixedTwitch, changedTwitch) = KeystoreVault.enforcePlatformLimits(badTwitch)
+        assertTrue(changedTwitch)
+        assertEquals("H264", fixedTwitch.codec)
+        assertEquals(1920, fixedTwitch.width)
+        assertEquals(1080, fixedTwitch.height)
+        assertEquals(6000, fixedTwitch.targetBitrateKbps)
+        assertEquals(160, fixedTwitch.audioBitrateKbps)
+        assertFalse(fixedTwitch.useVbr)
+        assertFalse(fixedTwitch.hdr10Enabled)
+        assertEquals(2, fixedTwitch.keyframeIntervalSec)
+        assertEquals(0, fixedTwitch.maxBFrames)
+
+        // Kick primary must enforce H264, <=1080p, <=8000 kbps, CBR, <=160k AAC, 2s keyframe, B-frames 0
+        val badKick = badTwitch.copy(platformPreset = "KICK", width = 3840, height = 2160, targetBitrateKbps = 30000)
+        val (fixedKick, changedKick) = KeystoreVault.enforcePlatformLimits(badKick)
+        assertTrue(changedKick)
+        assertEquals("H264", fixedKick.codec)
+        assertEquals(1920, fixedKick.width)
+        assertEquals(1080, fixedKick.height)
+        assertEquals(8000, fixedKick.targetBitrateKbps)
+        assertEquals(160, fixedKick.audioBitrateKbps)
+        assertFalse(fixedKick.useVbr)
+        assertEquals(0, fixedKick.maxBFrames)
+
+        // Single-encode YouTube + Twitch simulcast enforces stricter 6M H264 limits
+        val badSingleSim = StreamSettings(
+            platformPreset = "YOUTUBE",
+            simulcastTwitchEnabled = true,
+            simulcastSplitEncode = false,
+            codec = "HEVC",
+            width = 2560,
+            height = 1440,
+            targetBitrateKbps = 18000,
+            audioBitrateKbps = 256
+        )
+        val (fixedSingleSim, _) = KeystoreVault.enforcePlatformLimits(badSingleSim)
+        assertEquals("H264", fixedSingleSim.codec)
+        assertEquals(1920, fixedSingleSim.width)
+        assertEquals(6000, fixedSingleSim.targetBitrateKbps)
+        assertEquals(160, fixedSingleSim.audioBitrateKbps)
+
+        // Split-encode YouTube + Twitch keeps YouTube primary at 1440p HEVC 20M while locking B-frames to 0
+        val splitSim = badSingleSim.copy(simulcastSplitEncode = true, maxBFrames = 2)
+        val (fixedSplitSim, _) = KeystoreVault.enforcePlatformLimits(splitSim)
+        assertEquals("HEVC", fixedSplitSim.codec)
+        assertEquals(2560, fixedSplitSim.width)
+        assertEquals(18000, fixedSplitSim.targetBitrateKbps)
+        assertEquals(0, fixedSplitSim.maxBFrames)
+    }
+
+    @Test
+    fun crossPhoneClamping_handles720pOnlyAnd720p30OnlyBudgetEncoders() {
+        val enc720p30Only = HardwareEncoderReport(
+            codecKey = "H264",
+            mimeType = MediaFormat.MIMETYPE_VIDEO_AVC,
+            encoderName = "c2.budget.avc.encoder",
+            supports1440p60 = false,
+            supports1440p30 = false,
+            supports1080p60 = false,
+            supports1080p30 = false,
+            supports720p60 = false,
+            supports720p30 = true,
+            supportsCbr = true,
+            supportsVbr = true,
+            maxBitrateMbps = 8,
+            complexityMin = 0,
+            complexityMax = 0,
+            verifiedSurfaceConfigure = true,
+            verifiedRealEncode = true
+        )
+        assertEquals("720p30", enc720p30Only.topResolutionTag())
+        assertEquals("1080p30", enc720p30Only.copy(supports1080p30 = true).topResolutionTag())
+
+        val scan720 = DeviceScanSummary(
+            deviceModel = "Entry Phone",
+            socModel = "Entry SoC",
+            androidRelease = "13",
+            sdkInt = 33,
+            totalRamGb = 4,
+            hevcHardware = null,
+            h264Hardware = enc720p30Only,
+            av1Hardware = null,
+            recommendedTier = DeviceTier.LITE,
+            recommendedCodec = "H264",
+            recommendedWidth = 1280,
+            recommendedHeight = 720,
+            recommendedFps = 30
+        )
+
+        val imported1080p30 = StreamSettings(codec = "H264", width = 1920, height = 1080, fps = 30, targetBitrateKbps = 6000)
+        val (clamped1, changed1) = KeystoreVault.clampImportedSettingsToHardware(imported1080p30, scan720)
+        assertTrue(changed1)
+        assertEquals(1280, clamped1.width)
+        assertEquals(720, clamped1.height)
+        assertEquals(30, clamped1.fps)
+
+        val imported720p60 = StreamSettings(codec = "H264", width = 1280, height = 720, fps = 60, targetBitrateKbps = 5000)
+        val (clamped2, changed2) = KeystoreVault.clampImportedSettingsToHardware(imported720p60, scan720)
+        assertTrue(changed2)
+        assertEquals(1280, clamped2.width)
+        assertEquals(720, clamped2.height)
+        assertEquals(30, clamped2.fps)
+    }
+
+    @Test
+    fun videoDrainTransientRetryGuard_retriesBoundedTimesThenEscalates() {
+        assertTrue(SolVideoPipeline.shouldRetryTransientCodecException(true, true, 0))
+        assertTrue(SolVideoPipeline.shouldRetryTransientCodecException(true, true, SolVideoPipeline.MAX_TRANSIENT_CODEC_RETRIES - 1))
+        assertFalse(SolVideoPipeline.shouldRetryTransientCodecException(true, true, SolVideoPipeline.MAX_TRANSIENT_CODEC_RETRIES))
+        assertFalse(SolVideoPipeline.shouldRetryTransientCodecException(false, true, 0))
+        assertFalse(SolVideoPipeline.shouldRetryTransientCodecException(true, false, 0))
+    }
+
+    @Test
+    fun fourKFallbackLadder_stepsThrough4k30And1440p60Before1440p30() {
+        val ultraEnc = HardwareEncoderReport(
+            codecKey = "HEVC",
+            mimeType = MediaFormat.MIMETYPE_VIDEO_HEVC,
+            encoderName = "c2.ultra.hevc.encoder",
+            supports4k60 = true,
+            supports4k30 = true,
+            supports1440p60 = true,
+            supports1440p30 = true,
+            supports1080p60 = true,
+            supports1080p30 = true,
+            supportsCbr = true,
+            supportsVbr = true,
+            complexityMin = 0,
+            complexityMax = 0,
+            verifiedSurfaceConfigure = true,
+            verifiedRealEncode = true
+        )
+        val ladder = SolVideoPipeline.buildResolutionFallbackLadder(ultraEnc, 3840, 2160, 60)
+        assertEquals(Triple(3840, 2160, 60), ladder[0])
+        assertEquals(Triple(3840, 2160, 30), ladder[1])
+        assertEquals(Triple(2560, 1440, 60), ladder[2])
+        assertEquals(Triple(2560, 1440, 30), ladder[3])
+    }
+
+    @Test
+    fun verifiedSocThermalZoneFilter_acceptsCpuGpuZonesAndRejectsBatterySkin() {
+        assertTrue(DiagnosticsLogger.isVerifiedSocThermalZoneType("cpu0-thermal"))
+        assertTrue(DiagnosticsLogger.isVerifiedSocThermalZoneType("soc_therm"))
+        assertTrue(DiagnosticsLogger.isVerifiedSocThermalZoneType("G3D"))
+        assertTrue(DiagnosticsLogger.isVerifiedSocThermalZoneType("BIG"))
+        assertFalse(DiagnosticsLogger.isVerifiedSocThermalZoneType("battery"))
+        assertFalse(DiagnosticsLogger.isVerifiedSocThermalZoneType("usb_port"))
+        assertFalse(DiagnosticsLogger.isVerifiedSocThermalZoneType("skin-therm"))
+        assertFalse(DiagnosticsLogger.isVerifiedSocThermalZoneType("quiet-therm"))
+        assertFalse(DiagnosticsLogger.isVerifiedSocThermalZoneType(""))
+    }
+
+    @Test
+    fun idleHardwareHealthBanner_usesThermalPressureLabelAndHandlesMissingTemp() {
+        val missingTemp = LiveHardwareHealth(
+            batteryTempC = 0f,
+            thermalStatus = PowerManager.THERMAL_STATUS_NONE,
+            thermalHeadroomRatio = 0.42f,
+            socThermalLoadPercent = 42,
+            availRamGb = 3.5f,
+            totalRamGb = 8,
+            isPluggedIn = true,
+            powerSourceLabel = "Bypass Charging (USB-PD)"
+        )
+        val banner = missingTemp.toIdleStatusBanner()
+        assertTrue(banner.contains("Idle Temp: N/A"))
+        assertTrue(banner.contains("Thermal Pressure: 42%"))
+        assertFalse(banner.contains("SoC Load"))
+        assertTrue(banner.contains("⚡ Bypass Charging (USB-PD)"))
+        assertFalse(banner.contains("⚡ ⚡"))
     }
 }
