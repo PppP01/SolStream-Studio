@@ -5,9 +5,12 @@
 cmake_minimum_required(VERSION 3.22.1)
 project("sol_rnnoise" LANGUAGES C)
 
+option(SOL_REQUIRE_XIPH_RNNOISE "Fail build if official Xiph RNNoise sources are missing" OFF)
 set(RNNOISE_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/rnnoise")
 
-if(EXISTS "${RNNOISE_ROOT}/src/denoise.c" AND EXISTS "${RNNOISE_ROOT}/src/rnn_data.c")
+if(EXISTS "${RNNOISE_ROOT}/src/denoise.c"
+   AND EXISTS "${RNNOISE_ROOT}/src/rnn_data.c"
+   AND EXISTS "${RNNOISE_ROOT}/src/celt_lpc.c")
     message(STATUS "SolStream NDK: Compiling official Xiph 48kHz RNNoise neural model")
     set(RNNOISE_SRCS
         "${RNNOISE_ROOT}/src/denoise.c"
@@ -34,6 +37,9 @@ if(EXISTS "${RNNOISE_ROOT}/src/denoise.c" AND EXISTS "${RNNOISE_ROOT}/src/rnn_da
         SOL_USE_XIPH_RNNOISE=1
     )
 else()
+    if(SOL_REQUIRE_XIPH_RNNOISE)
+        message(FATAL_ERROR "SolStream NDK: SOL_REQUIRE_XIPH_RNNOISE=ON but official Xiph RNNoise sources are missing in ${RNNOISE_ROOT}!")
+    endif()
     message(STATUS "SolStream NDK: Compiling built-in C 48kHz Bark-MMSE fallback denoiser")
     add_library(sol_rnnoise SHARED
         sol_rnnoise_jni.c
