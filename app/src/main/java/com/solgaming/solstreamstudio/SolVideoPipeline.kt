@@ -142,7 +142,7 @@ class SolVideoPipeline(private val context: Context) {
     /** Automatic Severe-Thermal cooldown relief: steps 60 FPS pacing down to 30 FPS temporarily. */
     @Volatile var thermalThrottle30Fps = false
 
-    /** Stage-1 Moderate-Warmth (>=44.0°C / 90% SoC load) repeat-frame 1-tap GPU cooler (keeps 100% quality on fresh frames). */
+    /** Stage-1 Moderate-Warmth (>=44.0°C / 90% Thermal Pressure) repeat-frame 1-tap GPU cooler (keeps 100% quality on fresh frames). */
     @Volatile var thermalModerateCoolerActive = false
 
     /** Pauses secondary companion rendering first if Critical/Emergency warmth occurs. */
@@ -178,6 +178,7 @@ class SolVideoPipeline(private val context: Context) {
     private val codecReleaseLock = Any()
     private val projectionCallbackLock = Any()
     private var maxHardwareBitrateBps = 100_000_000
+    private var maxCompanionBitrateBps = 20_000_000
     private var primarySupportsRoi = false
     private var primaryEncoderName = ""
     private var primaryOutW = 1920
@@ -270,7 +271,7 @@ class SolVideoPipeline(private val context: Context) {
     }
 
     fun setCompanionBitrateOnFly(newBitrateBps: Int) {
-        val clamped = newBitrateBps.coerceIn(800_000, 25_000_000)
+        val clamped = newBitrateBps.coerceIn(800_000, maxCompanionBitrateBps)
         companionBitrateBps = clamped
         try {
             val params = Bundle().apply {
@@ -322,7 +323,7 @@ class SolVideoPipeline(private val context: Context) {
      * API 30+ and vendor-specific Qualcomm Snapdragon / Samsung Exynos keys.
      */
     private fun pushHardwareRoiIfSupported(codec: MediaCodec, width: Int, height: Int, mode: String) {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return
+        if (!primarySupportsRoi || Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return
         val m = mode.uppercase(Locale.US)
         if (m == "OFF") return
 
@@ -371,7 +372,15 @@ class SolVideoPipeline(private val context: Context) {
         companionIsLandscapeH264: Boolean = false
     ): ActiveVideoInfo? {
         if (isRunning) return null
-        applyLiveVisualSettings(settings)
+        val (safeSettings, destWasClamped) = KeystoreVault.enforcePlatformLimits(settings)
+        if (destWasClamped) {
+            DiagnosticsLogger.log(
+                "PLATFORM_GUARD",
+                "Adjusted encoder settings to comply with ${safeSettings.platformPreset} streaming limits (${safeSettings.codec} ${safeSettings.width}x${safeSettings.height}@${safeSettings.fps}fps <= ${safeSettings.targetBitrateKbps / 1000} Mbps CBR)."
+            )
+        }
+
+        applyLiveVisualSettings(safeSettings)
         thermalThrottle30Fps = false
         thermalModerateCoolerActive = false
         companionPausedByThermal = false
@@ -384,20 +393,14 @@ class SolVideoPipeline(private val context: Context) {
         actualEncodedFps = 0
         actualEncodedBitrateBps = 0
         actualFreshCaptureFps = 0
-        configuredKeyframeSec = settings.keyframeIntervalSec.coerceIn(1, 4)
+        configuredKeyframeSec = safeSettings.keyframeIntervalSec.coerceIn(1, 4)
 
         val scan = CodecCapabilityProbe.getBestAvailableScanNonBlocking(context)
-        val singleEncodeSimulcastLock = (settings.simulcastTwitchEnabled || settings.simulcastKickEnabled) &&
-            !settings.simulcastSplitEncode
-        val strictH264Lock = singleEncodeSimulcastLock ||
-            settings.platformPreset.equals("TWITCH", ignoreCase = true) ||
-            settings.platformPreset.equals("KICK", ignoreCase = true)
+        val strictH264Lock = KeystoreVault.isStrictH264Destination(safeSettings)
+        val strictCbrLock = KeystoreVault.isStrictCbrDestination(safeSettings)
+        val destinationMaxBitrateBps = KeystoreVault.maxVideoBitrateKbpsForDestination(safeSettings) * 1000
 
-        val effectiveCodecReq = if (strictH264Lock) {
-            "H264"
-        } else {
-            settings.codec
-        }
+        val effectiveCodecReq = if (strictH264Lock) "H264" else safeSettings.codec
         val candidateReports = resolveCandidateHardwareEncoders(
             scan = scan,
             requestedCodec = effectiveCodecReq,
@@ -406,23 +409,23 @@ class SolVideoPipeline(private val context: Context) {
         if (candidateReports.isEmpty()) {
             DiagnosticsLogger.log(
                 "VIDEO_ERR",
-                "No hardware video encoder matched $effectiveCodecReq. Software fallback is blocked to protect CODM FPS.",
+                "No hardware video encoder matched $effectiveCodecReq. Software fallback is blocked to protect game FPS.",
                 "requested=$effectiveCodecReq strictH264=$strictH264Lock"
             )
             return null
         }
 
-        val preferEs30 = when (settings.glEngineMode.uppercase(Locale.US)) {
+        val preferEs30 = when (safeSettings.glEngineMode.uppercase(Locale.US)) {
             "ES20" -> false
             "ES30" -> true
             else -> scan.supportsGlEs30
         }
-        val canRecord10BitEgl = settings.hdr10Enabled &&
+        val canRecord10BitEgl = safeSettings.hdr10Enabled &&
             preferEs30 &&
             !strictH264Lock &&
             canCreateRecordable10BitEglConfig()
 
-        val requestedFps = if (settings.fps <= 30) 30 else 60
+        val requestedFps = if (safeSettings.fps <= 30) 30 else 60
 
         var chosenReport: HardwareEncoderReport? = null
         var configured: ConfiguredEncoder? = null
@@ -433,10 +436,18 @@ class SolVideoPipeline(private val context: Context) {
 
         // Live Hardware Encoder & Resolution Fallback Ladder
         outerLoop@ for ((reportIdx, candidate) in candidateReports.withIndex()) {
+            if (strictCbrLock && !candidate.supportsCbr) {
+                DiagnosticsLogger.log(
+                    "VIDEO_SKIP",
+                    "Skipped ${candidate.encoderName} because destination requires strict CBR and encoder does not advertise CBR."
+                )
+                continue
+            }
+
             val (initialLong, initialShort, initialFps) = resolveSupportedResolutionAndFps(
                 report = candidate,
-                reqWidth = settings.width,
-                reqHeight = settings.height,
+                reqWidth = safeSettings.width,
+                reqHeight = safeSettings.height,
                 reqFps = requestedFps
             )
             val ladder = buildResolutionFallbackLadder(
@@ -445,23 +456,26 @@ class SolVideoPipeline(private val context: Context) {
                 startShort = initialShort,
                 startFps = initialFps
             )
-            val candidateMaxBps = (candidate.maxBitrateMbps.coerceIn(4, 100) * 1_000_000)
+            val candidateMaxBps = min(
+                candidate.maxBitrateMbps.coerceIn(4, 100) * 1_000_000,
+                destinationMaxBitrateBps
+            )
             val wantHdr10 = canRecord10BitEgl && candidate.supports10BitHdr
 
             for ((tierIdx, tier) in ladder.withIndex()) {
                 val (tierLong, tierShort, tierFps) = tier
-                val rawW = if (settings.isVertical) tierShort else tierLong
-                val rawH = if (settings.isVertical) tierLong else tierShort
+                val rawW = if (safeSettings.isVertical) tierShort else tierLong
+                val rawH = if (safeSettings.isVertical) tierLong else tierShort
                 val (alignedW, alignedH) = candidate.alignDimensions(rawW, rawH)
 
                 val scaledKbps = if (tierIdx == 0) {
-                    settings.targetBitrateKbps.coerceIn(500, 100_000)
+                    safeSettings.targetBitrateKbps.coerceIn(500, 100_000)
                 } else {
                     when {
-                        tierLong >= 2560 -> min(settings.targetBitrateKbps, 18_000)
-                        tierLong >= 1920 -> min(settings.targetBitrateKbps, 12_000)
-                        tierLong >= 1280 -> min(settings.targetBitrateKbps, 6_000)
-                        else -> min(settings.targetBitrateKbps, 2_500)
+                        tierLong >= 2560 -> min(safeSettings.targetBitrateKbps, 18_000)
+                        tierLong >= 1920 -> min(safeSettings.targetBitrateKbps, 12_000)
+                        tierLong >= 1280 -> min(safeSettings.targetBitrateKbps, 6_000)
+                        else -> min(safeSettings.targetBitrateKbps, 2_500)
                     }.coerceAtLeast(500)
                 }
                 val tierBps = (scaledKbps * 1000L).coerceIn(500_000L, candidateMaxBps.toLong()).toInt()
@@ -472,9 +486,10 @@ class SolVideoPipeline(private val context: Context) {
                     height = alignedH,
                     fps = tierFps,
                     bitrateBps = tierBps,
-                    wantVbr = settings.useVbr && !strictH264Lock,
+                    wantVbr = safeSettings.useVbr && !strictCbrLock,
+                    requireStrictCbr = strictCbrLock,
                     wantHdr10 = wantHdr10 && tierIdx == 0,
-                    settings = settings
+                    settings = safeSettings
                 )
                 if (attemptCfg != null) {
                     chosenReport = candidate
@@ -488,7 +503,7 @@ class SolVideoPipeline(private val context: Context) {
                         DiagnosticsLogger.log(
                             "VIDEO_FALLBACK",
                             "Hardware encoder automatically stepped to ${candidate.codecKey} (${candidate.encoderName}) ${alignedW}x${alignedH}@${tierFps}fps.",
-                            "req=${settings.width}x${settings.height}@$requestedFps"
+                            "req=${safeSettings.width}x${safeSettings.height}@$requestedFps"
                         )
                     }
                     break@outerLoop
@@ -518,7 +533,7 @@ class SolVideoPipeline(private val context: Context) {
         var compFps = min(targetFps, 60)
 
         if (enableDualCompanion &&
-            (!settings.isVertical || companionIsLandscapeH264) &&
+            (!safeSettings.isVertical || companionIsLandscapeH264) &&
             !finalConfigured.actualIsHdr10 &&
             onCompanionConfig != null &&
             onCompanionVideo != null
@@ -536,12 +551,19 @@ class SolVideoPipeline(private val context: Context) {
             } else {
                 val rawCompW = if (companionIsLandscapeH264) 1920 else 1080
                 val rawCompH = if (companionIsLandscapeH264) 1080 else 1920
-                val compStartBps = if (companionIsLandscapeH264) {
-                    if (settings.simulcastTwitchEnabled) 6_000_000 else 8_000_000
+                val compCapBps = if (companionIsLandscapeH264) {
+                    if (safeSettings.simulcastTwitchEnabled) 6_000_000 else 8_000_000
                 } else {
-                    settings.dualFormatBitrateKbps.coerceIn(1500, 20000) * 1000
+                    20_000_000
                 }
+                val compStartBps = if (companionIsLandscapeH264) {
+                    compCapBps
+                } else {
+                    (safeSettings.dualFormatBitrateKbps.coerceIn(1500, 20000) * 1000).coerceAtMost(compCapBps)
+                }
+                val compRequireStrictCbr = companionIsLandscapeH264
                 for (candidateComp in eligibleCompReports) {
+                    if (compRequireStrictCbr && !candidateComp.supportsCbr) continue
                     val (w, h) = candidateComp.alignDimensions(rawCompW, rawCompH)
                     val fps = if (candidateComp.supports1080p60 && targetFps >= 60) 60 else 30
                     val attempt = configureHardwareSurfaceEncoder(
@@ -551,8 +573,13 @@ class SolVideoPipeline(private val context: Context) {
                         fps = fps,
                         bitrateBps = compStartBps,
                         wantVbr = false,
+                        requireStrictCbr = compRequireStrictCbr,
                         wantHdr10 = false,
-                        settings = settings.copy(isVertical = !companionIsLandscapeH264, maxBFrames = 0)
+                        settings = safeSettings.copy(
+                            isVertical = !companionIsLandscapeH264,
+                            keyframeIntervalSec = 2,
+                            maxBFrames = 0
+                        )
                     )
                     if (attempt != null) {
                         compConfigured = attempt
@@ -560,6 +587,7 @@ class SolVideoPipeline(private val context: Context) {
                         compAlignedW = w
                         compAlignedH = h
                         compFps = fps
+                        maxCompanionBitrateBps = compCapBps
                         companionBitrateBps = compStartBps
                         companionCodecInstance = attempt.codec
                         break
@@ -578,7 +606,7 @@ class SolVideoPipeline(private val context: Context) {
         val (rawScreenW, rawScreenH, densityDpi) = readPhysicalDisplayMetrics()
         val panelLong = evenDimension(max(rawScreenW, rawScreenH).coerceAtLeast(1280))
         val panelShort = evenDimension(min(rawScreenW, rawScreenH).coerceAtLeast(720))
-        val capWidth = if (settings.isVertical && !isDisplayCurrentlyLandscape()) panelShort else panelLong
+        val capWidth = if (safeSettings.isVertical && !isDisplayCurrentlyLandscape()) panelShort else panelLong
         val capHeight = if (capWidth == panelShort) panelLong else panelShort
 
         // Android 14+ strict invariant: register MediaProjection.Callback BEFORE createVirtualDisplay()
@@ -602,11 +630,11 @@ class SolVideoPipeline(private val context: Context) {
                     val safeH = evenDimension(height)
                     if (!isRunning) return
 
-                    // Unified Vulkan PSS Memory Guard (16:9 Landscape & 9:16 Vertical):
+                    // Unified Graphics/Gralloc PSS Resize Guard (16:9 Landscape & 9:16 Vertical):
                     // Ignores resize callbacks while captured game is hidden/unfocused (!capturedContentVisible)
                     // AND ignores temporary portrait resizes during 16:9 landscape streams.
                     if (!shouldAcceptCaptureResize(
-                            isVerticalPrimary = settings.isVertical,
+                            isVerticalPrimary = safeSettings.isVertical,
                             reqW = safeW,
                             reqH = safeH,
                             isVisible = capturedContentVisible,
@@ -688,7 +716,7 @@ class SolVideoPipeline(private val context: Context) {
                 densityDpi = densityDpi,
                 outWidth = outWidth,
                 outHeight = outHeight,
-                isVerticalPrimary = settings.isVertical,
+                isVerticalPrimary = safeSettings.isVertical,
                 targetFps = targetFps,
                 originTimeNs = originTimeNs,
                 onEglInitialized = { res ->
@@ -699,7 +727,7 @@ class SolVideoPipeline(private val context: Context) {
         }, "SolGlFramePacer").apply { start() }
 
         val latchCompleted = try {
-            eglLatch.await(1500, TimeUnit.MILLISECONDS)
+            eglLatch.await(3000, TimeUnit.MILLISECONDS)
         } catch (_: Exception) {
             false
         }
@@ -959,23 +987,31 @@ class SolVideoPipeline(private val context: Context) {
         fps: Int,
         bitrateBps: Int,
         wantVbr: Boolean,
+        requireStrictCbr: Boolean,
         wantHdr10: Boolean,
         settings: StreamSettings
     ): ConfiguredEncoder? {
+        if (requireStrictCbr && !report.supportsCbr) {
+            return null
+        }
+
         for (attempt in 1..3) {
             var codec: MediaCodec? = null
+            var inputSurface: Surface? = null
             try {
                 val created = MediaCodec.createByCodecName(report.encoderName)
                 codec = created
                 val tryHdrThisAttempt = wantHdr10 && attempt == 1
                 val requestedMode = when {
+                    requireStrictCbr -> MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR
                     wantVbr && report.supportsVbr -> MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR
                     report.supportsCbr -> MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR
                     else -> MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR
                 }
 
                 val keyframeSec = settings.keyframeIntervalSec.coerceIn(1, 4)
-                val bFrames = if (attempt == 1) settings.maxBFrames.coerceIn(0, 2) else 0
+                // Locked to 0 B-frames: RootEncoder 2.8.1 RTMP packetizer writes CTS=0
+                val bFrames = 0
 
                 val format = MediaFormat.createVideoFormat(report.mimeType, width, height).apply {
                     setInteger(
@@ -1007,7 +1043,7 @@ class SolVideoPipeline(private val context: Context) {
                         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                             setFloat(MediaFormat.KEY_MAX_FPS_TO_ENCODER, fps.toFloat())
                         }
-                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && settings.lowLatencyCodecHint && bFrames == 0) {
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && settings.lowLatencyCodecHint) {
                             setInteger(MediaFormat.KEY_LATENCY, 1)
                         }
                         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
@@ -1064,7 +1100,8 @@ class SolVideoPipeline(private val context: Context) {
                 }
 
                 created.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
-                val inputSurface = created.createInputSurface()
+                val surf = created.createInputSurface()
+                inputSurface = surf
                 created.start()
 
                 val outFmt = try { created.outputFormat } catch (_: Exception) { null }
@@ -1078,6 +1115,16 @@ class SolVideoPipeline(private val context: Context) {
                     requestedMode
                 }
                 val isActualVbr = actualMode == MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR
+                if (requireStrictCbr && isActualVbr) {
+                    try { surf.release() } catch (_: Exception) {}
+                    try { created.stop() } catch (_: Exception) {}
+                    try { created.release() } catch (_: Exception) {}
+                    DiagnosticsLogger.log(
+                        "VIDEO_ERR",
+                        "Hardware encoder ${report.encoderName} fell back to VBR on a strict CBR destination; rejecting attempt #$attempt."
+                    )
+                    continue
+                }
 
                 val verifiedHdrOutput = if (tryHdrThisAttempt && outFmt != null) {
                     try {
@@ -1107,11 +1154,12 @@ class SolVideoPipeline(private val context: Context) {
                 }
                 return ConfiguredEncoder(
                     codec = created,
-                    inputSurface = inputSurface,
+                    inputSurface = surf,
                     actualIsVbr = isActualVbr,
                     actualIsHdr10 = verifiedHdrOutput
                 )
             } catch (e: Exception) {
+                try { inputSurface?.release() } catch (_: Exception) {}
                 try { codec?.release() } catch (_: Exception) {}
                 if (attempt == 3) {
                     DiagnosticsLogger.log(
@@ -1558,7 +1606,7 @@ class SolVideoPipeline(private val context: Context) {
                     }
                 }
 
-                if (nowMs - lastRoiPushMs > 2500L) {
+                if (primarySupportsRoi && nowMs - lastRoiPushMs > 2500L) {
                     lastRoiPushMs = nowMs
                     videoCodecInstance?.let { pushHardwareRoiIfSupported(it, primaryOutW, primaryOutH, liveRoiMode) }
                 }
@@ -2595,11 +2643,37 @@ class SolVideoPipeline(private val context: Context) {
         var bytesInWindow = 0L
         var qpSumInWindow = 0L
         var qpCountInWindow = 0
+        var consecutiveTransientErrors = 0
 
         try {
             while (isRunning) {
-                val outIdx = codec.dequeueOutputBuffer(bufferInfo, 15_000L)
+                val outIdx = try {
+                    codec.dequeueOutputBuffer(bufferInfo, 15_000L)
+                } catch (ce: MediaCodec.CodecException) {
+                    if (shouldRetryTransientCodecException(ce.isTransient, isRunning, consecutiveTransientErrors)) {
+                        consecutiveTransientErrors++
+                        DiagnosticsLogger.log(
+                            "ENC_TRANSIENT",
+                            "Hardware video encoder reported transient stall #$consecutiveTransientErrors/$MAX_TRANSIENT_CODEC_RETRIES; retrying safely.",
+                            ce.diagnosticInfo
+                        )
+                        try { Thread.sleep(25L) } catch (_: InterruptedException) { break }
+                        continue
+                    }
+                    if (isRunning) {
+                        if (isPrimaryStream) {
+                            val msg = "Hardware video encoder fatal error (${ce.diagnosticInfo})."
+                            DiagnosticsLogger.log("ENC_ERR", msg, ce.message ?: "")
+                            onFatalPipelineError?.invoke(msg)
+                        } else {
+                            onCompanionPipelineStopped?.invoke("Companion encoder fatal error")
+                        }
+                    }
+                    break
+                }
+
                 if (outIdx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                    consecutiveTransientErrors = 0
                     val outFmt = codec.outputFormat
                     if (isPrimaryStream &&
                         Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
@@ -2626,6 +2700,8 @@ class SolVideoPipeline(private val context: Context) {
                     continue
                 }
                 if (outIdx < 0) continue
+
+                consecutiveTransientErrors = 0
 
                 if (isPrimaryStream && Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                     try {
@@ -2721,13 +2797,7 @@ class SolVideoPipeline(private val context: Context) {
                 }
             }
         } catch (ce: MediaCodec.CodecException) {
-            if (ce.isTransient && isRunning) {
-                DiagnosticsLogger.log(
-                    "ENC_TRANSIENT",
-                    "Hardware encoder reported a brief transient stall; continuing stream safely.",
-                    ce.diagnosticInfo
-                )
-            } else if (isRunning) {
+            if (isRunning) {
                 if (isPrimaryStream) {
                     val msg = "Hardware video encoder fatal error (${ce.diagnosticInfo})."
                     DiagnosticsLogger.log("ENC_ERR", msg, ce.message ?: "")
@@ -2930,9 +3000,23 @@ class SolVideoPipeline(private val context: Context) {
         private const val SCREENSHOT_COOLDOWN_MS = 3_000L
         private const val HUD_REFRESH_INTERVAL_MS = 2_000L
         private const val PNGTUBER_TALK_HOLD_MS = 140L
+        internal const val MAX_TRANSIENT_CODEC_RETRIES = 5
 
         /**
-         * Unified Vulkan PSS Memory Guard (16:9 Landscape & 9:16 Vertical):
+         * Bounded retry gate for transient MediaCodec.CodecException errors inside the drain loop:
+         * retries up to MAX_TRANSIENT_CODEC_RETRIES consecutive times while running, then escalates
+         * cleanly to fatal error handling instead of silently stopping the encoder in LIVE state.
+         */
+        internal fun shouldRetryTransientCodecException(
+            isTransient: Boolean,
+            isRunning: Boolean,
+            consecutiveTransientErrors: Int
+        ): Boolean {
+            return isTransient && isRunning && consecutiveTransientErrors < MAX_TRANSIENT_CODEC_RETRIES
+        }
+
+        /**
+         * Unified Graphics/Gralloc PSS Resize Guard (16:9 Landscape & 9:16 Vertical):
          * Blocks VirtualDisplay reallocations when the captured target is hidden/unfocused,
          * blocks redundant identical-size resizes, and blocks temporary portrait resizes during 16:9 streams.
          */
@@ -3063,7 +3147,13 @@ class SolVideoPipeline(private val context: Context) {
         ): List<Triple<Int, Int, Int>> {
             val allTiers = buildList {
                 add(Triple(startLong, startShort, startFps))
-                if (startLong >= 2560 && startFps >= 60 && (report.supports1440p30 || report.supports1440p60)) {
+                if (startLong >= 3840 && startFps >= 60 && (report.supports4k30 || report.supports4k60)) {
+                    add(Triple(3840, 2160, 30))
+                }
+                if (startLong >= 3840 && report.supports1440p60 && startFps >= 60) {
+                    add(Triple(2560, 1440, 60))
+                }
+                if (startLong >= 2560 && (report.supports1440p30 || report.supports1440p60)) {
                     add(Triple(2560, 1440, 30))
                 }
                 if (report.supports1080p60 && startFps >= 60) add(Triple(1920, 1080, 60))
