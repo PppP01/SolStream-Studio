@@ -13,6 +13,7 @@ import android.media.MediaFormat
 import android.os.BatteryManager
 import android.os.PowerManager
 import com.solgaming.solstreamstudio.recorder.SolHudAndQrRenderer
+import com.solgaming.solstreamstudio.ui.DashboardDialogs
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
@@ -1694,7 +1695,7 @@ class SolStreamUnitTests {
         assertEquals(6000, fixedSingleSim.targetBitrateKbps)
         assertEquals(160, fixedSingleSim.audioBitrateKbps)
 
-        // Split-encode YouTube + Twitch keeps YouTube primary at 1440p HEVC 20M while locking B-frames to 0
+        // Split-encode YouTube + Twitch keeps YouTube primary at 1440p HEVC 18M while locking B-frames to 0
         val splitSim = badSingleSim.copy(simulcastSplitEncode = true, maxBFrames = 2)
         val (fixedSplitSim, _) = KeystoreVault.enforcePlatformLimits(splitSim)
         assertEquals("HEVC", fixedSplitSim.codec)
@@ -1823,5 +1824,194 @@ class SolStreamUnitTests {
         assertFalse(banner.contains("SoC Load"))
         assertTrue(banner.contains("⚡ Bypass Charging (USB-PD)"))
         assertFalse(banner.contains("⚡ ⚡"))
+    }
+
+    // === v1.5.2 AUDIO HARDENING, RESAMPLER CONTINUITY & UPDATE CHECK TESTS ===
+
+    @Test
+    fun micDspSustainedSpeechAndMute_freezeNoiseFloorAgainstDrift() {
+        val dsp = MicDspProcessor(48000).apply {
+            applyHardwareAcousticMode(HardwareAcousticMode.PHONE_STUDIO)
+            applySettings(
+                StreamSettings(
+                    voiceGenderProfile = "MALE",
+                    voicePreset = "SOL_LUXE",
+                    noiseSuppressMode = "LIGHT",
+                    rnnoiseLevel = 2,
+                    noiseGateEnabled = true,
+                    micGainPercent = 100
+                )
+            )
+        }
+
+        // Exact 50 ms (5-frame, 2400-sample) periodic vocal signal (140 Hz, 420 Hz, 1400 Hz are integer multiples of 20 Hz)
+        val periodSamples = 2400
+        val vocalCycle = FloatArray(periodSamples) { idx ->
+            val t = idx.toDouble() / 48000.0
+            (0.10 * sin(2.0 * PI * 140.0 * t) +
+                0.06 * sin(2.0 * PI * 420.0 * t) +
+                0.03 * sin(2.0 * PI * 1400.0 * t)).toFloat()
+        }
+
+        val frame = FloatArray(480)
+        var finalSpeechRms = 0f
+        // Simulate 3 full minutes (18,000 x 10 ms) of uninterrupted sustained speech without neural VAD
+        for (f in 0 until 18_000) {
+            val offset = (f % 5) * 480
+            System.arraycopy(vocalCycle, offset, frame, 0, 480)
+            dsp.processMonoFrameInPlace(frame, 480)
+            if (f == 17_999) {
+                finalSpeechRms = sqrt(frame.fold(0f) { acc, v -> acc + v * v } / frame.size)
+            }
+        }
+
+        assertTrue("Sustained 3-minute speech must stay detected by VAD", dsp.vadSpeechActive)
+        assertTrue(
+            "Noise floor must stay frozen during 3-minute sustained speech (was ${dsp.lastNoiseFloorDb} dB)",
+            dsp.lastNoiseFloorDb < -52.0f
+        )
+        assertTrue("Output RMS after 3 minutes of speech must remain clear (>0.05f), was $finalSpeechRms", finalSpeechRms > 0.05f)
+
+        // Verify muting the mic freezes the noise floor instead of dragging it down to -80 dB
+        val floorBeforeMute = dsp.lastNoiseFloorDb
+        dsp.streamMicMuted = true
+        repeat(50) {
+            frame.fill(0f)
+            dsp.processMonoFrameInPlace(frame, 480)
+        }
+        assertEquals(
+            "Noise floor must stay frozen during mute instead of dropping to -80 dB",
+            floorBeforeMute,
+            dsp.lastNoiseFloorDb,
+            0.25f
+        )
+    }
+
+    @Test
+    fun linearMonoResampler48k_preservesPhaseContinuityAndCallerBufferAcrossBlocks() {
+        for (srcRate in listOf(44100, 16000)) {
+            val resampler = LinearMonoResampler48k(srcRate)
+            assertEquals(1, resampler.causalDelayInputSamples)
+            val n = resampler.sourceSamplesPer10ms
+            val step = n.toDouble() / SolDualAudioEngine.MONO_SAMPLES_PER_10MS.toDouble()
+            val dest = FloatArray(SolDualAudioEngine.MONO_SAMPLES_PER_10MS)
+            var prevBlockTail = 0f
+
+            for (block in 0 until 5) {
+                val src = ShortArray(n) { k ->
+                    val t = (block * n + k).toDouble() / srcRate.toDouble()
+                    (0.5 * sin(2.0 * PI * 440.0 * t) * 32767.0).roundToInt().toShort()
+                }
+                resampler.resample10msPcm16To480Float(src, n, dest)
+
+                if (block >= 1) {
+                    val boundaryJump = abs(dest[0] - prevBlockTail)
+                    assertTrue(
+                        "Resampler $srcRate Hz block $block boundary jump ($boundaryJump) must stay smooth (<0.035f)",
+                        boundaryJump < 0.035f
+                    )
+                    var maxErr = 0f
+                    for (outIdx in dest.indices) {
+                        val expectedTimeSec = (block * n + outIdx * step - resampler.causalDelayInputSamples) / srcRate.toDouble()
+                        val expected = (0.5 * sin(2.0 * PI * 440.0 * expectedTimeSec)).toFloat()
+                        val err = abs(dest[outIdx] - expected)
+                        if (err > maxErr) maxErr = err
+                    }
+                    assertTrue(
+                        "Resampler $srcRate Hz block $block phase/amplitude max error ($maxErr) must be < 0.006f",
+                        maxErr < 0.006f
+                    )
+                }
+                prevBlockTail = dest[dest.lastIndex]
+            }
+
+            // Short read must NOT mutate caller's ShortArray in place
+            val shortBuf = ShortArray(n) { 12345 }
+            resampler.resample10msPcm16To480Float(shortBuf, n / 2, dest)
+            assertEquals(12345.toShort(), shortBuf[n - 1])
+        }
+    }
+
+    @Test
+    fun micRecoveryGuard_blocksHealthySilenceAndEnforces15sCooldown() {
+        // Healthy quiet mic (OS reports isClientSilenced == false) must NEVER restart even after 10s of exact zeros
+        assertFalse(
+            SolDualAudioEngine.shouldTriggerMicRecovery(
+                consecutiveReadErrors = 0,
+                consecutiveExactZeroFrames = 1000,
+                osReportedSilenced = false,
+                elapsedSinceLastRecoveryMs = SolDualAudioEngine.MIC_RECOVERY_COOLDOWN_MS + 5_000L
+            )
+        )
+
+        // Cooldown blocks rapid repeated restarts even on read errors or OS-silenced status
+        assertFalse(
+            SolDualAudioEngine.shouldTriggerMicRecovery(
+                consecutiveReadErrors = SolDualAudioEngine.MIC_RECOVERY_READ_ERROR_FRAMES + 10,
+                consecutiveExactZeroFrames = SolDualAudioEngine.MIC_RECOVERY_SILENCED_FRAMES + 10,
+                osReportedSilenced = true,
+                elapsedSinceLastRecoveryMs = 5_000L
+            )
+        )
+
+        // Sustained read errors trigger recovery once cooldown has elapsed
+        assertTrue(
+            SolDualAudioEngine.shouldTriggerMicRecovery(
+                consecutiveReadErrors = SolDualAudioEngine.MIC_RECOVERY_READ_ERROR_FRAMES,
+                consecutiveExactZeroFrames = 0,
+                osReportedSilenced = false,
+                elapsedSinceLastRecoveryMs = SolDualAudioEngine.MIC_RECOVERY_COOLDOWN_MS
+            )
+        )
+
+        // OS-confirmed silenced mic triggers recovery at 1.5s (150 frames), not before
+        assertFalse(
+            SolDualAudioEngine.shouldTriggerMicRecovery(
+                consecutiveReadErrors = 0,
+                consecutiveExactZeroFrames = SolDualAudioEngine.MIC_RECOVERY_SILENCED_FRAMES - 1,
+                osReportedSilenced = true,
+                elapsedSinceLastRecoveryMs = SolDualAudioEngine.MIC_RECOVERY_COOLDOWN_MS
+            )
+        )
+        assertTrue(
+            SolDualAudioEngine.shouldTriggerMicRecovery(
+                consecutiveReadErrors = 0,
+                consecutiveExactZeroFrames = SolDualAudioEngine.MIC_RECOVERY_SILENCED_FRAMES,
+                osReportedSilenced = true,
+                elapsedSinceLastRecoveryMs = SolDualAudioEngine.MIC_RECOVERY_COOLDOWN_MS
+            )
+        )
+
+        // When recording configuration is unavailable (null), requires full 8s (800 frames) of bit-exact zeros
+        assertFalse(
+            SolDualAudioEngine.shouldTriggerMicRecovery(
+                consecutiveReadErrors = 0,
+                consecutiveExactZeroFrames = SolDualAudioEngine.MIC_RECOVERY_UNKNOWN_ZERO_FRAMES - 1,
+                osReportedSilenced = null,
+                elapsedSinceLastRecoveryMs = SolDualAudioEngine.MIC_RECOVERY_COOLDOWN_MS
+            )
+        )
+        assertTrue(
+            SolDualAudioEngine.shouldTriggerMicRecovery(
+                consecutiveReadErrors = 0,
+                consecutiveExactZeroFrames = SolDualAudioEngine.MIC_RECOVERY_UNKNOWN_ZERO_FRAMES,
+                osReportedSilenced = null,
+                elapsedSinceLastRecoveryMs = SolDualAudioEngine.MIC_RECOVERY_COOLDOWN_MS
+            )
+        )
+    }
+
+    @Test
+    fun aacDrainTransientRetryAndRemoteVersionComparator_behaveCleanly() {
+        assertTrue(SolDualAudioEngine.shouldRetryTransientAacException(true, true, 0))
+        assertTrue(SolDualAudioEngine.shouldRetryTransientAacException(true, true, SolDualAudioEngine.MAX_TRANSIENT_AAC_RETRIES - 1))
+        assertFalse(SolDualAudioEngine.shouldRetryTransientAacException(true, true, SolDualAudioEngine.MAX_TRANSIENT_AAC_RETRIES))
+        assertFalse(SolDualAudioEngine.shouldRetryTransientAacException(false, true, 0))
+        assertFalse(SolDualAudioEngine.shouldRetryTransientAacException(true, false, 0))
+
+        assertTrue(DashboardDialogs.isRemoteVersionNewer("v1.5.2", "1.5.1"))
+        assertTrue(DashboardDialogs.isRemoteVersionNewer("1.10.0", "1.9.9"))
+        assertFalse(DashboardDialogs.isRemoteVersionNewer("v1.5.2", "1.5.2-debug"))
+        assertFalse(DashboardDialogs.isRemoteVersionNewer("1.5.1", "1.5.2"))
     }
 }
