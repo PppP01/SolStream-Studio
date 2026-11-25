@@ -112,6 +112,10 @@ internal interface PillActions {
     fun onTogglePngTuber()
     fun onToggleMinimapShield()
     fun onToggleManualKeyboardBlur()
+    fun onCycleShortsAnchor()
+    fun onCycleShortsMinimapLoupe()
+    fun onCycleShortsScoreLoupe()
+    fun onToggleShortsHeaderLayout()
     fun onStepLiveBitrate(dir: Int)
     fun onToggleAbr()
     fun onToggleThermal30FpsSaver()
@@ -172,7 +176,7 @@ internal class SolFloatingPillController(
     private var btnOvDucking: TextView? = null
     private var btnOvMicRoute: TextView? = null
 
-    // Tab 1 (Video & Pro Overlays) live buttons
+    // Tab 1 (Video, SolShorts™ Studio & Pro Overlays) live buttons
     private var btnOvSceneSelect: TextView? = null
     private var btnOvUpscaler: TextView? = null
     private var btnOvFraming: TextView? = null
@@ -183,6 +187,11 @@ internal class SolFloatingPillController(
     private var btnOvColorTemp: TextView? = null
     private var btnOvFlip180: TextView? = null
     private var btnOvSharpen: TextView? = null
+    private var shortsStudioSection: LinearLayout? = null
+    private var btnOvShortsAnchor: TextView? = null
+    private var btnOvShortsHeader: TextView? = null
+    private var btnOvShortsScoreLoupe: TextView? = null
+    private var btnOvShortsMinimapLoupe: TextView? = null
     private var btnOvOverlayPos: TextView? = null
     private var btnOvLiveBanner: TextView? = null
     private var btnOvCleanShot: TextView? = null
@@ -220,6 +229,20 @@ internal class SolFloatingPillController(
         val maxX = max(0, dm.widthPixels - dp(72))
         val maxY = max(0, dm.heightPixels - dp(48))
         return rawX.coerceIn(0, maxX) to rawY.coerceIn(0, maxY)
+    }
+
+    private fun ensurePillWithinCurrentScreenBounds() {
+        val root = pillRootView ?: return
+        val lp = pillLayoutParams ?: return
+        val (clampedX, clampedY) = clampOverlayCoords(lp.x, lp.y)
+        if (clampedX != lp.x || clampedY != lp.y) {
+            lp.x = clampedX
+            lp.y = clampedY
+            try {
+                windowManager.updateViewLayout(root, lp)
+            } catch (_: Exception) {
+            }
+        }
     }
 
     @SuppressLint("ClickableViewAccessibility")
@@ -357,7 +380,7 @@ internal class SolFloatingPillController(
         btnOvMicRoute = makePillMiniBtn("Mic:Phone Studio", "#38BDF8") { actions.onCycleMicHardware() }
         audioPane.addView(makeAlignedGridRow(btnOvBlastTamer!!, btnOvDucking!!, btnOvMicRoute!!))
 
-        // === TAB 1: 🎬 VIDEO, PRO OVERLAYS, SCREENSHOT & DUAL PRIVACY BLUR ===
+        // === TAB 1: 🎬 VIDEO, SOLSHORTS™ STUDIO, PRO OVERLAYS, SCREENSHOT & DUAL PRIVACY BLUR ===
         val videoPane = LinearLayout(context).apply {
             orientation = LinearLayout.VERTICAL
             visibility = View.GONE
@@ -372,6 +395,22 @@ internal class SolFloatingPillController(
         btnOvSharpen = makePillMiniBtn("Sharp:OFF", "#94A3B8") { actions.onToggleGpuSharpen() }
         btnOvFlip180 = makePillMiniBtn("Rot:0°", "#38BDF8") { actions.onToggleLandscapeFlip() }
         videoPane.addView(makeAlignedGridRow(btnOvUpscaler!!, btnOvSharpen!!, btnOvFlip180!!))
+
+        // v1.6.0 SolShorts™ Studio live controls (auto-shown for 9:16 Shorts & Dual-Format Companion)
+        val shortsSection = LinearLayout(context).apply {
+            orientation = LinearLayout.VERTICAL
+            visibility = View.GONE
+        }
+        shortsSection.addView(makePillSectionMicroHeader("SOLSHORTS™ 9:16 STUDIO (OPT-IN)"))
+        btnOvShortsAnchor = makePillMiniBtn("Pos:CENTER", "#38BDF8") { actions.onCycleShortsAnchor() }
+        btnOvShortsHeader = makePillMiniBtn("Header:OFF", "#94A3B8") { actions.onToggleShortsHeaderLayout() }
+        shortsSection.addView(makeAlignedGridRow(btnOvShortsAnchor!!, btnOvShortsHeader!!))
+
+        btnOvShortsScoreLoupe = makePillMiniBtn("FeedL:OFF", "#94A3B8") { actions.onCycleShortsScoreLoupe() }
+        btnOvShortsMinimapLoupe = makePillMiniBtn("MapL:OFF", "#94A3B8") { actions.onCycleShortsMinimapLoupe() }
+        shortsSection.addView(makeAlignedGridRow(btnOvShortsScoreLoupe!!, btnOvShortsMinimapLoupe!!))
+        shortsStudioSection = shortsSection
+        videoPane.addView(shortsSection)
 
         videoPane.addView(makePillSectionMicroHeader("STACKABLE GPU COLOR GRADING"))
         btnOvFilmic = makePillMiniBtn("Filmic:OFF", "#94A3B8") { actions.onToggleCinematicFilmic() }
@@ -626,7 +665,10 @@ internal class SolFloatingPillController(
         btnOvDucking = null; btnOvMicRoute = null
         btnOvSceneSelect = null; btnOvUpscaler = null; btnOvFraming = null; btnOvZoom = null
         btnOvFilmic = null; btnOvVivid = null; btnOvShadowBoost = null; btnOvColorTemp = null
-        btnOvFlip180 = null; btnOvSharpen = null; btnOvOverlayPos = null; btnOvLiveBanner = null
+        btnOvFlip180 = null; btnOvSharpen = null
+        shortsStudioSection = null; btnOvShortsAnchor = null; btnOvShortsHeader = null
+        btnOvShortsScoreLoupe = null; btnOvShortsMinimapLoupe = null
+        btnOvOverlayPos = null; btnOvLiveBanner = null
         btnOvCleanShot = null; btnOvHudTelemetry = null; btnOvQrOverlay = null; btnOvPngTuber = null
         btnOvMinimapShield = null; btnOvKeyboardBlur = null
         tvOvBitrateReadout = null; btnOvAbrToggle = null; btnOvThermal30Saver = null
@@ -638,6 +680,7 @@ internal class SolFloatingPillController(
     fun updateTelemetry() {
         val statusTv = pillStatusText ?: return
         val dot = pillStatusDot ?: return
+        ensurePillWithinCurrentScreenBounds()
         val snap = actions.getSnapshot()
 
         val mm = snap.elapsedSec / 60L
@@ -749,7 +792,7 @@ internal class SolFloatingPillController(
         )
         stylePillControlBtn(btnOvMicRoute, "Mic:${snap.shortMicPillLabel}", isOn = false, isSelector = true)
 
-        // Tab 1 (Video & Phase 1 Pro Overlays)
+        // Tab 1 (Video, SolShorts™ Studio & Phase 1 Pro Overlays)
         stylePillControlBtn(btnOvUpscaler, "Scale:${s.upscalerMode}", isOn = s.upscalerMode != "BILINEAR", isSelector = true)
         stylePillControlBtn(btnOvFraming, "Frame:${s.framingMode}", isOn = s.framingMode != "FIT", isSelector = true)
         stylePillControlBtn(btnOvZoom, "Zoom:${s.smartZoomPercent}%", isOn = s.framingMode == "SMART" && s.smartZoomPercent > 100, isSelector = true)
@@ -759,6 +802,41 @@ internal class SolFloatingPillController(
         stylePillControlBtn(btnOvColorTemp, "Temp:${s.colorTempFilter.take(4)}", isOn = s.colorTempFilter != "NEUTRAL", isSelector = true)
         stylePillControlBtn(btnOvFlip180, "Rot:${s.landscapeFlip}°", isOn = s.landscapeFlip == 180, isSelector = true)
         stylePillControlBtn(btnOvSharpen, if (s.gpuSharpen) "Sharp:ON" else "Sharp:OFF", isOn = s.gpuSharpen)
+
+        val showShortsControls = s.isVertical || s.dualFormatCompanionEnabled
+        shortsStudioSection?.visibility = if (showShortsControls) View.VISIBLE else View.GONE
+        if (showShortsControls) {
+            val anchorAbove = s.shortsVerticalAnchor.equals("ABOVE_CHAT", ignoreCase = true)
+            stylePillControlBtn(
+                btnOvShortsAnchor,
+                label = SolStreamService.formatCompactShortsAnchorTag(s.shortsVerticalAnchor),
+                isOn = anchorAbove,
+                isSelector = !anchorAbove
+            )
+            stylePillControlBtn(
+                btnOvShortsHeader,
+                label = if (s.shortsHeaderLayout) "Header:ON" else "Header:OFF",
+                isOn = s.shortsHeaderLayout
+            )
+            val scoreOn = !s.shortsScoreLoupe.equals("OFF", ignoreCase = true)
+            stylePillControlBtn(
+                btnOvShortsScoreLoupe,
+                label = SolStreamService.formatCompactShortsScoreLoupeTag(s.shortsScoreLoupe),
+                isOn = scoreOn
+            )
+            val mapSuppressed = SolVideoPipeline.isMinimapLoupeSuppressedByShield(
+                s.shortsMinimapLoupe,
+                s.minimapShieldEnabled,
+                s.minimapShieldCorner
+            )
+            val mapActive = !s.shortsMinimapLoupe.equals("OFF", ignoreCase = true) && !mapSuppressed
+            stylePillControlBtn(
+                btnOvShortsMinimapLoupe,
+                label = SolStreamService.formatCompactShortsMinimapLoupeTag(s.shortsMinimapLoupe, mapSuppressed),
+                isOn = mapActive,
+                isSelector = mapSuppressed
+            )
+        }
 
         val logoLabel = SolStreamService.formatCompactOverlayPositionTag(s.overlayImageEnabled, s.overlayPosition)
         stylePillControlBtn(btnOvOverlayPos, label = logoLabel, isOn = s.overlayImageEnabled)
