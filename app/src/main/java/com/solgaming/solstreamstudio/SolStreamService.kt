@@ -259,6 +259,10 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
         override fun onTogglePngTuber() = togglePngTuberLive()
         override fun onToggleMinimapShield() = toggleMinimapShieldLive()
         override fun onToggleManualKeyboardBlur() = toggleManualKeyboardBlurLive()
+        override fun onCycleShortsAnchor() = cycleShortsAnchorLive()
+        override fun onCycleShortsMinimapLoupe() = cycleShortsMinimapLoupeLive()
+        override fun onCycleShortsScoreLoupe() = cycleShortsScoreLoupeLive()
+        override fun onToggleShortsHeaderLayout() = toggleShortsHeaderLayoutLive()
         override fun onStepLiveBitrate(dir: Int) = stepLiveBitrate(dir)
         override fun onToggleAbr() = toggleAbrLive()
         override fun onToggleThermal30FpsSaver() = toggleThermal30FpsSaverLive()
@@ -508,11 +512,14 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
         newClient.setAudioInfo(SolDualAudioEngine.SAMPLE_RATE, true)
         val sps = cachedSps
         if (sps != null) {
-            newClient.setVideoInfo(
-                ByteBuffer.wrap(sps),
-                cachedPps?.let { ByteBuffer.wrap(it) },
-                cachedVps?.let { ByteBuffer.wrap(it) }
-            )
+            try {
+                newClient.setVideoInfo(
+                    ByteBuffer.wrap(sps),
+                    cachedPps?.let { ByteBuffer.wrap(it) },
+                    cachedVps?.let { ByteBuffer.wrap(it) }
+                )
+            } catch (_: Exception) {
+            }
         }
         cb.clientRef = newClient
         return newClient
@@ -794,11 +801,14 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
                 cachedSps = spsArr
                 cachedPps = ppsArr
                 cachedVps = vpsArr
-                this@SolStreamService.rtmpClient?.setVideoInfo(
-                    ByteBuffer.wrap(spsArr),
-                    ppsArr?.let { ByteBuffer.wrap(it) },
-                    vpsArr?.let { ByteBuffer.wrap(it) }
-                )
+                try {
+                    this@SolStreamService.rtmpClient?.setVideoInfo(
+                        ByteBuffer.wrap(spsArr),
+                        ppsArr?.let { ByteBuffer.wrap(it) },
+                        vpsArr?.let { ByteBuffer.wrap(it) }
+                    )
+                } catch (_: Exception) {
+                }
                 if (!splitEncodeSimulcastActive) {
                     for (aux in sessionAuxList) {
                         aux.sendVideoHeader(spsArr, ppsArr, vpsArr)
@@ -816,6 +826,8 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
                     val t0Ns = System.nanoTime()
                     try {
                         activeClient.sendVideo(bb, info)
+                    } catch (_: Exception) {
+                        // Guard hardware video drain loop against transient socket send races during disconnect/reconnect
                     } finally {
                         val elapsedMs = ((System.nanoTime() - t0Ns) / 1_000_000L).coerceAtLeast(0L)
                         lastVideoSendLatencyMs = elapsedMs
@@ -926,7 +938,11 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
 
                 val activeClient = this@SolStreamService.rtmpClient
                 if (rtmpConnected && activeClient != null) {
-                    activeClient.sendAudio(aacBuf, aacInfo)
+                    try {
+                        activeClient.sendAudio(aacBuf, aacInfo)
+                    } catch (_: Exception) {
+                        // Guard AAC drain loop against transient socket send races during disconnect/reconnect
+                    }
                 }
                 val vPts = vPipeline.lastSentVideoPtsUs
                 if (vPts > 0L) {
@@ -1191,6 +1207,7 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
             cumulativeDroppedFramesBeforeReconnect += lastDroppedTotal
             lastDroppedTotal = 0L
 
+            parseIngestHostAndPort(targetUrl)
             val freshClient = buildConfiguredPrimaryRtmpClient(sessionGen, targetUrl)
             rtmpClient = freshClient
             lastCallbackBitrateKbps = -1
@@ -2069,6 +2086,30 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
         pillController?.refreshExpandedControls()
     }
 
+    private fun cycleShortsAnchorLive() {
+        val order = KeystoreVault.SHORTS_ANCHOR_ORDER
+        val curIdx = order.indexOf(activeSettings.shortsVerticalAnchor.uppercase(Locale.US))
+        val next = order[(curIdx + 1) % order.size]
+        saveAndPushSettings(activeSettings.copy(shortsVerticalAnchor = next))
+    }
+
+    private fun cycleShortsMinimapLoupeLive() {
+        val order = KeystoreVault.SHORTS_MINIMAP_LOUPE_ORDER
+        val curIdx = order.indexOf(activeSettings.shortsMinimapLoupe.uppercase(Locale.US))
+        val next = order[(curIdx + 1) % order.size]
+        saveAndPushSettings(activeSettings.copy(shortsMinimapLoupe = next))
+    }
+
+    private fun cycleShortsScoreLoupeLive() {
+        val order = KeystoreVault.SHORTS_SCORE_LOUPE_ORDER
+        val curIdx = order.indexOf(activeSettings.shortsScoreLoupe.uppercase(Locale.US))
+        val next = order[(curIdx + 1) % order.size]
+        saveAndPushSettings(activeSettings.copy(shortsScoreLoupe = next))
+    }
+
+    private fun toggleShortsHeaderLayoutLive() =
+        saveAndPushSettings(activeSettings.copy(shortsHeaderLayout = !activeSettings.shortsHeaderLayout))
+
     private fun stepLiveBitrate(dir: Int) {
         val destMaxKbps = KeystoreVault.maxVideoBitrateKbpsForDestination(activeSettings)
         val stepsKbps = MASTER_BITRATE_LADDER_KBPS.filter { it <= destMaxKbps }
@@ -2182,20 +2223,24 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
             }
             return
         }
+        // Push SPS/PPS/VPS BEFORE flipping rtmpConnected = true so no live packet precedes headers
+        val sps = cachedSps
+        if (sps != null) {
+            try {
+                sourceClient?.setVideoInfo(
+                    ByteBuffer.wrap(sps),
+                    cachedPps?.let { ByteBuffer.wrap(it) },
+                    cachedVps?.let { ByteBuffer.wrap(it) }
+                )
+            } catch (_: Exception) {
+            }
+        }
         rtmpConnected = true
         rtmpConnectedSinceElapsedMs = SystemClock.elapsedRealtime()
         zeroThroughputStallTicks = 0
         reconnectScheduled.set(false)
         val serverTag = if (usingBackupUrl) "Backup RTMPS (?backup=1)" else "Primary RTMPS"
         DiagnosticsLogger.log("NETWORK", "Connected to $serverTag ingest. Stream is LIVE.")
-        val sps = cachedSps
-        if (sps != null) {
-            sourceClient?.setVideoInfo(
-                ByteBuffer.wrap(sps),
-                cachedPps?.let { ByteBuffer.wrap(it) },
-                cachedVps?.let { ByteBuffer.wrap(it) }
-            )
-        }
         videoPipeline?.requestSyncFrame()
         probeIngestTcpRttIfNeeded()
         mainHandler.post {
@@ -2446,6 +2491,32 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
             }
         }
 
+        internal fun formatCompactShortsAnchorTag(anchor: String): String {
+            return if (anchor.trim().equals("ABOVE_CHAT", ignoreCase = true)) "Pos:ABOVE" else "Pos:CENTER"
+        }
+
+        internal fun formatCompactShortsMinimapLoupeTag(
+            loupe: String,
+            suppressedByShield: Boolean = false
+        ): String {
+            val norm = loupe.trim().uppercase(Locale.US)
+            if (norm == "OFF") return "MapL:OFF"
+            if (suppressedByShield) return "MapL:SHIELD"
+            return when (norm) {
+                "TOP_LEFT" -> "MapL:TL"
+                else -> "MapL:TR"
+            }
+        }
+
+        internal fun formatCompactShortsScoreLoupeTag(loupe: String): String {
+            return when (loupe.trim().uppercase(Locale.US)) {
+                "TOP_LEFT_FEED" -> "FeedL:TL+K"
+                "TOP_LEFT" -> "FeedL:TL"
+                "TOP_CENTER" -> "FeedL:TC"
+                else -> "FeedL:OFF"
+            }
+        }
+
         internal fun buildActiveOverlaysSummary(s: StreamSettings): String {
             val parts = mutableListOf<String>()
             if (s.hudTelemetryEnabled) parts.add("SolHUD (${formatCompactCornerShortTag(s.hudTelemetryCorner)})")
@@ -2454,6 +2525,27 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
             if (s.overlayImageEnabled) parts.add(formatCompactOverlayPositionTag(true, s.overlayPosition))
             if (s.liveBannerEnabled && s.liveBannerText.isNotBlank()) parts.add("Banner (${s.liveBannerPosition})")
             if (s.minimapShieldEnabled) parts.add("MapBlur (${s.minimapShieldCorner})")
+            if (s.isVertical) {
+                val mapSuppressed = SolVideoPipeline.isMinimapLoupeSuppressedByShield(
+                    s.shortsMinimapLoupe,
+                    s.minimapShieldEnabled,
+                    s.minimapShieldCorner
+                )
+                if (s.shortsMinimapLoupe != "OFF" && !mapSuppressed) {
+                    parts.add("MapLoupe (${formatCompactCornerShortTag(s.shortsMinimapLoupe)})")
+                }
+                if (s.shortsScoreLoupe != "OFF") {
+                    val scoreTag = when (s.shortsScoreLoupe.uppercase(Locale.US)) {
+                        "TOP_LEFT_FEED" -> "TL+Feed"
+                        "TOP_CENTER" -> "TC"
+                        else -> "TL"
+                    }
+                    parts.add("ScoreLoupe ($scoreTag)")
+                }
+                if (s.shortsHeaderLayout) {
+                    parts.add("ShortsHeader")
+                }
+            }
             return if (parts.isEmpty()) "None" else parts.joinToString(" + ")
         }
 
