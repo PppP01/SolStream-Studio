@@ -225,6 +225,7 @@ class SolDualAudioEngine(private val context: Context) {
     private var activeSpeakerAecEnabled: Boolean = false
     @Volatile private var effectiveSpeakerAecActive: Boolean = false
     @Volatile private var pendingMicRouteRefresh = false
+    @Volatile private var fastBtEscapeReverifyRequested = false
 
     private val cleanupLock = Any()
     private val fatalErrorReported = AtomicBoolean(false)
@@ -378,6 +379,7 @@ class SolDualAudioEngine(private val context: Context) {
     ): Boolean {
         if (isRunning) return false
         fatalErrorReported.set(false)
+        fastBtEscapeReverifyRequested = false
 
         lastLoggedMicSessionId = -1
         lastLoggedMicRoute = ""
@@ -477,7 +479,7 @@ class SolDualAudioEngine(private val context: Context) {
      */
     private fun registerDynamicAudioRouteWatcher() {
         try {
-            val am = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+            val am = (context.applicationContext ?: context).getSystemService(Context.AUDIO_SERVICE) as AudioManager
             val cb = object : AudioDeviceCallback() {
                 override fun onAudioDevicesAdded(addedDevices: Array<out AudioDeviceInfo>?) {
                     if (!isRunning || addedDevices.isNullOrEmpty()) return
@@ -521,7 +523,7 @@ class SolDualAudioEngine(private val context: Context) {
         val cb = audioDeviceCallback ?: return
         audioDeviceCallback = null
         try {
-            val am = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+            val am = (context.applicationContext ?: context).getSystemService(Context.AUDIO_SERVICE) as AudioManager
             am.unregisterAudioDeviceCallback(cb)
         } catch (_: Exception) {
         }
@@ -590,6 +592,7 @@ class SolDualAudioEngine(private val context: Context) {
         DiagnosticsLogger.lockFinalMicStatusBeforeStop()
         isRunning = false
         pendingMicRouteRefresh = false
+        fastBtEscapeReverifyRequested = false
         unregisterDynamicAudioRouteWatcher()
 
         // Stop micRecord & gameRecord FIRST to immediately unblock any blocking AudioRecord.read() call
@@ -728,10 +731,11 @@ class SolDualAudioEngine(private val context: Context) {
         // preempting Android's InputDispatcher or the game's -19 audio mixer.
         Process.setThreadPriority(Process.THREAD_PRIORITY_AUDIO)
 
+        val appCtx = context.applicationContext ?: context
         var adpfSession: PerformanceHintManager.Session? = null
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             try {
-                val phm = context.getSystemService(PerformanceHintManager::class.java)
+                val phm = appCtx.getSystemService(PerformanceHintManager::class.java)
                 adpfSession = phm?.createHintSession(
                     intArrayOf(Process.myTid()),
                     FRAME_DURATION_US * 1000L
@@ -741,7 +745,7 @@ class SolDualAudioEngine(private val context: Context) {
         }
 
         val audioManager = try {
-            context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+            appCtx.getSystemService(Context.AUDIO_SERVICE) as AudioManager
         } catch (_: Exception) {
             null
         }
@@ -794,8 +798,10 @@ class SolDualAudioEngine(private val context: Context) {
         var lastGameSignalMonoMs = SystemClock.elapsedRealtime()
         var lastDriftCorrectionFrame = 0L
         var wasInPhoneCallInterruption = false
+        var postCallSettleUntilMonoMs = 0L
         var consecutiveClutchFrames = 0
         var wasFootstepOn = false
+        var wasSubFilterActive = false
 
         verifyActiveMicConfiguration(micSession, forceLog = true)
         onStatusChanged?.invoke()
@@ -805,24 +811,36 @@ class SolDualAudioEngine(private val context: Context) {
                 val workStartNs = System.nanoTime()
                 val nowMonoMs = SystemClock.elapsedRealtime()
 
-                // Incoming Phone Call / SIM Ring Privacy Shield
+                // Incoming Phone Call / SIM Ring Privacy Shield + 1.5s Post-Call BT/HAL Settle Window
                 val callMode = try { audioManager?.mode ?: AudioManager.MODE_NORMAL } catch (_: Exception) { AudioManager.MODE_NORMAL }
                 val inPhoneCall = (callMode == AudioManager.MODE_IN_CALL || callMode == AudioManager.MODE_RINGTONE)
                 if (inPhoneCall && !wasInPhoneCallInterruption) {
                     wasInPhoneCallInterruption = true
+                    postCallSettleUntilMonoMs = 0L
                     micStatusText = "CALL PRIVACY MUTE"
                     DiagnosticsLogger.micStatusLabel = micStatusText
                     DiagnosticsLogger.log("CALL_SHIELD", "Incoming/active phone call detected — stream mic auto-muted for privacy.")
                     onStatusChanged?.invoke()
                 } else if (!inPhoneCall && wasInPhoneCallInterruption) {
                     wasInPhoneCallInterruption = false
+                    postCallSettleUntilMonoMs = nowMonoMs + POST_CALL_SETTLE_DELAY_MS
                     pendingMicRouteRefresh = true
-                    DiagnosticsLogger.log("CALL_SHIELD", "Phone call ended — restoring 48 kHz stream studio microphone.")
+                    DiagnosticsLogger.log(
+                        "CALL_SHIELD",
+                        "Phone call ended — waiting 1.5s for Bluetooth/audio route to settle before restoring 48 kHz studio microphone."
+                    )
                 }
 
-                if (pendingMicRouteRefresh && !inPhoneCall && isRunning) {
+                val inPostCallSettle = !inPhoneCall && shouldDeferPostCallMicRestore(nowMonoMs, postCallSettleUntilMonoMs)
+                if (!inPostCallSettle && postCallSettleUntilMonoMs > 0L) {
+                    postCallSettleUntilMonoMs = 0L
+                }
+                val micHoldSilent = inPhoneCall || inPostCallSettle
+
+                if (pendingMicRouteRefresh && !micHoldSilent && isRunning) {
                     pendingMicRouteRefresh = false
                     didClearPreferredDeviceForHalRate = false
+                    fastBtEscapeReverifyRequested = false
                     consecutiveReadErrors = 0
                     consecutiveExactZeroFrames = 0
                     cachedOsSilencedFlag = null
@@ -868,7 +886,7 @@ class SolDualAudioEngine(private val context: Context) {
 
                 // 1. Read 10 ms mono 48 kHz 32-bit float frame from microphone (supports PCM_FLOAT, PCM_16BIT & resampled rates)
                 val activeMic = micSession
-                val micRead = if (inPhoneCall) {
+                val micRead = if (micHoldSilent) {
                     try { Thread.sleep(10) } catch (_: InterruptedException) { break }
                     micMonoBuf.fill(0f)
                     MONO_SAMPLES_PER_10MS
@@ -878,7 +896,7 @@ class SolDualAudioEngine(private val context: Context) {
                 if (!isRunning) break
 
                 var micPeakRaw = 0f
-                if (micRead > 0 && !inPhoneCall) {
+                if (micRead > 0 && !micHoldSilent) {
                     for (i in 0 until MONO_SAMPLES_PER_10MS) {
                         val a = abs(micMonoBuf[i])
                         if (a > micPeakRaw) micPeakRaw = a
@@ -891,7 +909,7 @@ class SolDualAudioEngine(private val context: Context) {
                 // Distinguishes real read failures & OS-silenced sessions from legitimate digital silence
                 // (never restarts a healthy quiet mic when Android reports isClientSilenced == false)
                 // and enforces a 15-second cooldown between recovery attempts.
-                if (!inPhoneCall && isRunning) {
+                if (!micHoldSilent && isRunning) {
                     if (micRead <= 0) {
                         consecutiveReadErrors++
                         consecutiveExactZeroFrames = 0
@@ -1108,6 +1126,12 @@ class SolDualAudioEngine(private val context: Context) {
                 }
                 wasFootstepOn = footOn
 
+                val subFilterActiveNow = subOn || subPunchVoiceGainSmooth > 0.001f
+                if (wasSubFilterActive && !subFilterActiveNow) {
+                    gameSubBandExtractor.reset()
+                }
+                wasSubFilterActive = subFilterActiveNow
+
                 val targetSubVoiceGain = if (!subOn || speechNow) 0.0f else 0.42f
                 val targetSonarLift = if (footOn && rawGameBlastEnv < 0.12f) {
                     ((0.12f - rawGameBlastEnv) / 0.12f).coerceIn(0.0f, 1.0f) * 0.25f
@@ -1286,7 +1310,9 @@ class SolDualAudioEngine(private val context: Context) {
                     }
                 }
 
-                if ((totalFramesMixed % 300L) == 0L && !inPhoneCall && isRunning) {
+                val checkIntervalFrames = if (fastBtEscapeReverifyRequested) 50L else 300L
+                if ((totalFramesMixed % checkIntervalFrames) == 0L && !micHoldSilent && isRunning) {
+                    fastBtEscapeReverifyRequested = false
                     verifyActiveMicConfiguration(micSession, forceLog = false)
                 }
 
@@ -1422,7 +1448,7 @@ class SolDualAudioEngine(private val context: Context) {
             if (direct != null && direct.clientAudioSessionId == rec.audioSessionId) {
                 return direct
             }
-            val am = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+            val am = (context.applicationContext ?: context).getSystemService(Context.AUDIO_SERVICE) as AudioManager
             am.activeRecordingConfigurations.firstOrNull {
                 it.clientAudioSessionId == rec.audioSessionId
             }
@@ -1438,7 +1464,7 @@ class SolDualAudioEngine(private val context: Context) {
             val routedDev = rec.routedDevice
             if (routedDev != null) {
                 // If user is in Auto (-1) mode and Android routed our mic to a Bluetooth SCO/BLE call mic,
-                // immediately lock onto the Phone's Built-in Studio Mic.
+                // immediately lock onto the Phone's Built-in Studio Mic and re-verify quickly (500 ms).
                 val isUnwantedBtMic = activeMicDeviceId == -1 && (
                     routedDev.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO ||
                         routedDev.type == AudioDeviceInfo.TYPE_BLE_HEADSET
@@ -1447,6 +1473,7 @@ class SolDualAudioEngine(private val context: Context) {
                     resolveTargetMicDevice(context, -1)?.let { studioDev ->
                         try { rec.setPreferredDevice(studioDev) } catch (_: Exception) {}
                     }
+                    fastBtEscapeReverifyRequested = true
                 }
 
                 routedMicLabel = "${routedDev.productName} (${DiagnosticsLogger.audioDeviceTypeName(routedDev.type)})"
@@ -1712,10 +1739,18 @@ class SolDualAudioEngine(private val context: Context) {
         private const val TEST_PCM_FILENAME = "sol_mic_test_48k.pcm"
 
         internal const val MAX_TRANSIENT_AAC_RETRIES = 5
+        internal const val POST_CALL_SETTLE_DELAY_MS = 1_500L
         internal const val MIC_RECOVERY_COOLDOWN_MS = 15_000L
         internal const val MIC_RECOVERY_READ_ERROR_FRAMES = 30
         internal const val MIC_RECOVERY_SILENCED_FRAMES = 150
         internal const val MIC_RECOVERY_UNKNOWN_ZERO_FRAMES = 800
+
+        internal fun shouldDeferPostCallMicRestore(
+            nowMonoMs: Long,
+            settleUntilMonoMs: Long
+        ): Boolean {
+            return settleUntilMonoMs > 0L && nowMonoMs < settleUntilMonoMs
+        }
 
         internal fun shouldRetryTransientAacException(
             isTransient: Boolean,
@@ -1803,7 +1838,7 @@ class SolDualAudioEngine(private val context: Context) {
 
         fun hasHeadphonesConnected(context: Context): Boolean {
             return try {
-                val am = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+                val am = (context.applicationContext ?: context).getSystemService(Context.AUDIO_SERVICE) as AudioManager
                 am.getDevices(AudioManager.GET_DEVICES_OUTPUTS).any { out ->
                     out.type == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP ||
                         out.type == AudioDeviceInfo.TYPE_BLE_HEADSET ||
@@ -1822,7 +1857,8 @@ class SolDualAudioEngine(private val context: Context) {
         @SuppressLint("MissingPermission")
         fun inspectPreFlightAudioAndWifiCoexistence(context: Context): String {
             return try {
-                val am = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+                val appCtx = context.applicationContext ?: context
+                val am = appCtx.getSystemService(Context.AUDIO_SERVICE) as AudioManager
                 val outputs = am.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
                 val hasBtOut = outputs.any {
                     it.type == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP ||
@@ -1840,7 +1876,7 @@ class SolDualAudioEngine(private val context: Context) {
                 val maxVol = max(1, am.getStreamMaxVolume(AudioManager.STREAM_MUSIC))
                 val volPct = ((curVol * 100.0f) / maxVol.toFloat()).roundToInt().coerceIn(0, 100)
 
-                val wm = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
+                val wm = appCtx.getSystemService(Context.WIFI_SERVICE) as? WifiManager
                 @Suppress("DEPRECATION")
                 val freqMhz = try { wm?.connectionInfo?.frequency ?: 0 } catch (_: Exception) { 0 }
                 val wifiBandTag = when {
@@ -1878,7 +1914,7 @@ class SolDualAudioEngine(private val context: Context) {
 
         private fun resolveTargetMicDevice(context: Context, preferredDeviceId: Int): AudioDeviceInfo? {
             return try {
-                val am = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+                val am = (context.applicationContext ?: context).getSystemService(Context.AUDIO_SERVICE) as AudioManager
                 val inputs = am.getDevices(AudioManager.GET_DEVICES_INPUTS).filter { it.isSource }
                 if (preferredDeviceId != -1) {
                     return inputs.firstOrNull { it.id == preferredDeviceId }
