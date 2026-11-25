@@ -193,9 +193,10 @@ internal object SolRtmpTelemetryBridge {
 /**
  * Bounded leased-slot pooled Simulcast & Companion RTMP sender:
  * - Exclusively leased PacketSlots (24 video + 32 audio) returned on completion or discard
- * - Per-client callback identity guard & pre-swap connected = false reset
+ * - Per-client callback identity guard, atomic SPS/PPS/VPS header triple & pre-swap connected = false reset
  * - Guarantees SPS/PPS/VPS headers are applied on sendExecutor BEFORE connected flips true
- * - Drains stale queued packets immediately on stop() so disconnect is never blocked
+ * - Auto-reconnects cleanly on both onConnectionFailed, onDisconnect, and sync connect errors (unless auth rejected)
+ * - Interrupts stalled handshakes & drains queued slots immediately on stop()
  */
 internal class SolAuxRtmpTarget(
     val name: String,
@@ -252,11 +253,11 @@ internal class SolAuxRtmpTarget(
     @Volatile var client: RtmpClient? = null
     @Volatile var connected = false
     @Volatile var stopped = false
+    @Volatile private var authRejected = false
     private val reconnecting = AtomicBoolean(false)
 
-    @Volatile private var lastHeaderSps: ByteArray? = null
-    @Volatile private var lastHeaderPps: ByteArray? = null
-    @Volatile private var lastHeaderVps: ByteArray? = null
+    // Single atomic reference so SPS/PPS/VPS can never tear across threads
+    @Volatile private var lastHeaders: Triple<ByteArray, ByteArray?, ByteArray?>? = null
 
     private val videoPoolCap = 24
     private val audioPoolCap = 32
@@ -313,10 +314,24 @@ internal class SolAuxRtmpTarget(
         }
     }
 
+    private fun scheduleAuxReconnect(reason: String) {
+        if (authRejected || stopped || !isSessionStillValid(sessionGen, stopped)) return
+        if (reconnecting.compareAndSet(false, true)) {
+            DiagnosticsLogger.log("AUX_WARN", "$name target disconnected ($reason); retrying in 4s...")
+            postDelayedOnMain(4000L) {
+                reconnecting.set(false)
+                if (!authRejected && isSessionStillValid(sessionGen, stopped)) {
+                    startAsync()
+                }
+            }
+        }
+    }
+
     fun startAsync() {
         stopped = false
+        authRejected = false
         executeControlSafely {
-            if (stopped || !isSessionStillValid(sessionGen, stopped)) {
+            if (stopped || authRejected || !isSessionStillValid(sessionGen, stopped)) {
                 return@executeControlSafely
             }
             // Reset connected BEFORE swapping/disconnecting previous client so no packets race
@@ -355,33 +370,33 @@ internal class SolAuxRtmpTarget(
                 freshClient.setVideoResolution(videoWidth, videoHeight)
                 freshClient.setFps(videoFps)
                 freshClient.setAudioInfo(SolDualAudioEngine.SAMPLE_RATE, true)
-                val sps = lastHeaderSps
-                if (sps != null) {
+                lastHeaders?.let { (sps, pps, vps) ->
                     freshClient.setVideoInfo(
                         ByteBuffer.wrap(sps),
-                        lastHeaderPps?.let { ByteBuffer.wrap(it) },
-                        lastHeaderVps?.let { ByteBuffer.wrap(it) }
+                        pps?.let { ByteBuffer.wrap(it) },
+                        vps?.let { ByteBuffer.wrap(it) }
                     )
                 }
                 freshClient.connect(fullUrl)
             } catch (e: Exception) {
-                DiagnosticsLogger.log("AUX_WARN", "$name connect error (${e.javaClass.simpleName}).")
+                if (freshClient === client && !stopped && isSessionStillValid(sessionGen, stopped)) {
+                    scheduleAuxReconnect("connect error: ${e.javaClass.simpleName}")
+                }
             }
         }
     }
 
     fun sendVideoHeader(sps: ByteArray, pps: ByteArray?, vps: ByteArray?) {
-        lastHeaderSps = sps
-        lastHeaderPps = pps
-        lastHeaderVps = vps
+        val hdr = Triple(sps, pps, vps)
+        lastHeaders = hdr
         if (!connected || stopped) return
         executeControlSafely {
             if (!connected || stopped) return@executeControlSafely
             try {
                 client?.setVideoInfo(
-                    ByteBuffer.wrap(sps),
-                    pps?.let { ByteBuffer.wrap(it) },
-                    vps?.let { ByteBuffer.wrap(it) }
+                    ByteBuffer.wrap(hdr.first),
+                    hdr.second?.let { ByteBuffer.wrap(it) },
+                    hdr.third?.let { ByteBuffer.wrap(it) }
                 )
             } catch (_: Exception) {
             }
@@ -464,19 +479,24 @@ internal class SolAuxRtmpTarget(
         val clientToClose = client
         client = null
 
-        val staleTasks = ArrayList<Runnable>()
-        sendExecutor.queue.drainTo(staleTasks)
+        val staleTasks = try {
+            sendExecutor.shutdownNow()
+        } catch (_: Exception) {
+            emptyList<Runnable>()
+        }
         for (r in staleTasks) {
             (r as? PoolReleasableRunnable)?.releaseSlotOnDiscard()
         }
 
         if (clientToClose != null) {
-            executeControlSafely {
+            Thread({
                 SolRtmpTelemetryBridge.clearCacheSafely(clientToClose)
                 try { clientToClose.disconnect() } catch (_: Exception) {}
+            }, "SolAuxStopClose-$name").apply {
+                isDaemon = true
+                start()
             }
         }
-        try { sendExecutor.shutdown() } catch (_: Exception) {}
     }
 
     internal fun onAuxConnectionSuccess(sourceClient: RtmpClient?) {
@@ -500,26 +520,24 @@ internal class SolAuxRtmpTarget(
             if (stopped || sourceClient !== client || !isSessionStillValid(sessionGen, stopped)) {
                 return@executeControlSafely
             }
-            val ownSps = lastHeaderSps
-            if (ownSps != null) {
+            val own = lastHeaders
+            if (own != null) {
                 try {
                     sourceClient.setVideoInfo(
-                        ByteBuffer.wrap(ownSps),
-                        lastHeaderPps?.let { ByteBuffer.wrap(it) },
-                        lastHeaderVps?.let { ByteBuffer.wrap(it) }
+                        ByteBuffer.wrap(own.first),
+                        own.second?.let { ByteBuffer.wrap(it) },
+                        own.third?.let { ByteBuffer.wrap(it) }
                     )
                 } catch (_: Exception) {
                 }
             } else if (usesSharedPrimaryHeaders) {
-                fallbackPrimaryHeaders()?.let { (fbSps, fbPps, fbVps) ->
-                    lastHeaderSps = fbSps
-                    lastHeaderPps = fbPps
-                    lastHeaderVps = fbVps
+                fallbackPrimaryHeaders()?.let { fb ->
+                    lastHeaders = fb
                     try {
                         sourceClient.setVideoInfo(
-                            ByteBuffer.wrap(fbSps),
-                            fbPps?.let { ByteBuffer.wrap(it) },
-                            fbVps?.let { ByteBuffer.wrap(it) }
+                            ByteBuffer.wrap(fb.first),
+                            fb.second?.let { ByteBuffer.wrap(it) },
+                            fb.third?.let { ByteBuffer.wrap(it) }
                         )
                     } catch (_: Exception) {
                     }
@@ -535,28 +553,24 @@ internal class SolAuxRtmpTarget(
             return
         }
         connected = false
-        DiagnosticsLogger.log("AUX_WARN", "$name target disconnected ($reason); retrying in 4s...")
         postOnMain { onStateChanged() }
-        if (reconnecting.compareAndSet(false, true)) {
-            postDelayedOnMain(4000L) {
-                reconnecting.set(false)
-                if (isSessionStillValid(sessionGen, stopped)) {
-                    startAsync()
-                }
-            }
-        }
+        scheduleAuxReconnect(reason)
     }
 
     internal fun onAuxDisconnect(sourceClient: RtmpClient?) {
         if (sourceClient !== client) return
         connected = false
         postOnMain { onStateChanged() }
+        if (!authRejected && isSessionStillValid(sessionGen, stopped)) {
+            scheduleAuxReconnect("server closed connection")
+        }
     }
 
     internal fun onAuxAuthError(sourceClient: RtmpClient?) {
         if (sourceClient !== client || !isSessionStillValid(sessionGen, stopped)) {
             return
         }
+        authRejected = true
         connected = false
         DiagnosticsLogger.log("AUX_AUTH_ERR", "$name stream key rejected by server.")
         postOnMain { onStateChanged() }
