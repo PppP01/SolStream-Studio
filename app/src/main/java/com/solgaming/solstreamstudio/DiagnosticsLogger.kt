@@ -91,7 +91,7 @@ data class BenchmarkSnapshot(
 
 object DiagnosticsLogger {
 
-    const val ENGINE_VERSION = "v1.5.2"
+    const val ENGINE_VERSION = "v1.6.0"
 
     private const val MAX_EVENTS = 160
     private const val MAX_CLIPS = 60
@@ -203,6 +203,19 @@ object DiagnosticsLogger {
         return socMarkers.any { t.contains(it) }
     }
 
+    /**
+     * Parses sysfs thermal_zone temp readings reported in millidegrees (42500 -> 42.5°C),
+     * decidegrees (425 -> 42.5°C), or whole degrees (42 -> 42.0°C). Returns -1f if out of range.
+     */
+    internal fun parseThermalZoneTempC(rawValue: Long): Float {
+        val degC = when {
+            rawValue > 1000L -> rawValue / 1000.0f
+            rawValue in 200L..1150L -> rawValue / 10.0f
+            else -> rawValue.toFloat()
+        }
+        return if (degC in 20.0f..115.0f) degC else -1f
+    }
+
     @Synchronized
     internal fun resetSessionLifecycleForTests() {
         sessionStartMs = 0L
@@ -211,6 +224,9 @@ object DiagnosticsLogger {
         activeOverlaysDesc = "None"
         droppedVideoFrames = 0
         droppedAudioFrames = 0
+        lastBitrateKbps = 0
+        bitrateSamplesSumKbps = 0L
+        bitrateSamplesCount = 0L
         lastRttMs = -1L
         lastRttSourceLabel = ""
         events.clear()
@@ -221,7 +237,7 @@ object DiagnosticsLogger {
         if (crashHandlerInstalled) return
         synchronized(this) {
             if (crashHandlerInstalled) return
-            val appCtx = context.applicationContext
+            val appCtx = context.applicationContext ?: context
             loadPersistedClipsIfEmpty(appCtx)
             val previousHandler = Thread.getDefaultUncaughtExceptionHandler()
             Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
@@ -329,7 +345,7 @@ object DiagnosticsLogger {
     fun clearSavedClips(context: Context) {
         clipHighlights.clear()
         try {
-            context.applicationContext.getSharedPreferences(PREFS_BENCH, Context.MODE_PRIVATE)
+            (context.applicationContext ?: context).getSharedPreferences(PREFS_BENCH, Context.MODE_PRIVATE)
                 .edit()
                 .remove(KEY_SAVED_CLIPS_JSON)
                 .apply()
@@ -360,7 +376,7 @@ object DiagnosticsLogger {
         try {
             val arr = JSONArray()
             for (c in clipHighlights) arr.put(c)
-            context.applicationContext.getSharedPreferences(PREFS_BENCH, Context.MODE_PRIVATE)
+            (context.applicationContext ?: context).getSharedPreferences(PREFS_BENCH, Context.MODE_PRIVATE)
                 .edit()
                 .putString(KEY_SAVED_CLIPS_JSON, arr.toString())
                 .apply()
@@ -372,7 +388,7 @@ object DiagnosticsLogger {
     private fun loadPersistedClipsIfEmpty(context: Context) {
         if (clipHighlights.isNotEmpty()) return
         try {
-            val raw = context.applicationContext
+            val raw = (context.applicationContext ?: context)
                 .getSharedPreferences(PREFS_BENCH, Context.MODE_PRIVATE)
                 .getString(KEY_SAVED_CLIPS_JSON, null) ?: return
             val arr = JSONArray(raw)
@@ -400,7 +416,7 @@ object DiagnosticsLogger {
                 isLiveCheckpoint = true,
                 skipHealthResample = skipHealthResample
             )
-            context.applicationContext.getSharedPreferences(PREFS_BENCH, Context.MODE_PRIVATE)
+            (context.applicationContext ?: context).getSharedPreferences(PREFS_BENCH, Context.MODE_PRIVATE)
                 .edit()
                 .putBoolean(KEY_LIVE_CHECKPOINT_ACTIVE, true)
                 .putString(KEY_LIVE_CHECKPOINT_LABEL, label)
@@ -414,7 +430,7 @@ object DiagnosticsLogger {
     @Synchronized
     fun clearLiveCheckpoint(context: Context) {
         try {
-            context.applicationContext.getSharedPreferences(PREFS_BENCH, Context.MODE_PRIVATE)
+            (context.applicationContext ?: context).getSharedPreferences(PREFS_BENCH, Context.MODE_PRIVATE)
                 .edit()
                 .putBoolean(KEY_LIVE_CHECKPOINT_ACTIVE, false)
                 .remove(KEY_LIVE_CHECKPOINT_LABEL)
@@ -427,7 +443,7 @@ object DiagnosticsLogger {
 
     fun hasUnfinishedLiveCheckpoint(context: Context): Boolean {
         return try {
-            val prefs = context.applicationContext.getSharedPreferences(PREFS_BENCH, Context.MODE_PRIVATE)
+            val prefs = (context.applicationContext ?: context).getSharedPreferences(PREFS_BENCH, Context.MODE_PRIVATE)
             prefs.getBoolean(KEY_LIVE_CHECKPOINT_ACTIVE, false) &&
                 !prefs.getString(KEY_LIVE_CHECKPOINT_REPORT, null).isNullOrBlank()
         } catch (_: Exception) {
@@ -437,7 +453,7 @@ object DiagnosticsLogger {
 
     fun getRecoveredLiveCheckpointSummaryLabel(context: Context): String? {
         return try {
-            val prefs = context.applicationContext.getSharedPreferences(PREFS_BENCH, Context.MODE_PRIVATE)
+            val prefs = (context.applicationContext ?: context).getSharedPreferences(PREFS_BENCH, Context.MODE_PRIVATE)
             if (!prefs.getBoolean(KEY_LIVE_CHECKPOINT_ACTIVE, false)) return null
             prefs.getString(KEY_LIVE_CHECKPOINT_LABEL, null)?.takeIf { it.isNotBlank() }
         } catch (_: Exception) {
@@ -447,7 +463,7 @@ object DiagnosticsLogger {
 
     fun getRecoveredLiveCheckpointReport(context: Context): String? {
         return try {
-            val prefs = context.applicationContext.getSharedPreferences(PREFS_BENCH, Context.MODE_PRIVATE)
+            val prefs = (context.applicationContext ?: context).getSharedPreferences(PREFS_BENCH, Context.MODE_PRIVATE)
             if (!prefs.getBoolean(KEY_LIVE_CHECKPOINT_ACTIVE, false)) return null
             val raw = prefs.getString(KEY_LIVE_CHECKPOINT_REPORT, null)?.takeIf { it.isNotBlank() } ?: return null
             "=== RECOVERED 60s LIVE CHECKPOINT (Session Ended Unexpectedly by OS) ===\n$raw"
@@ -527,7 +543,7 @@ object DiagnosticsLogger {
 
     fun captureLiveAudioPolicySnapshot(context: Context) {
         try {
-            val am = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+            val am = (context.applicationContext ?: context).getSystemService(Context.AUDIO_SERVICE) as AudioManager
             val configs: List<AudioRecordingConfiguration> = am.activeRecordingConfigurations
             if (configs.isNotEmpty()) {
                 lastActiveAudioPolicySnapshot = configs.joinToString(" | ") { cfg ->
@@ -614,7 +630,7 @@ object DiagnosticsLogger {
             droppedFrames = droppedVideoFrames,
             reconnects = reconnectAttempts
         )
-        val prefs = context.applicationContext.getSharedPreferences(PREFS_BENCH, Context.MODE_PRIVATE)
+        val prefs = (context.applicationContext ?: context).getSharedPreferences(PREFS_BENCH, Context.MODE_PRIVATE)
         prefs.edit()
             .putString(if (isGlipBaseline) KEY_LAST_GLIP_BENCH else KEY_LAST_SOL_BENCH, snap.toJson().toString())
             .apply()
@@ -624,7 +640,7 @@ object DiagnosticsLogger {
 
     fun readBatteryTempC(context: Context): Float {
         return try {
-            val intent = context.applicationContext.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+            val intent = (context.applicationContext ?: context).registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
             val tenths = intent?.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, -1) ?: -1
             if (tenths in 50..850) tenths / 10.0f else 0f
         } catch (_: Exception) {
@@ -634,7 +650,7 @@ object DiagnosticsLogger {
 
     /**
      * Reads peak temperature across verified CPU/SoC/GPU thermal zones only (checking each zone's `type`
-     * file first). Returns -1f if SELinux blocks /sys/class/thermal or no verified SoC zone is readable.
+     * file first). Supports millidegrees, decidegrees, and whole degrees. Returns -1f if SELinux blocks /sys/class/thermal.
      */
     private fun readOptionalSocTempC(): Float {
         return try {
@@ -648,8 +664,8 @@ object DiagnosticsLogger {
                 val tempFile = File("/sys/class/thermal/thermal_zone$idx/temp")
                 if (!tempFile.canRead()) continue
                 val raw = tempFile.readText().trim().toLongOrNull() ?: continue
-                val degC = if (raw > 1000L) raw / 1000.0f else raw.toFloat()
-                if (degC in 20.0f..115.0f && degC > maxSocTemp) {
+                val degC = parseThermalZoneTempC(raw)
+                if (degC > maxSocTemp) {
                     maxSocTemp = degC
                 }
             }
@@ -661,7 +677,7 @@ object DiagnosticsLogger {
 
     fun readBatteryPercentage(context: Context): Int {
         return try {
-            val intent = context.applicationContext.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+            val intent = (context.applicationContext ?: context).registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
             val level = intent?.getIntExtra(BatteryManager.EXTRA_LEVEL, -1) ?: -1
             val scale = intent?.getIntExtra(BatteryManager.EXTRA_SCALE, 100) ?: 100
             if (level >= 0 && scale > 0) ((level * 100) / scale).coerceIn(0, 100) else 100
@@ -672,7 +688,7 @@ object DiagnosticsLogger {
 
     fun isBatteryChargingOrPlugged(context: Context): Boolean {
         return try {
-            val intent = context.applicationContext.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+            val intent = (context.applicationContext ?: context).registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
             val plugged = intent?.getIntExtra(BatteryManager.EXTRA_PLUGGED, 0) ?: 0
             plugged != 0
         } catch (_: Exception) {
@@ -683,7 +699,7 @@ object DiagnosticsLogger {
     fun readThermalStatus(context: Context): Int {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return 0
         return try {
-            val pm = context.getSystemService(Context.POWER_SERVICE) as PowerManager
+            val pm = (context.applicationContext ?: context).getSystemService(Context.POWER_SERVICE) as PowerManager
             pm.currentThermalStatus
         } catch (_: Exception) {
             0
@@ -748,7 +764,7 @@ object DiagnosticsLogger {
         }
         loadPersistedClipsIfEmpty(context)
         val scan = CodecCapabilityProbe.peekCachedOrPlaceholder(context)
-        val prefs = context.applicationContext.getSharedPreferences(PREFS_BENCH, Context.MODE_PRIVATE)
+        val prefs = (context.applicationContext ?: context).getSharedPreferences(PREFS_BENCH, Context.MODE_PRIVATE)
         val lastSol = BenchmarkSnapshot.fromJson(prefs.getString(KEY_LAST_SOL_BENCH, null))
         val lastGlip = BenchmarkSnapshot.fromJson(prefs.getString(KEY_LAST_GLIP_BENCH, null))
         val lastCrash = prefs.getString(KEY_LAST_CRASH, null)
