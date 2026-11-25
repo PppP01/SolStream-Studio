@@ -14,13 +14,18 @@ import android.content.ClipDescription
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
+import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.Paint
+import android.graphics.RectF
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.net.Uri
 import android.os.Build
 import android.os.PersistableBundle
 import android.util.TypedValue
+import android.view.Gravity
+import android.view.View
 import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.ScrollView
@@ -30,6 +35,7 @@ import androidx.appcompat.app.AlertDialog
 import com.solgaming.solstreamstudio.DiagnosticsLogger
 import com.solgaming.solstreamstudio.KeystoreVault
 import com.solgaming.solstreamstudio.SolStreamService
+import com.solgaming.solstreamstudio.SolVideoPipeline
 import com.solgaming.solstreamstudio.StreamSettings
 import org.json.JSONObject
 import java.net.InetAddress
@@ -47,8 +53,9 @@ import kotlin.math.min
 import kotlin.math.roundToInt
 
 /**
- * Modular dashboard dialogs, visual user guide cards, Accessibility prominent disclosure,
- * Session Reports / Saved Clips viewers, 5-Metric Network Analyzer, and GitHub Update Checker.
+ * Modular dashboard dialogs, visual user guide cards, YouTube Shorts 9:16 Safe-Zone Previewer,
+ * Accessibility prominent disclosure, Session Reports / Saved Clips viewers,
+ * 5-Metric Network Analyzer, and GitHub Update Checker.
  */
 object DashboardDialogs {
 
@@ -59,17 +66,21 @@ object DashboardDialogs {
         get() = netTestBusy.get()
 
     fun copyPlainTextToClipboard(context: Context, label: String, text: String) {
-        val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-        val clip = ClipData.newPlainText(label, text)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            try {
-                clip.description.extras = PersistableBundle().apply {
-                    putBoolean(ClipDescription.EXTRA_IS_SENSITIVE, false)
+        try {
+            val appCtx = context.applicationContext ?: context
+            val cm = appCtx.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+            val clip = ClipData.newPlainText(label, text)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                try {
+                    clip.description.extras = PersistableBundle().apply {
+                        putBoolean(ClipDescription.EXTRA_IS_SENSITIVE, false)
+                    }
+                } catch (_: Exception) {
                 }
-            } catch (_: Exception) {
             }
+            cm.setPrimaryClip(clip)
+        } catch (_: Exception) {
         }
-        cm.setPrimaryClip(clip)
     }
 
     fun buildBrandAntiKillOneLiner(): String {
@@ -88,6 +99,345 @@ object DashboardDialogs {
         }
     }
 
+    /**
+     * In-App 9:16 YouTube Shorts Safe-Zone Visual Previewer (v1.6.0 SolShorts™ Studio).
+     * Mirrors SolVideoPipeline.kt's exact NDC math so users can inspect gameplay height,
+     * ABOVE_CHAT shift, Tactical Minimap & Score+Killfeed Loupes, and Shorts UI dead zones
+     * before tapping GO LIVE.
+     */
+    fun showShortsSafeZonePreviewDialog(
+        activity: Activity,
+        settings: StreamSettings
+    ) {
+        val dm = activity.resources.displayMetrics
+        val panelLong = max(dm.widthPixels, dm.heightPixels).coerceAtLeast(1280)
+        val panelShort = min(dm.widthPixels, dm.heightPixels).coerceAtLeast(720)
+        val srcAspect = (panelLong.toFloat() / panelShort.toFloat()).coerceIn(1.75f, 2.35f)
+        val dstAspect = 9.0f / 16.0f
+
+        val framing = settings.framingMode.uppercase(Locale.US)
+        val zoomPct = settings.smartZoomPercent.coerceIn(100, 250)
+        val sideCropPct = when {
+            framing == "FILL" -> (((1.0f - (dstAspect / srcAspect)) * 50.0f).coerceIn(0f, 45f))
+            framing == "SMART" && zoomPct > 100 -> (((1.0f - (100.0f / zoomPct.toFloat())) * 50.0f).coerceIn(0f, 40f))
+            else -> 0.0f
+        }
+        val (capW, capH) = SolVideoPipeline.scaleCaptureForShortsCooler(
+            rawW = panelLong,
+            rawH = panelShort,
+            framingMode = framing,
+            smartZoomPercent = zoomPct,
+            coolerEnabled = settings.shortsCaptureCooler
+        )
+        val rawPx = panelLong.toLong() * panelShort.toLong()
+        val capPx = capW.toLong() * capH.toLong()
+        val bandwidthSavedPct = if (rawPx > 0L && capPx < rawPx) {
+            (((rawPx - capPx) * 100L) / rawPx).toInt()
+        } else {
+            0
+        }
+
+        val container = LinearLayout(activity).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_HORIZONTAL
+            setBackgroundColor(Color.parseColor("#050A14"))
+            setPadding(dp(activity, 14), dp(activity, 12), dp(activity, 14), dp(activity, 10))
+        }
+
+        val previewView = ShortsPreviewCanvasView(activity, settings, srcAspect)
+        container.addView(
+            previewView,
+            LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { bottomMargin = dp(activity, 10) }
+        )
+
+        val mapSuppressed = SolVideoPipeline.isMinimapLoupeSuppressedByShield(
+            settings.shortsMinimapLoupe,
+            settings.minimapShieldEnabled,
+            settings.minimapShieldCorner
+        )
+        val coolerLine = if (settings.shortsCaptureCooler && bandwidthSavedPct > 0) {
+            "Capture Cooler: ON (${capW}×${capH} • -${bandwidthSavedPct}% capture bandwidth)"
+        } else {
+            "Capture Cooler: OFF (Full ${panelLong}×${panelShort} panel capture)"
+        }
+        val loupeLine = "Loupes: Score=${settings.shortsScoreLoupe} • Minimap=" +
+            if (mapSuppressed) "${settings.shortsMinimapLoupe} (Paused by Blur Shield)" else settings.shortsMinimapLoupe
+
+        val infoTv = TextView(activity).apply {
+            text = buildString {
+                append("Framing: $framing")
+                if (framing == "SMART") append(" ($zoomPct% • ~${String.format(Locale.US, "%.0f%%", sideCropPct)} side crop)")
+                append(" • Anchor: ${settings.shortsVerticalAnchor}\n")
+                append("$loupeLine\n")
+                append("$coolerLine\n")
+                append("Red zones = YouTube Shorts LIVE header (15%), Live Chat (35%) & Right Like/Share buttons (18%).")
+            }
+            setTextColor(Color.parseColor("#CBD5E1"))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 10.8f)
+            setLineSpacing(dp(activity, 2).toFloat(), 1.0f)
+        }
+        container.addView(infoTv)
+
+        val scroll = ScrollView(activity).apply {
+            setBackgroundColor(Color.parseColor("#050A14"))
+            addView(container)
+        }
+        AlertDialog.Builder(activity)
+            .setTitle("👁️ 9:16 YouTube Shorts Safe-Zone Preview")
+            .setView(scroll)
+            .setPositiveButton("Got It", null)
+            .show()
+    }
+
+    private class ShortsPreviewCanvasView(
+        context: Context,
+        private val settings: StreamSettings,
+        private val srcAspect: Float
+    ) : View(context) {
+        private val dstAspect = 9.0f / 16.0f
+        private val density = context.resources.displayMetrics.density
+
+        private val bgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
+        private val frameStrokePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.STROKE
+            color = Color.parseColor("#38BDF8")
+            strokeWidth = 2f * density
+        }
+        private val gameFillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.FILL
+            color = Color.parseColor("#12304D")
+        }
+        private val gameStrokePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.STROKE
+            color = Color.parseColor("#00E5FF")
+            strokeWidth = 2f * density
+        }
+        private val loupeFillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.FILL
+            color = Color.parseColor("#0B2A3D")
+        }
+        private val loupeStrokePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.STROKE
+            color = Color.parseColor("#00E5FF")
+            strokeWidth = 1.5f * density
+        }
+        private val deadZonePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.FILL
+            color = Color.argb(72, 255, 23, 68)
+        }
+        private val deadZoneStrokePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.STROKE
+            color = Color.argb(145, 255, 82, 82)
+            strokeWidth = 1f * density
+        }
+        private val overlayChipPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.FILL
+            color = Color.parseColor("#4C1D95")
+        }
+        private val labelPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.parseColor("#F8FAFC")
+            textAlign = Paint.Align.CENTER
+            typeface = Typeface.DEFAULT_BOLD
+            textSize = 10f * density
+        }
+        private val smallLabelPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.parseColor("#E0F2FE")
+            textAlign = Paint.Align.CENTER
+            typeface = Typeface.DEFAULT_BOLD
+            textSize = 8.2f * density
+        }
+        private val deadLabelPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.parseColor("#FDA4AF")
+            textAlign = Paint.Align.CENTER
+            typeface = Typeface.DEFAULT_BOLD
+            textSize = 8.5f * density
+        }
+        private val tmpRect = RectF()
+
+        override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
+            val screenH = context.resources.displayMetrics.heightPixels
+            val screenW = context.resources.displayMetrics.widthPixels
+            val maxH = min((400f * density).roundToInt(), (screenH * 0.48f).roundToInt()).coerceAtLeast((240f * density).roundToInt())
+            val maxW = (screenW * 0.72f).roundToInt().coerceAtLeast((150f * density).roundToInt())
+            var h = maxH
+            var w = (h * dstAspect).roundToInt()
+            if (w > maxW) {
+                w = maxW
+                h = (w / dstAspect).roundToInt()
+            }
+            setMeasuredDimension(w, h)
+        }
+
+        private fun ndcX(x: Float, w: Float): Float = (x + 1.0f) * 0.5f * w
+        private fun ndcY(y: Float, h: Float): Float = (1.0f - y) * 0.5f * h
+
+        override fun onDraw(canvas: Canvas) {
+            super.onDraw(canvas)
+            val w = width.toFloat()
+            val h = height.toFloat()
+            if (w <= 4f || h <= 4f) return
+
+            // 1. Canvas Backdrop
+            bgPaint.color = when (settings.shortsBackdropMode.uppercase(Locale.US)) {
+                "DARK" -> Color.parseColor("#070B14")
+                "POSTER" -> Color.parseColor("#1A1330")
+                else -> Color.parseColor("#0F1A2E")
+            }
+            tmpRect.set(0f, 0f, w, h)
+            canvas.drawRect(tmpRect, bgPaint)
+
+            // 2. Gameplay Window (exact SolVideoPipeline NDC math)
+            val framing = settings.framingMode.uppercase(Locale.US)
+            val zoomPct = settings.smartZoomPercent.coerceIn(100, 250)
+            val activeZoom = if (framing == "SMART") zoomPct / 100.0f else 1.0f
+            val sharpScaleY = if (framing == "FILL") {
+                1.0f
+            } else {
+                ((dstAspect / srcAspect) * activeZoom).coerceIn(0.10f, 1.50f)
+            }
+            val translateY = SolVideoPipeline.computeShortsVerticalOffsetNdc(
+                isVerticalDst = true,
+                isLandscapeSrc = true,
+                framingMode = framing,
+                sharpScaleY = sharpScaleY,
+                anchorMode = settings.shortsVerticalAnchor
+            )
+            val topNdc = (translateY + sharpScaleY).coerceIn(-1.0f, 1.0f)
+            val botNdc = (translateY - sharpScaleY).coerceIn(-1.0f, 1.0f)
+
+            tmpRect.set(0f, ndcY(topNdc, h), w, ndcY(botNdc, h))
+            canvas.drawRect(tmpRect, gameFillPaint)
+            canvas.drawRect(tmpRect, gameStrokePaint)
+
+            val gameCenterY = (tmpRect.top + tmpRect.bottom) * 0.5f
+            val mainText = if (framing == "SMART") "GAMEPLAY ($framing $zoomPct%)" else "GAMEPLAY ($framing)"
+            canvas.drawText(mainText, w * 0.5f, gameCenterY + (3.5f * density), labelPaint)
+
+            // 3. Tactical HUD Loupes above gameplay (exact SolVideoPipeline math)
+            if (framing != "FILL") {
+                val scoreCrop = SolVideoPipeline.resolveShortsLoupeSourceCrop(settings.shortsScoreLoupe, isMinimap = false)
+                val mapSuppressed = SolVideoPipeline.isMinimapLoupeSuppressedByShield(
+                    settings.shortsMinimapLoupe,
+                    settings.minimapShieldEnabled,
+                    settings.minimapShieldCorner
+                )
+                val mapCrop = if (mapSuppressed) {
+                    null
+                } else {
+                    SolVideoPipeline.resolveShortsLoupeSourceCrop(settings.shortsMinimapLoupe, isMinimap = true)
+                }
+                val gameTopClamped = topNdc.coerceIn(-0.60f, 0.92f)
+                val slotBottomNdc = gameTopClamped + 0.018f
+                val slotTopNdc = min(0.86f, slotBottomNdc + 0.34f)
+                if (slotTopNdc - slotBottomNdc >= 0.08f) {
+                    if (scoreCrop != null) {
+                        val cropAspect = ((scoreCrop.x1 - scoreCrop.x0) * srcAspect) /
+                            max(0.05f, scoreCrop.yBot - scoreCrop.yTop)
+                        SolVideoPipeline.computeShortsLoupeDestNdc(
+                            slotLeftNdc = -0.94f,
+                            slotRightNdc = -0.02f,
+                            slotBottomNdc = slotBottomNdc,
+                            slotTopNdc = slotTopNdc,
+                            cropAspect = cropAspect,
+                            dstAspect = dstAspect,
+                            alignRight = false
+                        )?.let { dest ->
+                            tmpRect.set(ndcX(dest.left, w), ndcY(dest.top, h), ndcX(dest.right, w), ndcY(dest.bottom, h))
+                            canvas.drawRect(tmpRect, loupeFillPaint)
+                            canvas.drawRect(tmpRect, loupeStrokePaint)
+                            val lbl = if (settings.shortsScoreLoupe == "TOP_LEFT_FEED") "SCORE+FEED" else "SCORE"
+                            canvas.drawText(lbl, tmpRect.centerX(), tmpRect.centerY() + (3f * density), smallLabelPaint)
+                        }
+                    }
+                    if (mapCrop != null) {
+                        val cropAspect = ((mapCrop.x1 - mapCrop.x0) * srcAspect) /
+                            max(0.05f, mapCrop.yBot - mapCrop.yTop)
+                        SolVideoPipeline.computeShortsLoupeDestNdc(
+                            slotLeftNdc = 0.02f,
+                            slotRightNdc = 0.94f,
+                            slotBottomNdc = slotBottomNdc,
+                            slotTopNdc = slotTopNdc,
+                            cropAspect = cropAspect,
+                            dstAspect = dstAspect,
+                            alignRight = true
+                        )?.let { dest ->
+                            tmpRect.set(ndcX(dest.left, w), ndcY(dest.top, h), ndcX(dest.right, w), ndcY(dest.bottom, h))
+                            canvas.drawRect(tmpRect, loupeFillPaint)
+                            canvas.drawRect(tmpRect, loupeStrokePaint)
+                            canvas.drawText("MINIMAP", tmpRect.centerX(), tmpRect.centerY() + (3f * density), smallLabelPaint)
+                        }
+                    }
+                }
+            }
+
+            // 4. Active Pro Overlays indicator badges (SolHUD / QR / PNGTuber)
+            val useHeader = settings.shortsHeaderLayout
+            if (settings.hudTelemetryEnabled) {
+                val c = if (useHeader) "TOP_LEFT" else settings.hudTelemetryCorner
+                drawCornerPreviewBadge(canvas, w, h, c, "HUD", if (useHeader) 0.08f else 0.02f, 0.34f, 0.045f)
+            }
+            if (settings.qrOverlayEnabled && settings.qrOverlayText.isNotBlank()) {
+                val c = if (useHeader && settings.qrOverlayCorner.startsWith("BOTTOM_")) "TOP_RIGHT" else settings.qrOverlayCorner
+                drawCornerPreviewBadge(canvas, w, h, c, "QR", if (useHeader) 0.08f else 0.02f, 0.19f, 0.105f)
+            }
+            if (settings.pngTuberEnabled) {
+                val c = if (useHeader) {
+                    when (settings.pngTuberCorner) {
+                        "BOTTOM_RIGHT" -> "TOP_RIGHT"
+                        "BOTTOM_LEFT" -> "TOP_LEFT"
+                        else -> settings.pngTuberCorner
+                    }
+                } else {
+                    settings.pngTuberCorner
+                }
+                drawCornerPreviewBadge(canvas, w, h, c, "AVATAR", if (useHeader) 0.13f else 0.03f, 0.24f, 0.12f)
+            }
+
+            // 5. YouTube Shorts UI Dead Zones (Top 15%, Bottom 35%, Right 18% action buttons)
+            tmpRect.set(0f, 0f, w, h * 0.15f)
+            canvas.drawRect(tmpRect, deadZonePaint)
+            canvas.drawRect(tmpRect, deadZoneStrokePaint)
+            canvas.drawText("YT TOP BAR (15%)", w * 0.5f, h * 0.085f, deadLabelPaint)
+
+            tmpRect.set(w * 0.82f, h * 0.45f, w, h * 0.65f)
+            canvas.drawRect(tmpRect, deadZonePaint)
+            canvas.drawRect(tmpRect, deadZoneStrokePaint)
+            canvas.drawText("LIKE", tmpRect.centerX(), tmpRect.centerY() + (3f * density), deadLabelPaint)
+
+            tmpRect.set(0f, h * 0.65f, w, h)
+            canvas.drawRect(tmpRect, deadZonePaint)
+            canvas.drawRect(tmpRect, deadZoneStrokePaint)
+            canvas.drawText("YT LIVE CHAT & CHANNEL (35%)", w * 0.5f, h * 0.83f, deadLabelPaint)
+
+            // Outer 9:16 border
+            tmpRect.set(1f, 1f, w - 1f, h - 1f)
+            canvas.drawRect(tmpRect, frameStrokePaint)
+        }
+
+        private fun drawCornerPreviewBadge(
+            canvas: Canvas,
+            w: Float,
+            h: Float,
+            corner: String,
+            text: String,
+            topExtraFrac: Float,
+            wFrac: Float,
+            hFrac: Float
+        ) {
+            val bw = w * wFrac
+            val bh = h * hFrac
+            val margin = w * 0.03f
+            val left = if (corner.endsWith("RIGHT")) (w - bw - margin) else margin
+            val top = if (corner.startsWith("BOTTOM_")) (h - bh - h * 0.03f) else (h * topExtraFrac)
+            tmpRect.set(left, top, left + bw, top + bh)
+            canvas.drawRoundRect(tmpRect, 4f * density, 4f * density, overlayChipPaint)
+            canvas.drawText(text, tmpRect.centerX(), tmpRect.centerY() + (2.8f * density), smallLabelPaint)
+        }
+    }
+
     fun showPlainEnglishGlossaryDialog(
         activity: Activity,
         appVersionName: String,
@@ -100,7 +450,7 @@ object DashboardDialogs {
                     "1. App Info → Battery → Unrestricted.\n" +
                     "2. Device Care → Memory → Excluded apps → add BOTH SolStream Studio and your game.\n" +
                     "3. Device Care → Memory → RAM Plus → OFF (prevents background disk-swap freezes on 8 GB phones).\n" +
-                    "4. Game Booster → Enable 'Pause USB PD charging when gaming' with a 25W+ PPS charger for cooler sessions."
+                    "4. Game Booster → Plug in your 25W+ PPS charger BEFORE opening your game and enable 'Pause USB PD charging when gaming' for cooler sessions."
             mfr.contains("xiaomi") || mfr.contains("redmi") || mfr.contains("poco") ->
                 "★ YOUR DEVICE: XIAOMI / POCO / REDMI (${Build.MODEL})\n" +
                     "1. App Info → Battery Saver → No restrictions.\n" +
@@ -171,11 +521,11 @@ object DashboardDialogs {
         guideContainer.addView(
             makeGuideCard(
                 context = activity,
-                badgeText = "CARD 4 • CONTROLS, PRO OVERLAYS & VIDEO",
-                titleText = "Floating Pill, SolHUD™, QR, PNGTuber & Thumbnails",
-                bodyContent = "• Floating Pill: Double-tap or hold the compact pill to open 3 tabs (Audio, Video, Bitrate/Net) with separate App CPU % and Android Thermal Pressure % telemetry. Tap 📸 Shot in Video tab to save a clean pill-free 1080p YouTube thumbnail to Pictures/SolStream/.\n" +
+                badgeText = "CARD 4 • SOLSHORTS™ STUDIO, PRO OVERLAYS & PILL",
+                titleText = "9:16 Tactical Loupes, Safe-Zone Anchor, SolHUD™ & Thumbnails",
+                bodyContent = "• SolShorts™ Studio (Opt-In, Zero Locks/Caps): Keep 135–150% zoomed gameplay big while optionally docking zero-copy Minimap & Score+Killfeed Loupes in the open space above gameplay, shift gameplay ABOVE CHAT (+10%), use the ~50%-lighter Shorts Capture Cooler, and verify your framing with the 👁️ 9:16 Safe-Zone Previewer in Card 3.\n" +
+                    "• Floating Pill: Double-tap or hold the compact pill to open 3 tabs (Audio, Video, Bitrate/Net) with separate App CPU % and Android Thermal Pressure % telemetry. Tap 📸 Shot in Video tab to save a clean pill-free 1080p YouTube thumbnail to Pictures/SolStream/.\n" +
                     "• Pro Overlays (Opt-In, 0 MB VRAM When OFF): Turn on SolHUD™ (live FPS • °C • Mbps visible even in Single-App Capture), offline Corner QR (UPI / YouTube / Discord), or zero-camera 2-PNG PNGTuber Avatar.\n" +
-                    "• Studio Profiles: Tap any of the 4 profiles in Card 2 to switch setups in 1 tap; long-press any slot to save & rename your current setup.\n" +
                     "• Safe Notification Shade: Exactly 3 quick actions (Mute Mic, Scene/BRB, ★ Clip) — Stop is safely locked inside the app & Floating Pill with 2-tap confirm.",
                 accentHex = "#38BDF8"
             )
@@ -256,7 +606,7 @@ object DashboardDialogs {
                 "★ DETECTED PHONE: SAMSUNG ONE UI (${Build.MODEL})\n" +
                     "• Memory Exclusion (Prevents 2–3h Kills): Settings → Device Care → Memory → Excluded apps → add BOTH SolStream Studio and your game.\n" +
                     "• RAM Plus: Keep Device Care → Memory → RAM Plus OFF on 8 GB phones to prevent background disk-swap freezes.\n" +
-                    "• Game Booster: Enable 'Pause USB PD charging when gaming' with a 25W+ PPS charger for cooler sessions."
+                    "• Game Booster: Plug in your 25W+ PPS charger BEFORE opening your game and enable 'Pause USB PD charging when gaming' for cooler sessions."
             mfr.contains("xiaomi") || mfr.contains("redmi") || mfr.contains("poco") ->
                 "★ DETECTED PHONE: XIAOMI / REDMI / POCO (HyperOS / MIUI)\n" +
                     "• Unlocking Restricted Settings: Open App Info → scroll to the VERY BOTTOM → tap 'Allow restricted settings'.\n" +
@@ -636,6 +986,8 @@ object DashboardDialogs {
                         "Kick Limit Active: Safe up to $platformCappedMbps Mbps (1080p60 H.264 CBR • 8 Mbps Kick Cap)."
                     uploadMbps > 0.0 && uploadMbps < 6.0 ->
                         "Low Upload: Use 720p/480p HEVC @ ${platformCappedMbps} Mbps + Ping Guard ABR ON."
+                    settings.isVertical && uploadMbps >= 14.0 ->
+                        "Shorts 9:16 Sweet Spot: 8–10 Mbps HEVC (1080×1920@60) or up to $platformCappedMbps Mbps with ABR ON."
                     uploadMbps >= 24.0 && bloatDeltaMs in 0..35 ->
                         "Grade A+ Fiber! Safe for 18–24 Mbps 1440p60 HEVC (Single) or 16M + 8M (Dual Companion)."
                     else ->
