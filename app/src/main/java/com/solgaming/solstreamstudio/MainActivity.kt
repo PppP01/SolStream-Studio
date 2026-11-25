@@ -141,7 +141,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var btnNetTest: Button
     private lateinit var tvNetTestResult: TextView
 
-    // Card 3: SolCore Ultra™ Video Engine, Segmented Pills, Visuals, Scenes & Phase 1 Pro Overlays
+    // Card 3: SolCore Ultra™ Video Engine, Segmented Pills, Visuals, SolShorts™ Studio & Pro Overlays
     private val resPillButtons = mutableMapOf<Int, Button>()
     private val codecPillButtons = mutableMapOf<String, Button>()
     private val fpsPillButtons = mutableMapOf<Int, Button>()
@@ -165,6 +165,12 @@ class MainActivity : AppCompatActivity() {
     private lateinit var btnSharpen: Button
     private lateinit var btnToggleSceneProDrawer: Button
     private lateinit var boxSceneProDrawer: LinearLayout
+    private lateinit var btnShortsAnchor: Button
+    private lateinit var btnShortsHeaderLayout: Button
+    private lateinit var btnShortsScoreLoupe: Button
+    private lateinit var btnShortsMinimapLoupe: Button
+    private lateinit var btnShortsCaptureCooler: Button
+    private lateinit var btnPreviewShortsSafeZones: Button
     private lateinit var btnPickStartImg: Button
     private lateinit var btnPickBrbImg: Button
     private lateinit var btnPickOverlayPng: Button
@@ -287,7 +293,16 @@ class MainActivity : AppCompatActivity() {
                 putExtra(SolStreamService.EXTRA_RESULT_CODE, res.resultCode)
                 putExtra(SolStreamService.EXTRA_RESULT_DATA, res.data)
             }
-            ContextCompat.startForegroundService(this, svcIntent)
+            try {
+                ContextCompat.startForegroundService(this, svcIntent)
+            } catch (e: Exception) {
+                CodecCapabilityProbe.isBroadcastStartingOrLive = false
+                Toast.makeText(
+                    this,
+                    "Could not start broadcast service (${e.javaClass.simpleName}). Tap GO LIVE again.",
+                    Toast.LENGTH_LONG
+                ).show()
+            }
         } else {
             CodecCapabilityProbe.isBroadcastStartingOrLive = false
             Toast.makeText(this, "Screen capture cancelled.", Toast.LENGTH_SHORT).show()
@@ -423,9 +438,9 @@ class MainActivity : AppCompatActivity() {
                 @Suppress("DEPRECATION")
                 packageManager.getPackageInfo(packageName, 0)
             }
-            info.versionName?.removeSuffix("-debug") ?: "1.5.2"
+            info.versionName?.removeSuffix("-debug") ?: "1.6.0"
         } catch (_: Exception) {
-            "1.5.2"
+            "1.6.0"
         }
     }
 
@@ -1020,7 +1035,7 @@ class MainActivity : AppCompatActivity() {
         cardStream.addView(tvNetTestResult)
         container.addView(cardStream)
 
-        // === CARD 3: SOLCORE ULTRA VIDEO ENGINE, DIRECT-TAP PILLS, VISUALS & PRO OVERLAYS ===
+        // === CARD 3: SOLCORE ULTRA VIDEO ENGINE, DIRECT-TAP PILLS, VISUALS, SOLSHORTS™ & PRO OVERLAYS ===
         val cardVideo = sectionCard(
             heading = "3. Video Engine (360p–4K60 • 0.5–100M)",
             engineBadge = "SOLCORE ULTRA™",
@@ -1185,7 +1200,7 @@ class MainActivity : AppCompatActivity() {
         cardVideo.addView(buttonRow(btnShadowBoost, btnColorTemp))
         cardVideo.addView(btnSharpen)
 
-        // Collapsible Accordion Drawer: Scenes, Pro Overlays (SolHUD, QR, PNGTuber), Privacy Blur & SolCodec
+        // Collapsible Accordion Drawer: SolShorts™ Studio, Scenes, Pro Overlays (SolHUD, QR, PNGTuber), Privacy & SolCodec
         boxSceneProDrawer = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             visibility = View.GONE
@@ -1198,13 +1213,32 @@ class MainActivity : AppCompatActivity() {
             layoutParams = lp
         }
         btnToggleSceneProDrawer = actionButton(
-            "▸ Scenes, SolHUD™, QR, PNGTuber, Privacy & SolCodec™",
+            "▸ SolShorts™, Scenes, SolHUD™, QR, Avatar & SolCodec™",
             "#111D30"
         ) {
             val show = boxSceneProDrawer.visibility != View.VISIBLE
             boxSceneProDrawer.visibility = if (show) View.VISIBLE else View.GONE
             refreshAccordionHeaders()
         }
+
+        boxSceneProDrawer.addView(labelText("SolShorts™ 9:16 Studio Controls (All Opt-In • 0% Extra GPU When OFF):"))
+        btnShortsAnchor = actionButton("", "#13284A") { cycleShortsVerticalAnchor() }
+        btnShortsHeaderLayout = actionButton("", "#101929") {
+            updateSetting(settings.copy(shortsHeaderLayout = !settings.shortsHeaderLayout))
+        }
+        btnShortsScoreLoupe = actionButton("", "#101929") { cycleShortsScoreLoupe() }
+        btnShortsMinimapLoupe = actionButton("", "#101929") { cycleShortsMinimapLoupe() }
+        btnShortsCaptureCooler = actionButton("", "#0D3652") {
+            updateSetting(settings.copy(shortsCaptureCooler = !settings.shortsCaptureCooler), requiresRestartIfLive = true)
+        }
+        btnPreviewShortsSafeZones = actionButton("👁️ Preview 9:16 YouTube Shorts Safe Zones", "#153969") {
+            saveVaultInputs(showToast = false)
+            DashboardDialogs.showShortsSafeZonePreviewDialog(this, settings)
+        }
+        boxSceneProDrawer.addView(buttonRow(btnShortsAnchor, btnShortsHeaderLayout))
+        boxSceneProDrawer.addView(buttonRow(btnShortsScoreLoupe, btnShortsMinimapLoupe))
+        boxSceneProDrawer.addView(btnShortsCaptureCooler)
+        boxSceneProDrawer.addView(btnPreviewShortsSafeZones)
 
         boxSceneProDrawer.addView(labelText("SolHUD™ Live GPU Telemetry Badge (Visible Even in Single-App Capture):"))
         btnHudTelemetryToggle = actionButton("", "#101929") {
@@ -1759,7 +1793,7 @@ class MainActivity : AppCompatActivity() {
         val simOpen = boxSimulcastDrawer.visibility == View.VISIBLE
         val activeSimCount = (if (settings.simulcastTwitchEnabled) 1 else 0) +
             (if (settings.simulcastKickEnabled) 1 else 0) +
-            (if (settings.dualFormatCompanionEnabled) 1 else 0)
+            (if (!settings.isVertical && settings.dualFormatCompanionEnabled) 1 else 0)
         val simSummary = if (activeSimCount > 0) "$activeSimCount Active" else "Primary Only"
         btnToggleSimulcastDrawer.text = if (simOpen) {
             "▾ Simulcast, 9:16 Shorts Key & Dual-Format ($simSummary)"
@@ -1769,6 +1803,9 @@ class MainActivity : AppCompatActivity() {
 
         val sceneOpen = boxSceneProDrawer.visibility == View.VISIBLE
         val proTags = mutableListOf<String>()
+        if (settings.shortsScoreLoupe != "OFF") proTags.add("FeedL")
+        if (settings.shortsMinimapLoupe != "OFF") proTags.add("MapL")
+        if (settings.shortsVerticalAnchor == "ABOVE_CHAT") proTags.add("Above")
         if (settings.hudTelemetryEnabled) proTags.add("HUD")
         if (settings.qrOverlayEnabled && settings.qrOverlayText.isNotBlank()) proTags.add("QR")
         if (settings.pngTuberEnabled) proTags.add("Avatar")
@@ -1778,9 +1815,9 @@ class MainActivity : AppCompatActivity() {
         if (settings.minimapShieldEnabled) proTags.add("Blur")
         val sceneSummary = if (proTags.isEmpty()) "All OFF" else proTags.joinToString(" • ")
         btnToggleSceneProDrawer.text = if (sceneOpen) {
-            "▾ Scenes, SolHUD™, QR, Avatar & SolCodec™ ($sceneSummary)"
+            "▾ SolShorts™, Scenes, SolHUD™, QR & SolCodec™ ($sceneSummary)"
         } else {
-            "▸ Scenes, SolHUD™, QR, Avatar & SolCodec™ ($sceneSummary)"
+            "▸ SolShorts™, Scenes, SolHUD™, QR & SolCodec™ ($sceneSummary)"
         }
 
         val voiceOpen = boxVoiceStageDrawer.visibility == View.VISIBLE
@@ -1976,14 +2013,16 @@ class MainActivity : AppCompatActivity() {
         styleToggleBtn(btnSimulcastKick, isOn = settings.simulcastKickEnabled)
 
         val compCodecHint = scanSummary.selectCompanionEncoder(settings.codec, requireH264Only = false)?.codecKey
+        val companionEffectiveOn = !settings.isVertical && settings.dualFormatCompanionEnabled
         btnDualCompanion.text =
-            "Dual-Format 16:9 + 9:16 Companion: ${onOff(settings.dualFormatCompanionEnabled)}" +
+            "Dual-Format 16:9 + 9:16 Companion: ${onOff(companionEffectiveOn)}" +
                 when {
+                    settings.isVertical -> " (16:9 Primary Only)"
                     !dualSupported -> " (Needs 2-Instance HW)"
                     compCodecHint != null -> " ($compCodecHint)"
                     else -> ""
                 }
-        styleToggleBtn(btnDualCompanion, isOn = settings.dualFormatCompanionEnabled)
+        styleToggleBtn(btnDualCompanion, isOn = companionEffectiveOn)
 
         btnCompanionBitrate.text =
             "9:16 Companion Bitrate: ${formatBitrateMbps(settings.dualFormatBitrateKbps)} (Tap to step 2–20 Mbps)"
@@ -2069,6 +2108,39 @@ class MainActivity : AppCompatActivity() {
             "GPU Crisp Sharpen: OFF (Recommended — Coolest Temp)"
         }
         styleToggleBtn(btnSharpen, isOn = settings.gpuSharpen)
+
+        // v1.6.0 SolShorts™ Studio Controls inside Card 3 Drawer
+        val anchorAbove = settings.shortsVerticalAnchor.equals("ABOVE_CHAT", ignoreCase = true)
+        btnShortsAnchor.text = if (anchorAbove) {
+            "9:16 Pos: ABOVE CHAT (+10% Up)"
+        } else {
+            "9:16 Pos: CENTER (0%)"
+        }
+        styleToggleBtn(btnShortsAnchor, isOn = anchorAbove, activeFillHex = "#0D3652", activeStrokeHex = "#00E5FF")
+
+        btnShortsHeaderLayout.text = "Shorts Pro Header: ${onOff(settings.shortsHeaderLayout)}"
+        styleToggleBtn(btnShortsHeaderLayout, isOn = settings.shortsHeaderLayout)
+
+        btnShortsScoreLoupe.text = formatShortsScoreLoupeButtonLabel(settings.shortsScoreLoupe)
+        styleToggleBtn(btnShortsScoreLoupe, isOn = !settings.shortsScoreLoupe.equals("OFF", ignoreCase = true))
+
+        val mapSuppressed = SolVideoPipeline.isMinimapLoupeSuppressedByShield(
+            settings.shortsMinimapLoupe,
+            settings.minimapShieldEnabled,
+            settings.minimapShieldCorner
+        )
+        btnShortsMinimapLoupe.text = formatShortsMinimapLoupeButtonLabel(settings.shortsMinimapLoupe, mapSuppressed)
+        styleToggleBtn(
+            btnShortsMinimapLoupe,
+            isOn = !settings.shortsMinimapLoupe.equals("OFF", ignoreCase = true) && !mapSuppressed
+        )
+
+        btnShortsCaptureCooler.text = if (settings.shortsCaptureCooler) {
+            "Shorts Capture Cooler (-50% Capture BW): ON$restartSuffix"
+        } else {
+            "Shorts Capture Cooler: OFF (Full Raw Panel Capture)$restartSuffix"
+        }
+        styleToggleBtn(btnShortsCaptureCooler, isOn = settings.shortsCaptureCooler)
 
         // Phase 1 (v1.5.0+) Pro Broadcast Overlays inside Card 3 Drawer
         btnHudTelemetryToggle.text = "SolHUD™ Telemetry: ${onOff(settings.hudTelemetryEnabled)}"
@@ -2334,7 +2406,7 @@ class MainActivity : AppCompatActivity() {
             if (requiresRestartIfLive) {
                 Toast.makeText(
                     this,
-                    "Saved for next stream! (Encoder Codec/Res/FPS/HDR/AAC apply on next Go Live.)",
+                    "Saved for next stream! (Encoder Codec/Res/FPS/HDR/AAC/Capture Cooler apply on next Go Live.)",
                     Toast.LENGTH_SHORT
                 ).show()
             } else if (userToggledSharp && settings.gpuSharpen) {
@@ -2354,6 +2426,28 @@ class MainActivity : AppCompatActivity() {
         refreshAllUi()
     }
 
+    // === v1.6.0 SOLSHORTS™ STUDIO HANDLERS ===
+    private fun cycleShortsVerticalAnchor() {
+        val order = KeystoreVault.SHORTS_ANCHOR_ORDER
+        val curIdx = order.indexOf(settings.shortsVerticalAnchor.uppercase(Locale.US)).let { if (it < 0) 0 else it }
+        val next = order[(curIdx + 1) % order.size]
+        updateSetting(settings.copy(shortsVerticalAnchor = next))
+    }
+
+    private fun cycleShortsMinimapLoupe() {
+        val order = KeystoreVault.SHORTS_MINIMAP_LOUPE_ORDER
+        val curIdx = order.indexOf(settings.shortsMinimapLoupe.uppercase(Locale.US)).let { if (it < 0) 0 else it }
+        val next = order[(curIdx + 1) % order.size]
+        updateSetting(settings.copy(shortsMinimapLoupe = next))
+    }
+
+    private fun cycleShortsScoreLoupe() {
+        val order = KeystoreVault.SHORTS_SCORE_LOUPE_ORDER
+        val curIdx = order.indexOf(settings.shortsScoreLoupe.uppercase(Locale.US)).let { if (it < 0) 0 else it }
+        val next = order[(curIdx + 1) % order.size]
+        updateSetting(settings.copy(shortsScoreLoupe = next))
+    }
+
     // === PHASE 1 (v1.5.0+) STUDIO PROFILES & PRO OVERLAY HANDLERS ===
     private fun loadStudioProfileSlot(slotIndex: Int) {
         val loaded = KeystoreVault.loadStudioProfile(this, slotIndex, settings, scanSummary)
@@ -2364,7 +2458,8 @@ class MainActivity : AppCompatActivity() {
             next.fps != settings.fps ||
             next.isVertical != settings.isVertical ||
             next.hdr10Enabled != settings.hdr10Enabled ||
-            next.audioBitrateKbps != settings.audioBitrateKbps
+            next.audioBitrateKbps != settings.audioBitrateKbps ||
+            next.shortsCaptureCooler != settings.shortsCaptureCooler
         activeStudioProfileSlot = slotIndex
         updateSetting(next, requiresRestartIfLive = needsRestart)
         val resTag = "${min(next.width, next.height)}p${next.fps}"
@@ -2531,6 +2626,17 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun toggleDualFormatCompanion() {
+        if (settings.isVertical) {
+            Toast.makeText(
+                this,
+                "Dual-Format Companion requires 16:9 Landscape as your Primary format (switch Format to 16:9 first).",
+                Toast.LENGTH_LONG
+            ).show()
+            if (settings.dualFormatCompanionEnabled) {
+                updateSetting(settings.copy(dualFormatCompanionEnabled = false), requiresRestartIfLive = true)
+            }
+            return
+        }
         val nextState = !settings.dualFormatCompanionEnabled
         if (nextState) {
             if (!scanSummary.supportsDualFormatCompanion(primaryCodec = settings.codec)) {
@@ -2637,7 +2743,10 @@ class MainActivity : AppCompatActivity() {
             !settings.isVertical && settings.landscapeFlip == 0 ->
                 updateSetting(settings.copy(isVertical = false, landscapeFlip = 180))
             !settings.isVertical && settings.landscapeFlip == 180 ->
-                updateSetting(settings.copy(isVertical = true, landscapeFlip = 0), requiresRestartIfLive = true)
+                updateSetting(
+                    settings.copy(isVertical = true, landscapeFlip = 0, dualFormatCompanionEnabled = false),
+                    requiresRestartIfLive = true
+                )
             else ->
                 updateSetting(settings.copy(isVertical = false, landscapeFlip = 0), requiresRestartIfLive = true)
         }
@@ -2866,6 +2975,17 @@ class MainActivity : AppCompatActivity() {
         updateSetting(settings.copy(brbMuteMicToo = brbMute, wifiLowLatencyLock = wifiLow))
     }
 
+    private fun readClipboardTextSafely(): String? {
+        return try {
+            val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+            val clip = cm.primaryClip ?: return null
+            if (clip.itemCount <= 0) return null
+            clip.getItemAt(0).coerceToText(this)?.toString()?.trim()
+        } catch (_: Exception) {
+            null
+        }
+    }
+
     // === PRESET SHARE & SMART HARDWARE CLAMPING ===
     private fun copyPresetToClipboard() {
         val json = KeystoreVault.exportPresetJson(settings)
@@ -2878,8 +2998,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun importPresetFromClipboard() {
-        val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-        val raw = cm.primaryClip?.getItemAt(0)?.coerceToText(this)?.toString()?.trim()
+        val raw = readClipboardTextSafely()
         if (raw.isNullOrBlank()) {
             Toast.makeText(this, "Clipboard is empty.", Toast.LENGTH_SHORT).show()
             return
@@ -3018,8 +3137,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun pasteStreamKeyFromClipboard() {
-        val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-        val rawClip = cm.primaryClip?.getItemAt(0)?.coerceToText(this)?.toString()?.trim()
+        val rawClip = readClipboardTextSafely()
         if (rawClip.isNullOrEmpty()) {
             Toast.makeText(this, "Clipboard is empty.", Toast.LENGTH_SHORT).show()
             return
@@ -3336,12 +3454,20 @@ class MainActivity : AppCompatActivity() {
             .setItems(apps) { _, which ->
                 benchmarkTargetAppName = apps[which]
                 DiagnosticsLogger.log("BENCH_TARGET", "Selected $benchmarkTargetAppName for passive thermal/RAM comparison.")
-                ContextCompat.startForegroundService(
-                    this,
-                    Intent(this, SolStreamService::class.java).apply {
-                        action = SolStreamService.ACTION_START_GLIP_BENCH
-                    }
-                )
+                try {
+                    ContextCompat.startForegroundService(
+                        this,
+                        Intent(this, SolStreamService::class.java).apply {
+                            action = SolStreamService.ACTION_START_GLIP_BENCH
+                        }
+                    )
+                } catch (e: Exception) {
+                    Toast.makeText(
+                        this,
+                        "Could not start Benchmark service (${e.javaClass.simpleName}).",
+                        Toast.LENGTH_LONG
+                    ).show()
+                }
                 refreshAllUi()
             }
             .setNegativeButton("Cancel", null)
@@ -3578,6 +3704,27 @@ class MainActivity : AppCompatActivity() {
                 "POSTER" -> "9:16 Shorts Canvas: POSTER (Static Image — Low GPU)"
                 else -> "9:16 Shorts Canvas: BLUR (40% Cooler Scissor Blur)"
             }
+        }
+
+        internal fun formatShortsScoreLoupeButtonLabel(mode: String): String {
+            return when (mode.trim().uppercase(Locale.US)) {
+                "TOP_LEFT_FEED" -> "Score+Feed Loupe: Top-Left + Killfeed"
+                "TOP_LEFT" -> "Score+Feed Loupe: Top-Left Score/Squad"
+                "TOP_CENTER" -> "Score+Feed Loupe: Top-Center Timer"
+                else -> "Score+Feed Loupe: OFF"
+            }
+        }
+
+        internal fun formatShortsMinimapLoupeButtonLabel(
+            mode: String,
+            suppressedByShield: Boolean = false
+        ): String {
+            val base = when (mode.trim().uppercase(Locale.US)) {
+                "TOP_RIGHT" -> "Minimap Loupe: Top-Right Radar"
+                "TOP_LEFT" -> "Minimap Loupe: Top-Left Radar"
+                else -> return "Minimap Loupe: OFF"
+            }
+            return if (suppressedByShield) "$base (Paused by Blur)" else base
         }
     }
 }
