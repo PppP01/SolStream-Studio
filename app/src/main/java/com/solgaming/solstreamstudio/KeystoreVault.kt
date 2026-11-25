@@ -119,7 +119,14 @@ data class StreamSettings(
     val qrOverlayCorner: String = "BOTTOM_RIGHT", // "TOP_LEFT", "TOP_RIGHT", "BOTTOM_LEFT", "BOTTOM_RIGHT"
     val pngTuberEnabled: Boolean = false,         // Zero-Camera 2-PNG voice-reactive avatar (uses existing vadSpeechActive)
     val pngTuberCorner: String = "BOTTOM_LEFT",   // "TOP_LEFT", "TOP_RIGHT", "BOTTOM_LEFT", "BOTTOM_RIGHT"
-    val pngTuberSizePercent: Int = 18             // 12..30% of output frame height
+    val pngTuberSizePercent: Int = 18,            // 12..30% of output frame height
+
+    // === v1.6.0 SolShorts™ Studio Controls (All Freely Toggleable — Zero Locks/Caps) ===
+    val shortsVerticalAnchor: String = "CENTER",  // "CENTER" (0%) or "ABOVE_CHAT" (+10% upward shift above YouTube Shorts chat)
+    val shortsMinimapLoupe: String = "OFF",       // "OFF", "TOP_RIGHT", "TOP_LEFT" (0-copy GPU radar crop above gameplay)
+    val shortsScoreLoupe: String = "OFF",         // "OFF", "TOP_LEFT_FEED" (Score+Killfeed), "TOP_LEFT" (Score/Squad), "TOP_CENTER"
+    val shortsHeaderLayout: Boolean = false,      // Docks SolHUD / QR / PNGTuber cleanly above gameplay in 9:16 mode
+    val shortsCaptureCooler: Boolean = true       // Toggleable ~50%-lighter 9:16 capture + landscape-first VirtualDisplay startup
 )
 
 data class StudioProfile(
@@ -137,6 +144,10 @@ object KeystoreVault {
     const val DEFAULT_KICK_RTMPS = "rtmps://fa723fc1b171.global-contribute.live-video.net:443/app"
     const val STUDIO_PROFILE_COUNT = 4
     const val MAX_QR_OVERLAY_CHARS = 200
+
+    val SHORTS_ANCHOR_ORDER = listOf("CENTER", "ABOVE_CHAT")
+    val SHORTS_MINIMAP_LOUPE_ORDER = listOf("OFF", "TOP_RIGHT", "TOP_LEFT")
+    val SHORTS_SCORE_LOUPE_ORDER = listOf("OFF", "TOP_LEFT_FEED", "TOP_LEFT", "TOP_CENTER")
 
     private const val ANDROID_KEYSTORE = "AndroidKeyStore"
     private const val MASTER_KEY_ALIAS = "solstream_vault_aes256_v1"
@@ -169,6 +180,20 @@ object KeystoreVault {
         return if (norm in validOverlayCorners) norm else fallback
     }
 
+    fun sanitizeShortsVerticalAnchor(raw: String?): String {
+        return if (raw?.trim()?.equals("ABOVE_CHAT", ignoreCase = true) == true) "ABOVE_CHAT" else "CENTER"
+    }
+
+    fun sanitizeShortsMinimapLoupe(raw: String?): String {
+        val norm = raw?.trim()?.uppercase(Locale.US) ?: "OFF"
+        return if (norm in SHORTS_MINIMAP_LOUPE_ORDER) norm else "OFF"
+    }
+
+    fun sanitizeShortsScoreLoupe(raw: String?): String {
+        val norm = raw?.trim()?.uppercase(Locale.US) ?: "OFF"
+        return if (norm in SHORTS_SCORE_LOUPE_ORDER) norm else "OFF"
+    }
+
     private fun resolveDeviceTier(tierId: String): DeviceTier = when (tierId.uppercase(Locale.US)) {
         "LITE" -> DeviceTier.LITE
         "BALANCED" -> DeviceTier.BALANCED
@@ -184,12 +209,12 @@ object KeystoreVault {
     }
 
     fun isTwitchLimited(settings: StreamSettings): Boolean {
-        return settings.platformPreset.equals("TWITCH", ignoreCase = true) ||
+        return settings.platformPreset.trim().equals("TWITCH", ignoreCase = true) ||
             (isSingleEncodeSimulcast(settings) && settings.simulcastTwitchEnabled)
     }
 
     fun isKickLimited(settings: StreamSettings): Boolean {
-        return settings.platformPreset.equals("KICK", ignoreCase = true) ||
+        return settings.platformPreset.trim().equals("KICK", ignoreCase = true) ||
             (isSingleEncodeSimulcast(settings) && settings.simulcastKickEnabled)
     }
 
@@ -222,33 +247,45 @@ object KeystoreVault {
      * and immediately before encoder start:
      * - Twitch (primary or single-encode simulcast): H.264, CBR, <=1080p60, <=6,000 kbps, <=160 kbps AAC, 2s keyframe, HDR10 OFF.
      * - Kick (primary or single-encode simulcast): H.264, CBR, <=1080p60, <=8,000 kbps, <=160 kbps AAC, 2s keyframe, HDR10 OFF.
+     * - YouTube & Custom RTMP: Fully unlocked (360p..4K60, 0.5..100 Mbps, HEVC/H264/AV1, all SolShorts™ toggles free).
      * - All destinations: maxBFrames locked to 0 (RootEncoder 2.8.1 packetizer writes CTS=0).
      */
     fun enforcePlatformLimits(settings: StreamSettings): Pair<StreamSettings, Boolean> {
-        val strictDest = isStrictH264Destination(settings)
-        val normCodec = when (settings.codec.trim().uppercase(Locale.US)) {
-            "HEVC", "H264", "AV1" -> settings.codec.trim().uppercase(Locale.US)
+        val normPlatform = when (settings.platformPreset.trim().uppercase(Locale.US)) {
+            "YOUTUBE", "TWITCH", "KICK", "CUSTOM" -> settings.platformPreset.trim().uppercase(Locale.US)
+            else -> "YOUTUBE"
+        }
+        val normalized = settings.copy(
+            platformPreset = normPlatform,
+            shortsVerticalAnchor = sanitizeShortsVerticalAnchor(settings.shortsVerticalAnchor),
+            shortsMinimapLoupe = sanitizeShortsMinimapLoupe(settings.shortsMinimapLoupe),
+            shortsScoreLoupe = sanitizeShortsScoreLoupe(settings.shortsScoreLoupe)
+        )
+
+        val strictDest = isStrictH264Destination(normalized)
+        val normCodec = when (normalized.codec.trim().uppercase(Locale.US)) {
+            "HEVC", "H264", "AV1" -> normalized.codec.trim().uppercase(Locale.US)
             else -> "HEVC"
         }
         val finalCodec = if (strictDest) "H264" else normCodec
 
-        var longDim = max(settings.width, settings.height).coerceIn(360, 3840)
-        var shortDim = min(settings.width, settings.height).coerceIn(360, 2160)
-        val maxLong = maxLongSideForDestination(settings)
+        var longDim = max(normalized.width, normalized.height).coerceIn(360, 3840)
+        var shortDim = min(normalized.width, normalized.height).coerceIn(360, 2160)
+        val maxLong = maxLongSideForDestination(normalized)
         if (longDim > maxLong) {
             longDim = 1920
             shortDim = 1080
         }
 
-        val finalFps = if (settings.fps <= 30) 30 else 60
-        val finalBitrate = settings.targetBitrateKbps.coerceIn(500, maxVideoBitrateKbpsForDestination(settings))
-        val finalAudioBitrate = settings.audioBitrateKbps.coerceIn(64, maxAudioBitrateKbpsForDestination(settings))
-        val finalUseVbr = if (strictDest) false else settings.useVbr
-        val finalHdr10 = if (strictDest) false else settings.hdr10Enabled
-        val finalKeyframe = if (strictDest) 2 else settings.keyframeIntervalSec.coerceIn(1, 4)
+        val finalFps = if (normalized.fps <= 30) 30 else 60
+        val finalBitrate = normalized.targetBitrateKbps.coerceIn(500, maxVideoBitrateKbpsForDestination(normalized))
+        val finalAudioBitrate = normalized.audioBitrateKbps.coerceIn(64, maxAudioBitrateKbpsForDestination(normalized))
+        val finalUseVbr = if (strictDest) false else normalized.useVbr
+        val finalHdr10 = if (strictDest) false else normalized.hdr10Enabled
+        val finalKeyframe = if (strictDest) 2 else normalized.keyframeIntervalSec.coerceIn(1, 4)
         val finalBFrames = 0
 
-        val enforced = settings.copy(
+        val enforced = normalized.copy(
             codec = finalCodec,
             width = longDim,
             height = shortDim,
@@ -731,9 +768,10 @@ object KeystoreVault {
                 val shortsFps = if (tier == DeviceTier.LITE) 30 else 60
                 val shortsKbps = when (tier) {
                     DeviceTier.LITE -> 5000
-                    DeviceTier.BALANCED, DeviceTier.HIGH -> 10000
-                    DeviceTier.FLAGSHIP, DeviceTier.ULTRA -> 12000
+                    DeviceTier.BALANCED, DeviceTier.HIGH -> 8000
+                    DeviceTier.FLAGSHIP, DeviceTier.ULTRA -> 9000
                 }
+                val shortsAudioKbps = if (tier == DeviceTier.LITE) 128 else 160
                 "Shorts 9:16" to baseLandscape.copy(
                     width = shortsW,
                     height = shortsH,
@@ -741,7 +779,10 @@ object KeystoreVault {
                     isVertical = true,
                     useShortsKeySlot = true,
                     shortsBackdropMode = "BLUR",
+                    shortsVerticalAnchor = "ABOVE_CHAT",
+                    shortsCaptureCooler = true,
                     targetBitrateKbps = shortsKbps,
+                    audioBitrateKbps = shortsAudioKbps,
                     dualFormatCompanionEnabled = false
                 )
             }
@@ -858,14 +899,14 @@ object KeystoreVault {
     // === HARDWARE KEYSTORE AES-256-GCM ===
     fun getKeySecurityDescription(): String {
         cachedSecurityLabel?.let { return it }
-        val desc = synchronized(vaultLock) {
+        return synchronized(vaultLock) {
             cachedSecurityLabel?.let { return@synchronized it }
             try {
                 val ks = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
                 val key = (ks.getKey(MASTER_KEY_ALIAS, null) as? SecretKey) ?: return@synchronized "Android Keystore Ready"
                 val factory = SecretKeyFactory.getInstance(key.algorithm, ANDROID_KEYSTORE)
                 val info = factory.getKeySpec(key, KeyInfo::class.java) as KeyInfo
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                val verified = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
                     when (info.securityLevel) {
                         KeyProperties.SECURITY_LEVEL_STRONGBOX -> "Hardware-Backed (StrongBox)"
                         KeyProperties.SECURITY_LEVEL_TRUSTED_ENVIRONMENT -> "Hardware-Backed (TEE)"
@@ -875,14 +916,12 @@ object KeystoreVault {
                     @Suppress("DEPRECATION")
                     if (info.isInsideSecureHardware) "Hardware-Backed (TEE)" else "OS Keystore Protected"
                 }
+                cachedSecurityLabel = verified
+                verified
             } catch (_: Exception) {
                 "Android Keystore Protected"
             }
         }
-        if (desc != "Android Keystore Ready") {
-            cachedSecurityLabel = desc
-        }
-        return desc
     }
 
     private fun getOrCreateAesKey(context: Context): SecretKey {
@@ -1003,7 +1042,7 @@ object KeystoreVault {
     fun exportPresetJson(s: StreamSettings): String {
         val safe = enforcePlatformLimits(s).first
         return JSONObject().apply {
-            put("solPresetSchema", 5)
+            put("solPresetSchema", 6)
             put("deviceTier", safe.deviceTier)
             put("platformPreset", safe.platformPreset)
             put("useShortsKeySlot", safe.useShortsKeySlot)
@@ -1100,6 +1139,13 @@ object KeystoreVault {
             put("pngTuberEnabled", safe.pngTuberEnabled)
             put("pngTuberCorner", sanitizeOverlayCorner(safe.pngTuberCorner, "BOTTOM_LEFT"))
             put("pngTuberSizePercent", safe.pngTuberSizePercent.coerceIn(12, 30))
+
+            // v1.6.0 SolShorts™ Studio Controls
+            put("shortsVerticalAnchor", sanitizeShortsVerticalAnchor(safe.shortsVerticalAnchor))
+            put("shortsMinimapLoupe", sanitizeShortsMinimapLoupe(safe.shortsMinimapLoupe))
+            put("shortsScoreLoupe", sanitizeShortsScoreLoupe(safe.shortsScoreLoupe))
+            put("shortsHeaderLayout", safe.shortsHeaderLayout)
+            put("shortsCaptureCooler", safe.shortsCaptureCooler)
         }.toString()
     }
 
@@ -1228,7 +1274,19 @@ object KeystoreVault {
                     j.optString("pngTuberCorner", fallback.pngTuberCorner),
                     fallback.pngTuberCorner
                 ),
-                pngTuberSizePercent = j.optInt("pngTuberSizePercent", fallback.pngTuberSizePercent).coerceIn(12, 30)
+                pngTuberSizePercent = j.optInt("pngTuberSizePercent", fallback.pngTuberSizePercent).coerceIn(12, 30),
+
+                shortsVerticalAnchor = sanitizeShortsVerticalAnchor(
+                    j.optString("shortsVerticalAnchor", fallback.shortsVerticalAnchor)
+                ),
+                shortsMinimapLoupe = sanitizeShortsMinimapLoupe(
+                    j.optString("shortsMinimapLoupe", fallback.shortsMinimapLoupe)
+                ),
+                shortsScoreLoupe = sanitizeShortsScoreLoupe(
+                    j.optString("shortsScoreLoupe", fallback.shortsScoreLoupe)
+                ),
+                shortsHeaderLayout = j.optBoolean("shortsHeaderLayout", fallback.shortsHeaderLayout),
+                shortsCaptureCooler = j.optBoolean("shortsCaptureCooler", fallback.shortsCaptureCooler)
             )
             enforcePlatformLimits(parsed).first
         } catch (_: Exception) {
