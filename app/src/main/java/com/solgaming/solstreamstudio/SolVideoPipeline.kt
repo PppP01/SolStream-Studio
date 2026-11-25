@@ -68,6 +68,8 @@ class SolVideoPipeline(private val context: Context) {
     )
 
     internal data class ScissorRect(val x: Int, val y: Int, val w: Int, val h: Int)
+    internal data class CropUvRect(val x0: Float, val yTop: Float, val x1: Float, val yBot: Float)
+    internal data class NdcRect(val left: Float, val bottom: Float, val right: Float, val top: Float)
 
     private data class ConfiguredEncoder(
         val codec: MediaCodec,
@@ -131,6 +133,13 @@ class SolVideoPipeline(private val context: Context) {
     @Volatile var livePngTuberSizePercent = 18
     @Volatile var liveVoiceGenderProfile = "NEUTRAL"
     @Volatile var liveVoiceSpeaking = false
+
+    // v1.6.0 SolShorts™ Studio Controls (all freely toggleable live with 0-ms GPU latency)
+    @Volatile var liveShortsVerticalAnchor = "CENTER"   // "CENTER" or "ABOVE_CHAT"
+    @Volatile var liveShortsMinimapLoupe = "OFF"        // "OFF", "TOP_RIGHT", "TOP_LEFT"
+    @Volatile var liveShortsScoreLoupe = "OFF"          // "OFF", "TOP_LEFT_FEED", "TOP_LEFT", "TOP_CENTER"
+    @Volatile var liveShortsHeaderLayout = false
+    @Volatile var liveShortsCaptureCooler = true
 
     /**
      * Independent Dual-Layer Keyboard Privacy Blur:
@@ -234,6 +243,13 @@ class SolVideoPipeline(private val context: Context) {
         livePngTuberCorner = KeystoreVault.sanitizeOverlayCorner(s.pngTuberCorner, "BOTTOM_LEFT")
         livePngTuberSizePercent = s.pngTuberSizePercent.coerceIn(12, 30)
         liveVoiceGenderProfile = s.voiceGenderProfile.uppercase(Locale.US)
+
+        // v1.6.0 SolShorts™ Studio Controls
+        liveShortsVerticalAnchor = KeystoreVault.sanitizeShortsVerticalAnchor(s.shortsVerticalAnchor)
+        liveShortsMinimapLoupe = KeystoreVault.sanitizeShortsMinimapLoupe(s.shortsMinimapLoupe)
+        liveShortsScoreLoupe = KeystoreVault.sanitizeShortsScoreLoupe(s.shortsScoreLoupe)
+        liveShortsHeaderLayout = s.shortsHeaderLayout
+        liveShortsCaptureCooler = s.shortsCaptureCooler
     }
 
     /**
@@ -606,8 +622,24 @@ class SolVideoPipeline(private val context: Context) {
         val (rawScreenW, rawScreenH, densityDpi) = readPhysicalDisplayMetrics()
         val panelLong = evenDimension(max(rawScreenW, rawScreenH).coerceAtLeast(1280))
         val panelShort = evenDimension(min(rawScreenW, rawScreenH).coerceAtLeast(720))
-        val capWidth = if (safeSettings.isVertical && !isDisplayCurrentlyLandscape()) panelShort else panelLong
-        val capHeight = if (capWidth == panelShort) panelLong else panelShort
+
+        // v1.6.0 SolShorts™ Capture Cooler + Landscape-First Startup:
+        // When streaming 9:16 gaming Shorts with Shorts Capture Cooler ON, start VirtualDisplay in
+        // landscape at ~50% lighter capture resolution (e.g. 1600x738 instead of 2340x1080) to slash
+        // SurfaceFlinger bandwidth and avoid a startup portrait->landscape resize spike when opening games.
+        val (capWidth, capHeight) = if (safeSettings.isVertical && safeSettings.shortsCaptureCooler) {
+            scaleCaptureForShortsCooler(
+                rawW = panelLong,
+                rawH = panelShort,
+                framingMode = safeSettings.framingMode,
+                smartZoomPercent = safeSettings.smartZoomPercent,
+                coolerEnabled = true
+            )
+        } else {
+            val w = if (safeSettings.isVertical && !isDisplayCurrentlyLandscape()) panelShort else panelLong
+            val h = if (w == panelShort) panelLong else panelShort
+            w to h
+        }
 
         // Android 14+ strict invariant: register MediaProjection.Callback BEFORE createVirtualDisplay()
         synchronized(projectionCallbackLock) {
@@ -1465,7 +1497,10 @@ class SolVideoPipeline(private val context: Context) {
                     engineSummary = summary
                 )
             )
-            DiagnosticsLogger.log("GL_INIT", "Initialized $activeGlEngineSummary SolCore Ultra render pipeline.")
+            DiagnosticsLogger.log(
+                "GL_INIT",
+                "Initialized $activeGlEngineSummary SolCore Ultra render pipeline (capture=${activeCapW}x${activeCapH} -> stream=${outWidth}x${outHeight})."
+            )
 
             val fullQuadVerts = GlShaderBank.createFloatBuffer(
                 floatArrayOf(-1f, -1f, 1f, -1f, -1f, 1f, 1f, 1f)
@@ -1482,6 +1517,9 @@ class SolVideoPipeline(private val context: Context) {
             val bannerBottomVerts = GlShaderBank.createFloatBuffer(
                 floatArrayOf(-0.92f, -0.95f, 0.92f, -0.95f, -0.92f, -0.78f, 0.92f, -0.78f)
             )
+            // Zero-allocation reusable vertex/UV buffers for v1.6.0 SolShorts™ Tactical HUD Loupes
+            val loupeQuadVerts = GlShaderBank.createFloatBuffer(FloatArray(8))
+            val loupeTexCoords = GlShaderBank.createFloatBuffer(FloatArray(8))
 
             val stMatrix = FloatArray(16)
             val mvpMatrix = FloatArray(16)
@@ -1536,7 +1574,18 @@ class SolVideoPipeline(private val context: Context) {
 
                 val pendingSize = pendingCaptureResize.getAndSet(null)
                 if (pendingSize != null) {
-                    val (reqW, reqH) = pendingSize
+                    val (rawReqW, rawReqH) = pendingSize
+                    val (reqW, reqH) = if (isVerticalPrimary && liveShortsCaptureCooler) {
+                        scaleCaptureForShortsCooler(
+                            rawW = rawReqW,
+                            rawH = rawReqH,
+                            framingMode = liveFramingMode,
+                            smartZoomPercent = liveSmartZoomPercent,
+                            coolerEnabled = true
+                        )
+                    } else {
+                        rawReqW to rawReqH
+                    }
                     if (shouldAcceptCaptureResize(
                             isVerticalPrimary = isVerticalPrimary,
                             reqW = reqW,
@@ -1602,7 +1651,18 @@ class SolVideoPipeline(private val context: Context) {
                         activeCapW < activeCapH &&
                         isDisplayCurrentlyLandscape()
                     ) {
-                        pendingCaptureResize.compareAndSet(null, panelLong to panelShort)
+                        val (targetW, targetH) = if (liveShortsCaptureCooler) {
+                            scaleCaptureForShortsCooler(
+                                rawW = panelLong,
+                                rawH = panelShort,
+                                framingMode = liveFramingMode,
+                                smartZoomPercent = liveSmartZoomPercent,
+                                coolerEnabled = true
+                            )
+                        } else {
+                            panelLong to panelShort
+                        }
+                        pendingCaptureResize.compareAndSet(null, targetW to targetH)
                     }
                 }
 
@@ -1869,6 +1929,8 @@ class SolVideoPipeline(private val context: Context) {
                     fullQuadVerts = fullQuadVerts,
                     bannerTopVerts = bannerTopVerts,
                     bannerBottomVerts = bannerBottomVerts,
+                    loupeQuadVerts = loupeQuadVerts,
+                    loupeTexCoords = loupeTexCoords,
                     oesTexCoords = oesTexCoords,
                     bitmapTexCoords = bitmapTexCoords,
                     stMatrix = stMatrix,
@@ -1915,6 +1977,8 @@ class SolVideoPipeline(private val context: Context) {
                         fullQuadVerts = fullQuadVerts,
                         bannerTopVerts = bannerTopVerts,
                         bannerBottomVerts = bannerBottomVerts,
+                        loupeQuadVerts = loupeQuadVerts,
+                        loupeTexCoords = loupeTexCoords,
                         oesTexCoords = oesTexCoords,
                         bitmapTexCoords = bitmapTexCoords,
                         stMatrix = stMatrix,
@@ -1960,6 +2024,8 @@ class SolVideoPipeline(private val context: Context) {
                             fullQuadVerts = fullQuadVerts,
                             bannerTopVerts = bannerTopVerts,
                             bannerBottomVerts = bannerBottomVerts,
+                            loupeQuadVerts = loupeQuadVerts,
+                            loupeTexCoords = loupeTexCoords,
                             oesTexCoords = oesTexCoords,
                             bitmapTexCoords = bitmapTexCoords,
                             stMatrix = stMatrix,
@@ -2074,6 +2140,8 @@ class SolVideoPipeline(private val context: Context) {
         fullQuadVerts: FloatBuffer,
         bannerTopVerts: FloatBuffer,
         bannerBottomVerts: FloatBuffer,
+        loupeQuadVerts: FloatBuffer,
+        loupeTexCoords: FloatBuffer,
         oesTexCoords: FloatBuffer,
         bitmapTexCoords: FloatBuffer,
         stMatrix: FloatArray,
@@ -2154,6 +2222,8 @@ class SolVideoPipeline(private val context: Context) {
                 fullQuadVerts = fullQuadVerts,
                 bannerTopVerts = bannerTopVerts,
                 bannerBottomVerts = bannerBottomVerts,
+                loupeQuadVerts = loupeQuadVerts,
+                loupeTexCoords = loupeTexCoords,
                 oesTexCoords = oesTexCoords,
                 bitmapTexCoords = bitmapTexCoords,
                 stMatrix = stMatrix,
@@ -2236,6 +2306,8 @@ class SolVideoPipeline(private val context: Context) {
         fullQuadVerts: FloatBuffer,
         bannerTopVerts: FloatBuffer,
         bannerBottomVerts: FloatBuffer,
+        loupeQuadVerts: FloatBuffer,
+        loupeTexCoords: FloatBuffer,
         oesTexCoords: FloatBuffer,
         bitmapTexCoords: FloatBuffer,
         stMatrix: FloatArray,
@@ -2262,6 +2334,22 @@ class SolVideoPipeline(private val context: Context) {
         val srcIsLandscape = srcW > srcH
         val framing = liveFramingMode
         val zoomPct = liveSmartZoomPercent
+        val srcAspect = max(1, srcW).toFloat() / max(1, srcH).toFloat()
+        val dstAspect = max(1, dstW).toFloat() / max(1, dstH).toFloat()
+
+        val activeZoom = if (framing == "SMART") (zoomPct.coerceIn(100, 250) / 100.0f) else 1.0f
+        val sharpScaleY = if (dstIsVertical && srcIsLandscape && framing != "FILL") {
+            ((dstAspect / srcAspect) * activeZoom).coerceIn(0.10f, 1.50f)
+        } else {
+            1.0f
+        }
+        val shortsTranslateY = computeShortsVerticalOffsetNdc(
+            isVerticalDst = dstIsVertical,
+            isLandscapeSrc = srcIsLandscape,
+            framingMode = framing,
+            sharpScaleY = sharpScaleY,
+            anchorMode = liveShortsVerticalAnchor
+        )
 
         if (dstIsVertical && srcIsLandscape && framing != "FILL") {
             val needBlurBackdrop = liveShortsBackdropMode == "BLUR" ||
@@ -2269,18 +2357,17 @@ class SolVideoPipeline(private val context: Context) {
 
             if (liveShortsBackdropMode == "POSTER" && posterTexId != 0) {
                 drawRgbaQuad(rgbaHandles, posterTexId, identityMvp, fullQuadVerts, bitmapTexCoords, enableBlend = false)
-            } else if (needBlurBackdrop) {
-                val srcAspect = srcW.toFloat() / max(1, srcH).toFloat()
-                val dstAspect = dstW.toFloat() / max(1, dstH).toFloat()
-                val activeZoom = if (framing == "SMART") (zoomPct.coerceIn(100, 250) / 100.0f) else 1.0f
-                val sharpScaleY = ((dstAspect / srcAspect) * activeZoom).coerceIn(0.10f, 1.50f)
+            } else if (needBlurBackdrop && sharpScaleY < 0.998f) {
+                computeFramingMatrix(mvpMatrix, srcW, srcH, dstW, dstH, "FILL", 100, liveLandscapeFlip, 0.0f)
+                val bottomNdc = (shortsTranslateY - sharpScaleY).coerceIn(-1.0f, 1.0f)
+                val topNdc = (shortsTranslateY + sharpScaleY).coerceIn(-1.0f, 1.0f)
+                val bottomEdgePx = (((bottomNdc + 1.0f) * 0.5f * dstH).roundToInt() + 4).coerceIn(0, dstH)
+                val topStartPx = (((topNdc + 1.0f) * 0.5f * dstH).roundToInt() - 4).coerceIn(0, dstH)
+                val topBarH = (dstH - topStartPx).coerceIn(0, dstH)
 
-                // Skip blur completely when zoomed gameplay already fills 100% of vertical height
-                if (sharpScaleY < 0.998f) {
-                    computeFramingMatrix(mvpMatrix, srcW, srcH, dstW, dstH, "FILL", 100, liveLandscapeFlip)
-                    val barHeightPx = (((1.0f - sharpScaleY) * 0.5f * dstH).roundToInt() + 4).coerceIn(4, dstH / 2)
-                    GLES20.glEnable(GLES20.GL_SCISSOR_TEST)
-                    GLES20.glScissor(0, 0, dstW, barHeightPx)
+                GLES20.glEnable(GLES20.GL_SCISSOR_TEST)
+                if (bottomEdgePx > 0) {
+                    GLES20.glScissor(0, 0, dstW, bottomEdgePx)
                     drawOesGameplayQuad(
                         h = oesHandles,
                         oesTexId = oesTexId,
@@ -2294,22 +2381,24 @@ class SolVideoPipeline(private val context: Context) {
                         isFreshFrame = isFreshGameFrame,
                         isHdr10 = isHdr10Surface
                     )
-                    GLES20.glScissor(0, dstH - barHeightPx, dstW, barHeightPx)
-                    drawOesGameplayQuad(
-                        h = oesHandles,
-                        oesTexId = oesTexId,
-                        mvp = mvpMatrix,
-                        texMatrix = stMatrix,
-                        verts = fullQuadVerts,
-                        texCoords = oesTexCoords,
-                        srcW = srcW,
-                        srcH = srcH,
-                        isBlurPass = true,
-                        isFreshFrame = isFreshGameFrame,
-                        isHdr10 = isHdr10Surface
-                    )
-                    GLES20.glDisable(GLES20.GL_SCISSOR_TEST)
                 }
+                if (topBarH > 0) {
+                    GLES20.glScissor(0, topStartPx, dstW, topBarH)
+                    drawOesGameplayQuad(
+                        h = oesHandles,
+                        oesTexId = oesTexId,
+                        mvp = mvpMatrix,
+                        texMatrix = stMatrix,
+                        verts = fullQuadVerts,
+                        texCoords = oesTexCoords,
+                        srcW = srcW,
+                        srcH = srcH,
+                        isBlurPass = true,
+                        isFreshFrame = isFreshGameFrame,
+                        isHdr10 = isHdr10Surface
+                    )
+                }
+                GLES20.glDisable(GLES20.GL_SCISSOR_TEST)
             }
         }
 
@@ -2322,7 +2411,8 @@ class SolVideoPipeline(private val context: Context) {
             dstH = dstH,
             mode = framing,
             smartZoomPct = zoomPct,
-            flipDeg = liveLandscapeFlip
+            flipDeg = liveLandscapeFlip,
+            translateNdcY = shortsTranslateY
         )
         drawOesGameplayQuad(
             h = oesHandles,
@@ -2337,6 +2427,92 @@ class SolVideoPipeline(private val context: Context) {
             isFreshFrame = isFreshGameFrame,
             isHdr10 = isHdr10Surface
         )
+
+        // 1b. v1.6.0 SolShorts™ Zero-Copy Tactical HUD Loupes (Score+Killfeed & Minimap above gameplay)
+        if (dstIsVertical && srcIsLandscape && framing != "FILL") {
+            val scoreCrop = resolveShortsLoupeSourceCrop(liveShortsScoreLoupe, isMinimap = false)
+            val minimapSuppressed = isMinimapLoupeSuppressedByShield(
+                minimapLoupe = liveShortsMinimapLoupe,
+                shieldEnabled = liveMinimapShieldEnabled,
+                shieldCorner = liveMinimapShieldCorner
+            )
+            val minimapCrop = if (minimapSuppressed) {
+                null
+            } else {
+                resolveShortsLoupeSourceCrop(liveShortsMinimapLoupe, isMinimap = true)
+            }
+            if (scoreCrop != null || minimapCrop != null) {
+                val gameTopNdc = (shortsTranslateY + sharpScaleY).coerceIn(-0.60f, 0.92f)
+                val slotBottomNdc = gameTopNdc + 0.018f
+                val slotTopNdc = min(0.86f, slotBottomNdc + 0.34f)
+                if (slotTopNdc - slotBottomNdc >= 0.08f) {
+                    if (scoreCrop != null) {
+                        val cropAspect = ((scoreCrop.x1 - scoreCrop.x0) * srcW) /
+                            max(1f, (scoreCrop.yBot - scoreCrop.yTop) * srcH)
+                        val destRect = computeShortsLoupeDestNdc(
+                            slotLeftNdc = -0.94f,
+                            slotRightNdc = -0.02f,
+                            slotBottomNdc = slotBottomNdc,
+                            slotTopNdc = slotTopNdc,
+                            cropAspect = cropAspect,
+                            dstAspect = dstAspect,
+                            alignRight = false
+                        )
+                        if (destRect != null) {
+                            drawTacticalLoupe(
+                                oesHandles = oesHandles,
+                                oesTexId = oesTexId,
+                                stMatrix = stMatrix,
+                                identityMvp = identityMvp,
+                                loupeQuadVerts = loupeQuadVerts,
+                                loupeTexCoords = loupeTexCoords,
+                                crop = scoreCrop,
+                                dest = destRect,
+                                flipDeg = liveLandscapeFlip,
+                                srcW = srcW,
+                                srcH = srcH,
+                                dstW = dstW,
+                                dstH = dstH,
+                                isFreshFrame = isFreshGameFrame,
+                                isHdr10 = isHdr10Surface
+                            )
+                        }
+                    }
+                    if (minimapCrop != null) {
+                        val cropAspect = ((minimapCrop.x1 - minimapCrop.x0) * srcW) /
+                            max(1f, (minimapCrop.yBot - minimapCrop.yTop) * srcH)
+                        val destRect = computeShortsLoupeDestNdc(
+                            slotLeftNdc = 0.02f,
+                            slotRightNdc = 0.94f,
+                            slotBottomNdc = slotBottomNdc,
+                            slotTopNdc = slotTopNdc,
+                            cropAspect = cropAspect,
+                            dstAspect = dstAspect,
+                            alignRight = true
+                        )
+                        if (destRect != null) {
+                            drawTacticalLoupe(
+                                oesHandles = oesHandles,
+                                oesTexId = oesTexId,
+                                stMatrix = stMatrix,
+                                identityMvp = identityMvp,
+                                loupeQuadVerts = loupeQuadVerts,
+                                loupeTexCoords = loupeTexCoords,
+                                crop = minimapCrop,
+                                dest = destRect,
+                                flipDeg = liveLandscapeFlip,
+                                srcW = srcW,
+                                srcH = srcH,
+                                dstW = dstW,
+                                dstH = dstH,
+                                isFreshFrame = isFreshGameFrame,
+                                isHdr10 = isHdr10Surface
+                            )
+                        }
+                    }
+                }
+            }
+        }
 
         // 2. Privacy Blur (Minimap Shield + Independent Keyboard Blur)
         if (liveMinimapShieldEnabled) {
@@ -2399,19 +2575,27 @@ class SolVideoPipeline(private val context: Context) {
             }
         }
 
-        // 4. Phase 1 (v1.5.0+) Pro Broadcast Overlays (drawn ABOVE Privacy Blur so HUD/QR/Avatar stay crisp)
+        // 4. Pro Broadcast Overlays (SolHUD™, Corner QR, PNGTuber) — with optional Shorts Pro Header layout
+        val useShortsHeader = dstIsVertical && liveShortsHeaderLayout
+
         if (hudTexId != 0) {
             val maxH = if (dstIsVertical) 0.042f else 0.062f
             val maxW = if (dstIsVertical) 0.52f else 0.30f
+            val (hudCorner, hudOffsetY) = if (useShortsHeader) {
+                "TOP_LEFT" to -0.10f
+            } else {
+                liveHudTelemetryCorner to 0.0f
+            }
             SolHudAndQrRenderer.computeCornerQuadMvp(
                 mvp = overlayMvpMatrix,
                 bmpW = SolHudAndQrRenderer.HUD_WIDTH_PX,
                 bmpH = SolHudAndQrRenderer.HUD_HEIGHT_PX,
                 dstW = dstW,
                 dstH = dstH,
-                corner = liveHudTelemetryCorner,
+                corner = hudCorner,
                 maxHeightFrac = maxH,
-                maxWidthFrac = maxW
+                maxWidthFrac = maxW,
+                extraOffsetY = hudOffsetY
             )
             drawRgbaQuad(rgbaHandles, hudTexId, overlayMvpMatrix, fullQuadVerts, bitmapTexCoords, enableBlend = true)
         }
@@ -2419,15 +2603,22 @@ class SolVideoPipeline(private val context: Context) {
         if (qrTexId != 0) {
             val qrMaxH = if (dstIsVertical) 0.13f else 0.18f
             val qrMaxW = if (dstIsVertical) 0.24f else 0.14f
+            val (qrCorner, qrOffsetY) = if (useShortsHeader) {
+                val lifted = if (liveQrOverlayCorner.startsWith("BOTTOM_")) "TOP_RIGHT" else liveQrOverlayCorner
+                lifted to -0.12f
+            } else {
+                liveQrOverlayCorner to 0.0f
+            }
             SolHudAndQrRenderer.computeCornerQuadMvp(
                 mvp = overlayMvpMatrix,
                 bmpW = SolHudAndQrRenderer.QR_SIZE_PX,
                 bmpH = SolHudAndQrRenderer.QR_SIZE_PX,
                 dstW = dstW,
                 dstH = dstH,
-                corner = liveQrOverlayCorner,
+                corner = qrCorner,
                 maxHeightFrac = qrMaxH,
-                maxWidthFrac = qrMaxW
+                maxWidthFrac = qrMaxW,
+                extraOffsetY = qrOffsetY
             )
             drawRgbaQuad(rgbaHandles, qrTexId, overlayMvpMatrix, fullQuadVerts, bitmapTexCoords, enableBlend = true)
         }
@@ -2435,16 +2626,26 @@ class SolVideoPipeline(private val context: Context) {
         if (pngTuberTexId != 0) {
             val sizeFrac = (livePngTuberSizePercent.coerceIn(12, 30) / 100.0f) * (if (dstIsVertical) 0.78f else 1.0f)
             val hopNdcY = pngTuberBounceFrac * 0.032f
+            val (avatarCorner, avatarOffsetY) = if (useShortsHeader) {
+                val lifted = when (livePngTuberCorner) {
+                    "BOTTOM_RIGHT" -> "TOP_RIGHT"
+                    "BOTTOM_LEFT" -> "TOP_LEFT"
+                    else -> livePngTuberCorner
+                }
+                lifted to (-0.14f + hopNdcY)
+            } else {
+                livePngTuberCorner to hopNdcY
+            }
             SolHudAndQrRenderer.computeCornerQuadMvp(
                 mvp = overlayMvpMatrix,
                 bmpW = pngTuberBmpW,
                 bmpH = pngTuberBmpH,
                 dstW = dstW,
                 dstH = dstH,
-                corner = livePngTuberCorner,
+                corner = avatarCorner,
                 maxHeightFrac = sizeFrac,
                 maxWidthFrac = if (dstIsVertical) 0.34f else 0.24f,
-                extraOffsetY = hopNdcY
+                extraOffsetY = avatarOffsetY
             )
             drawRgbaQuad(rgbaHandles, pngTuberTexId, overlayMvpMatrix, fullQuadVerts, bitmapTexCoords, enableBlend = true)
         }
@@ -2454,6 +2655,85 @@ class SolVideoPipeline(private val context: Context) {
             val bannerVerts = if (liveBannerPosition == "BOTTOM") bannerBottomVerts else bannerTopVerts
             drawRgbaQuad(rgbaHandles, bannerTexId, identityMvp, bannerVerts, bitmapTexCoords, enableBlend = true)
         }
+    }
+
+    /**
+     * Draws one zero-copy Tactical HUD Loupe cropped straight from [oesTexId] with a crisp 2px cyan border.
+     * Supports 180° landscape flip accurately so minimap & score/killfeed always read right-side up.
+     */
+    private fun drawTacticalLoupe(
+        oesHandles: GlShaderBank.OesHandles,
+        oesTexId: Int,
+        stMatrix: FloatArray,
+        identityMvp: FloatArray,
+        loupeQuadVerts: FloatBuffer,
+        loupeTexCoords: FloatBuffer,
+        crop: CropUvRect,
+        dest: NdcRect,
+        flipDeg: Int,
+        srcW: Int,
+        srcH: Int,
+        dstW: Int,
+        dstH: Int,
+        isFreshFrame: Boolean,
+        isHdr10: Boolean
+    ) {
+        // 2px crisp obsidian-cyan accent frame via zero-cost glScissor + glClear
+        val borderPx = 2
+        val pxLeft = (((dest.left + 1.0f) * 0.5f * dstW).roundToInt() - borderPx).coerceIn(0, dstW - 1)
+        val pxRight = (((dest.right + 1.0f) * 0.5f * dstW).roundToInt() + borderPx).coerceIn(pxLeft + 1, dstW)
+        val pxBottom = (((dest.bottom + 1.0f) * 0.5f * dstH).roundToInt() - borderPx).coerceIn(0, dstH - 1)
+        val pxTop = (((dest.top + 1.0f) * 0.5f * dstH).roundToInt() + borderPx).coerceIn(pxBottom + 1, dstH)
+
+        GLES20.glEnable(GLES20.GL_SCISSOR_TEST)
+        GLES20.glScissor(pxLeft, pxBottom, pxRight - pxLeft, pxTop - pxBottom)
+        GLES20.glClearColor(0.0f, 0.72f, 0.90f, 1.0f)
+        GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
+        GLES20.glDisable(GLES20.GL_SCISSOR_TEST)
+
+        loupeQuadVerts.clear()
+        loupeQuadVerts.put(dest.left).put(dest.bottom)
+        loupeQuadVerts.put(dest.right).put(dest.bottom)
+        loupeQuadVerts.put(dest.left).put(dest.top)
+        loupeQuadVerts.put(dest.right).put(dest.top)
+        loupeQuadVerts.position(0)
+
+        loupeTexCoords.clear()
+        if (flipDeg == 180) {
+            val uLeft = 1.0f - crop.x0
+            val uRight = 1.0f - crop.x1
+            val vBottom = crop.yBot
+            val vTop = crop.yTop
+            loupeTexCoords.put(uLeft).put(vBottom)
+            loupeTexCoords.put(uRight).put(vBottom)
+            loupeTexCoords.put(uLeft).put(vTop)
+            loupeTexCoords.put(uRight).put(vTop)
+        } else {
+            val uLeft = crop.x0
+            val uRight = crop.x1
+            val vBottom = 1.0f - crop.yBot
+            val vTop = 1.0f - crop.yTop
+            loupeTexCoords.put(uLeft).put(vBottom)
+            loupeTexCoords.put(uRight).put(vBottom)
+            loupeTexCoords.put(uLeft).put(vTop)
+            loupeTexCoords.put(uRight).put(vTop)
+        }
+        loupeTexCoords.position(0)
+
+        drawOesGameplayQuad(
+            h = oesHandles,
+            oesTexId = oesTexId,
+            mvp = identityMvp,
+            texMatrix = stMatrix,
+            verts = loupeQuadVerts,
+            texCoords = loupeTexCoords,
+            srcW = srcW,
+            srcH = srcH,
+            isBlurPass = false,
+            isFreshFrame = isFreshFrame,
+            isHdr10 = isHdr10,
+            forceBilinear = true
+        )
     }
 
     private fun drawOesGameplayQuad(
@@ -2467,7 +2747,8 @@ class SolVideoPipeline(private val context: Context) {
         srcH: Int,
         isBlurPass: Boolean,
         isFreshFrame: Boolean,
-        isHdr10: Boolean
+        isHdr10: Boolean,
+        forceBilinear: Boolean = false
     ) {
         GLES20.glUseProgram(h.programId)
         GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
@@ -2483,7 +2764,7 @@ class SolVideoPipeline(private val context: Context) {
             "LANCZOS" -> 2.0f
             else -> 1.0f
         }
-        val effectiveUpscalerVal = if (isBlurPass || (thermalModerateCoolerActive && !isFreshFrame)) {
+        val effectiveUpscalerVal = if (forceBilinear || isBlurPass || (thermalModerateCoolerActive && !isFreshFrame)) {
             0.0f
         } else {
             rawUpscalerVal
@@ -2499,7 +2780,7 @@ class SolVideoPipeline(private val context: Context) {
         val filmicVal = if (!isBlurPass && !isHdr10 && liveCinematicFilmic) 1.0f else 0.0f
         val vividVal = if (!isBlurPass && !isHdr10 && liveAmoledVivid) 1.0f else 0.0f
         val tempVal = if (!isBlurPass && !isHdr10) tempShift else 0.0f
-        val sharpVal = if (!isBlurPass && liveGpuSharpen) 0.34f else 0.0f
+        val sharpVal = if (!forceBilinear && !isBlurPass && liveGpuSharpen) 0.34f else 0.0f
 
         val fastPassthrough = !isBlurPass &&
             effectiveUpscalerVal < 0.5f &&
@@ -2576,7 +2857,8 @@ class SolVideoPipeline(private val context: Context) {
         dstH: Int,
         mode: String,
         smartZoomPct: Int,
-        flipDeg: Int
+        flipDeg: Int,
+        translateNdcY: Float = 0.0f
     ) {
         val srcAspect = max(1, srcW).toFloat() / max(1, srcH).toFloat()
         val dstAspect = max(1, dstW).toFloat() / max(1, dstH).toFloat()
@@ -2612,6 +2894,9 @@ class SolVideoPipeline(private val context: Context) {
         }
 
         Matrix.setIdentityM(mvp, 0)
+        if (translateNdcY != 0.0f) {
+            Matrix.translateM(mvp, 0, 0f, translateNdcY, 0f)
+        }
         if (flipDeg == 180) {
             Matrix.rotateM(mvp, 0, 180f, 0f, 0f, 1f)
         }
@@ -3013,6 +3298,138 @@ class SolVideoPipeline(private val context: Context) {
             consecutiveTransientErrors: Int
         ): Boolean {
             return isTransient && isRunning && consecutiveTransientErrors < MAX_TRANSIENT_CODEC_RETRIES
+        }
+
+        /**
+         * v1.6.0 SolShorts™ Capture Bandwidth Saver:
+         * Scales VirtualDisplay capture smoothly down to <=1600 long side for FIT/SMART (<=160% zoom)
+         * or <=1920 long side for FILL/high zoom while preserving exact aspect ratio and even dimensions.
+         * Cuts SurfaceFlinger capture bandwidth by ~50% on 2340x1080 panels when coolerEnabled is true.
+         */
+        internal fun scaleCaptureForShortsCooler(
+            rawW: Int,
+            rawH: Int,
+            framingMode: String,
+            smartZoomPercent: Int,
+            coolerEnabled: Boolean
+        ): Pair<Int, Int> {
+            val safeW = max(2, rawW).let { if (it % 2 == 0) it else it - 1 }
+            val safeH = max(2, rawH).let { if (it % 2 == 0) it else it - 1 }
+            if (!coolerEnabled) return safeW to safeH
+
+            val normMode = framingMode.trim().uppercase(Locale.US)
+            val maxLongCap = if (normMode == "FILL" || (normMode == "SMART" && smartZoomPercent > 160)) {
+                1920
+            } else {
+                1600
+            }
+            val longSide = max(safeW, safeH)
+            if (longSide <= maxLongCap) return safeW to safeH
+
+            val scale = maxLongCap.toFloat() / longSide.toFloat()
+            val w = max(2, (safeW * scale).roundToInt()).let { if (it % 2 == 0) it else it - 1 }
+            val h = max(2, (safeH * scale).roundToInt()).let { if (it % 2 == 0) it else it - 1 }
+            return w to h
+        }
+
+        /**
+         * Computes vertical NDC offset for 9:16 Shorts gameplay:
+         * - CENTER: 0.0f
+         * - ABOVE_CHAT: +0.20f (+10% viewport height upward shift so gameplay sits above YouTube's
+         *   bottom 35% live chat zone while keeping top clearance below the 15% LIVE/search header).
+         */
+        internal fun computeShortsVerticalOffsetNdc(
+            isVerticalDst: Boolean,
+            isLandscapeSrc: Boolean,
+            framingMode: String,
+            sharpScaleY: Float,
+            anchorMode: String
+        ): Float {
+            if (!isVerticalDst || !isLandscapeSrc) return 0.0f
+            if (framingMode.equals("FILL", ignoreCase = true)) return 0.0f
+            if (!anchorMode.equals("ABOVE_CHAT", ignoreCase = true)) return 0.0f
+            val maxSafeShift = max(0.0f, 1.0f - sharpScaleY - 0.16f)
+            return min(0.20f, maxSafeShift)
+        }
+
+        /**
+         * Resolves visual normalized crop rectangles (0..1 left-to-right, 0..1 top-to-bottom)
+         * for zero-copy SolShorts™ Tactical HUD Loupes.
+         */
+        internal fun resolveShortsLoupeSourceCrop(loupeMode: String, isMinimap: Boolean): CropUvRect? {
+            val m = loupeMode.trim().uppercase(Locale.US)
+            if (m == "OFF") return null
+            return if (isMinimap) {
+                when (m) {
+                    "TOP_RIGHT" -> CropUvRect(x0 = 0.79f, yTop = 0.02f, x1 = 0.99f, yBot = 0.33f)
+                    "TOP_LEFT" -> CropUvRect(x0 = 0.01f, yTop = 0.02f, x1 = 0.21f, yBot = 0.33f)
+                    else -> null
+                }
+            } else {
+                when (m) {
+                    "TOP_LEFT_FEED" -> CropUvRect(x0 = 0.01f, yTop = 0.01f, x1 = 0.29f, yBot = 0.39f)
+                    "TOP_LEFT" -> CropUvRect(x0 = 0.01f, yTop = 0.01f, x1 = 0.24f, yBot = 0.22f)
+                    "TOP_CENTER" -> CropUvRect(x0 = 0.34f, yTop = 0.00f, x1 = 0.66f, yBot = 0.16f)
+                    else -> null
+                }
+            }
+        }
+
+        /**
+         * Privacy safety guard: automatically suppresses the Minimap Loupe whenever Minimap Blur Shield
+         * is actively protecting that same radar corner so stream-sniper protection is never bypassed.
+         */
+        internal fun isMinimapLoupeSuppressedByShield(
+            minimapLoupe: String,
+            shieldEnabled: Boolean,
+            shieldCorner: String
+        ): Boolean {
+            if (!shieldEnabled) return false
+            val loupe = minimapLoupe.trim().uppercase(Locale.US)
+            val corner = shieldCorner.trim().uppercase(Locale.US)
+            return when (loupe) {
+                "TOP_RIGHT" -> corner.startsWith("TOP_RIGHT")
+                "TOP_LEFT" -> corner == "TOP_LEFT"
+                else -> false
+            }
+        }
+
+        /**
+         * Fits a cropped HUD Loupe cleanly inside its NDC slot above gameplay while preserving exact
+         * pixel aspect ratio (zero squished circles or stretched killfeed text).
+         */
+        internal fun computeShortsLoupeDestNdc(
+            slotLeftNdc: Float,
+            slotRightNdc: Float,
+            slotBottomNdc: Float,
+            slotTopNdc: Float,
+            cropAspect: Float,
+            dstAspect: Float,
+            alignRight: Boolean
+        ): NdcRect? {
+            val availW = slotRightNdc - slotLeftNdc
+            val availH = slotTopNdc - slotBottomNdc
+            if (availW <= 0.05f || availH <= 0.05f || cropAspect <= 0.05f || dstAspect <= 0.05f) return null
+
+            val targetNdcRatio = cropAspect / dstAspect
+            var w = availH * targetNdcRatio
+            var h = availH
+            if (w > availW) {
+                w = availW
+                h = availW / targetNdcRatio
+            }
+            if (w <= 0.02f || h <= 0.02f) return null
+
+            val left = if (alignRight) (slotRightNdc - w) else slotLeftNdc
+            val right = left + w
+            val bottom = slotBottomNdc
+            val top = bottom + h
+            return NdcRect(
+                left = left.coerceIn(-0.98f, 0.98f),
+                bottom = bottom.coerceIn(-0.98f, 0.98f),
+                right = right.coerceIn(-0.98f, 0.98f),
+                top = top.coerceIn(-0.98f, 0.98f)
+            )
         }
 
         /**
