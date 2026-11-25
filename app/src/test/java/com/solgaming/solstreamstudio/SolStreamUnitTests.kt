@@ -230,11 +230,16 @@ class SolStreamUnitTests {
 
     @Test
     fun diagnosticsBitrateTracker_computesAccurateSessionAverage() {
-        DiagnosticsLogger.recordBitrateSample(20_000)
-        DiagnosticsLogger.recordBitrateSample(16_000)
-        DiagnosticsLogger.recordBitrateSample(18_000)
-        assertEquals(18_000, DiagnosticsLogger.lastBitrateKbps)
-        assertTrue(DiagnosticsLogger.getSessionAverageBitrateKbps() in 16_000..20_000)
+        try {
+            DiagnosticsLogger.resetSessionLifecycleForTests()
+            DiagnosticsLogger.recordBitrateSample(20_000)
+            DiagnosticsLogger.recordBitrateSample(16_000)
+            DiagnosticsLogger.recordBitrateSample(18_000)
+            assertEquals(18_000, DiagnosticsLogger.lastBitrateKbps)
+            assertEquals(18_000, DiagnosticsLogger.getSessionAverageBitrateKbps())
+        } finally {
+            DiagnosticsLogger.resetSessionLifecycleForTests()
+        }
     }
 
     @Test
@@ -1017,11 +1022,11 @@ class SolStreamUnitTests {
         assertEquals("SOL LUXE 3.0 (Pure Condenser)", MicDspProcessor.presetDisplayName("SOL_LUXE"))
     }
 
-    // === PHASE 1 (v1.5.0 / v1.5.1 / v1.5.2) UNIT TESTS ===
+    // === PHASE 1 (v1.5.0 / v1.5.1 / v1.5.2 / v1.6.0) UNIT TESTS ===
 
     @Test
     fun diagnosticsReportFreeze_stopsResamplingAfterSessionFinalized() {
-        assertEquals("v1.5.2", DiagnosticsLogger.ENGINE_VERSION)
+        assertEquals("v1.6.0", DiagnosticsLogger.ENGINE_VERSION)
         try {
             DiagnosticsLogger.resetSessionLifecycleForTests()
             // Before any session starts -> allowed to sample idle hardware health
@@ -1137,7 +1142,10 @@ class SolStreamUnitTests {
         assertTrue(p2.settings.isVertical)
         assertTrue(p2.settings.useShortsKeySlot)
         assertEquals("BLUR", p2.settings.shortsBackdropMode)
-        assertEquals(12000, p2.settings.targetBitrateKbps)
+        assertEquals("ABOVE_CHAT", p2.settings.shortsVerticalAnchor)
+        assertTrue(p2.settings.shortsCaptureCooler)
+        assertEquals(9000, p2.settings.targetBitrateKbps)
+        assertEquals(160, p2.settings.audioBitrateKbps)
 
         assertEquals("Custom", p3.name)
         assertFalse(p3.isUserCustomized)
@@ -1174,6 +1182,8 @@ class SolStreamUnitTests {
         assertEquals(30, liteWifi.settings.fps)
         assertEquals(1280, liteShorts.settings.width)
         assertEquals(30, liteShorts.settings.fps)
+        assertEquals(5000, liteShorts.settings.targetBitrateKbps)
+        assertEquals(128, liteShorts.settings.audioBitrateKbps)
     }
 
     @Test
@@ -2009,9 +2019,224 @@ class SolStreamUnitTests {
         assertFalse(SolDualAudioEngine.shouldRetryTransientAacException(false, true, 0))
         assertFalse(SolDualAudioEngine.shouldRetryTransientAacException(true, false, 0))
 
-        assertTrue(DashboardDialogs.isRemoteVersionNewer("v1.5.2", "1.5.1"))
+        assertTrue(DashboardDialogs.isRemoteVersionNewer("v1.6.0", "1.5.2"))
         assertTrue(DashboardDialogs.isRemoteVersionNewer("1.10.0", "1.9.9"))
-        assertFalse(DashboardDialogs.isRemoteVersionNewer("v1.5.2", "1.5.2-debug"))
-        assertFalse(DashboardDialogs.isRemoteVersionNewer("1.5.1", "1.5.2"))
+        assertFalse(DashboardDialogs.isRemoteVersionNewer("v1.6.0", "1.6.0-debug"))
+        assertFalse(DashboardDialogs.isRemoteVersionNewer("1.5.2", "1.6.0"))
+    }
+
+    // === v1.6.0 SOLSHORTS™ STUDIO & POST-CALL BT SCO SETTLE UNIT TESTS ===
+
+    @Test
+    fun shortsCaptureCooler_scales2340x1080To1600x738AndRespectsOffToggle() {
+        // Cooler ON in SMART 150% -> ~53% lower SurfaceFlinger pixel bandwidth with even dimensions
+        val (wSmart, hSmart) = SolVideoPipeline.scaleCaptureForShortsCooler(
+            rawW = 2340,
+            rawH = 1080,
+            framingMode = "SMART",
+            smartZoomPercent = 150,
+            coolerEnabled = true
+        )
+        assertEquals(1600, wSmart)
+        assertEquals(738, hSmart)
+        assertEquals(0, wSmart % 2)
+        assertEquals(0, hSmart % 2)
+
+        // High zoom (>160%) or FILL steps up automatically to 1920x886 for sharpness
+        assertEquals(
+            1920 to 886,
+            SolVideoPipeline.scaleCaptureForShortsCooler(2340, 1080, "SMART", 175, coolerEnabled = true)
+        )
+        assertEquals(
+            1920 to 886,
+            SolVideoPipeline.scaleCaptureForShortsCooler(2340, 1080, "FILL", 100, coolerEnabled = true)
+        )
+
+        // Cooler OFF preserves full raw panel capture untouched (zero hard caps)
+        assertEquals(
+            2340 to 1080,
+            SolVideoPipeline.scaleCaptureForShortsCooler(2340, 1080, "SMART", 150, coolerEnabled = false)
+        )
+
+        // Smaller displays (1280x720) are never upscaled
+        assertEquals(
+            1280 to 720,
+            SolVideoPipeline.scaleCaptureForShortsCooler(1280, 720, "FIT", 100, coolerEnabled = true)
+        )
+    }
+
+    @Test
+    fun shortsVerticalAnchorAndTacticalLoupes_computeNonOverlappingAspectSafeBounds() {
+        // ABOVE_CHAT shifts 9:16 gameplay +0.20 NDC (+10% height) while CENTER stays 0.0f
+        assertEquals(
+            0.20f,
+            SolVideoPipeline.computeShortsVerticalOffsetNdc(true, true, "SMART", 0.39f, "ABOVE_CHAT"),
+            1e-4f
+        )
+        assertEquals(
+            0.0f,
+            SolVideoPipeline.computeShortsVerticalOffsetNdc(true, true, "SMART", 0.39f, "CENTER"),
+            1e-4f
+        )
+        assertEquals(
+            0.0f,
+            SolVideoPipeline.computeShortsVerticalOffsetNdc(true, true, "FILL", 1.0f, "ABOVE_CHAT"),
+            1e-4f
+        )
+        assertEquals(
+            0.0f,
+            SolVideoPipeline.computeShortsVerticalOffsetNdc(false, true, "SMART", 0.39f, "ABOVE_CHAT"),
+            1e-4f
+        )
+        // High zoom clamps upward shift cleanly below top safe margin
+        assertEquals(
+            0.06f,
+            SolVideoPipeline.computeShortsVerticalOffsetNdc(true, true, "SMART", 0.78f, "ABOVE_CHAT"),
+            1e-4f
+        )
+
+        // Verify Score+Killfeed (left) and Minimap (right) crop rectangles and non-overlapping aspect-safe NDC placement
+        assertNull(SolVideoPipeline.resolveShortsLoupeSourceCrop("OFF", isMinimap = true))
+        assertNull(SolVideoPipeline.resolveShortsLoupeSourceCrop("OFF", isMinimap = false))
+
+        val scoreCrop = SolVideoPipeline.resolveShortsLoupeSourceCrop("TOP_LEFT_FEED", isMinimap = false)
+        val minimapCrop = SolVideoPipeline.resolveShortsLoupeSourceCrop("TOP_RIGHT", isMinimap = true)
+        assertNotNull(scoreCrop)
+        assertNotNull(minimapCrop)
+
+        val srcW = 2340f
+        val srcH = 1080f
+        val dstAspect = 1080f / 1920f
+        val scoreAspect = ((scoreCrop!!.x1 - scoreCrop.x0) * srcW) / ((scoreCrop.yBot - scoreCrop.yTop) * srcH)
+        val mapAspect = ((minimapCrop!!.x1 - minimapCrop.x0) * srcW) / ((minimapCrop.yBot - minimapCrop.yTop) * srcH)
+
+        val scoreDest = SolVideoPipeline.computeShortsLoupeDestNdc(
+            slotLeftNdc = -0.94f,
+            slotRightNdc = -0.02f,
+            slotBottomNdc = 0.52f,
+            slotTopNdc = 0.86f,
+            cropAspect = scoreAspect,
+            dstAspect = dstAspect,
+            alignRight = false
+        )
+        val mapDest = SolVideoPipeline.computeShortsLoupeDestNdc(
+            slotLeftNdc = 0.02f,
+            slotRightNdc = 0.94f,
+            slotBottomNdc = 0.52f,
+            slotTopNdc = 0.86f,
+            cropAspect = mapAspect,
+            dstAspect = dstAspect,
+            alignRight = true
+        )
+        assertNotNull(scoreDest)
+        assertNotNull(mapDest)
+        assertTrue("Score+Feed and Minimap loupes must never overlap", scoreDest!!.right < mapDest!!.left)
+        assertTrue(scoreDest.left >= -0.98f && scoreDest.top <= 0.98f)
+        assertTrue(mapDest.right <= 0.98f && mapDest.top <= 0.98f)
+
+        val actualScorePixelAspect = ((scoreDest.right - scoreDest.left) / (scoreDest.top - scoreDest.bottom)) * dstAspect
+        val actualMapPixelAspect = ((mapDest.right - mapDest.left) / (mapDest.top - mapDest.bottom)) * dstAspect
+        assertEquals(scoreAspect, actualScorePixelAspect, 0.005f)
+        assertEquals(mapAspect, actualMapPixelAspect, 0.005f)
+    }
+
+    @Test
+    fun shortsMinimapLoupePrivacyGuard_suppressesLoupeWhenBlurShieldCoversSameCorner() {
+        assertTrue(SolVideoPipeline.isMinimapLoupeSuppressedByShield("TOP_RIGHT", true, "TOP_RIGHT"))
+        assertTrue(SolVideoPipeline.isMinimapLoupeSuppressedByShield("TOP_RIGHT", true, "TOP_RIGHT_LARGE"))
+        assertTrue(SolVideoPipeline.isMinimapLoupeSuppressedByShield("TOP_LEFT", true, "TOP_LEFT"))
+        assertFalse(SolVideoPipeline.isMinimapLoupeSuppressedByShield("TOP_RIGHT", true, "TOP_LEFT"))
+        assertFalse(SolVideoPipeline.isMinimapLoupeSuppressedByShield("TOP_RIGHT", false, "TOP_RIGHT"))
+        assertFalse(SolVideoPipeline.isMinimapLoupeSuppressedByShield("OFF", true, "TOP_RIGHT"))
+    }
+
+    @Test
+    fun shortsSettingsSanitizersAndPlatformNormalizer_preserveUnlockedYoutubeShorts() {
+        assertEquals("CENTER", KeystoreVault.sanitizeShortsVerticalAnchor("invalid"))
+        assertEquals("ABOVE_CHAT", KeystoreVault.sanitizeShortsVerticalAnchor(" above_chat "))
+        assertEquals("OFF", KeystoreVault.sanitizeShortsMinimapLoupe("BOTTOM_LEFT"))
+        assertEquals("TOP_RIGHT", KeystoreVault.sanitizeShortsMinimapLoupe("top_right"))
+        assertEquals("TOP_LEFT_FEED", KeystoreVault.sanitizeShortsScoreLoupe(" top_left_feed "))
+        assertEquals("OFF", KeystoreVault.sanitizeShortsScoreLoupe("unknown"))
+
+        // Trimmed lowercase platformPreset must normalize cleanly without bypassing validation
+        val dirtyTwitch = StreamSettings(platformPreset = "  twitch ", codec = "HEVC", targetBitrateKbps = 20000)
+        val (fixedTwitch, _) = KeystoreVault.enforcePlatformLimits(dirtyTwitch)
+        assertEquals("TWITCH", fixedTwitch.platformPreset)
+        assertEquals("H264", fixedTwitch.codec)
+        assertEquals(6000, fixedTwitch.targetBitrateKbps)
+
+        // YouTube 9:16 Shorts stays completely unlocked (user free to pick 1440p / 25M / all Loupes OFF or ON)
+        val unlockedYtShorts = StreamSettings(
+            platformPreset = "YOUTUBE",
+            isVertical = true,
+            codec = "HEVC",
+            width = 2560,
+            height = 1440,
+            fps = 60,
+            targetBitrateKbps = 25000,
+            shortsVerticalAnchor = "ABOVE_CHAT",
+            shortsMinimapLoupe = "TOP_RIGHT",
+            shortsScoreLoupe = "TOP_LEFT_FEED",
+            shortsHeaderLayout = true,
+            shortsCaptureCooler = false
+        )
+        val (enforcedYt, changedYt) = KeystoreVault.enforcePlatformLimits(unlockedYtShorts)
+        assertFalse(changedYt)
+        assertEquals(2560, enforcedYt.width)
+        assertEquals(25000, enforcedYt.targetBitrateKbps)
+        assertFalse(enforcedYt.shortsCaptureCooler)
+    }
+
+    @Test
+    fun postCallBtScoSettleDelayAndDecidegreeThermalParser_behaveAccurately() {
+        assertEquals(1_500L, SolDualAudioEngine.POST_CALL_SETTLE_DELAY_MS)
+        assertFalse(SolDualAudioEngine.shouldDeferPostCallMicRestore(10_000L, 0L))
+        assertTrue(SolDualAudioEngine.shouldDeferPostCallMicRestore(10_000L, 11_500L))
+        assertTrue(SolDualAudioEngine.shouldDeferPostCallMicRestore(11_499L, 11_500L))
+        assertFalse(SolDualAudioEngine.shouldDeferPostCallMicRestore(11_500L, 11_500L))
+        assertFalse(SolDualAudioEngine.shouldDeferPostCallMicRestore(13_000L, 11_500L))
+
+        // Sysfs thermal parser handles millidegrees, decidegrees, whole degrees, and rejects out-of-range
+        assertEquals(42.5f, DiagnosticsLogger.parseThermalZoneTempC(42_500L), 0.01f)
+        assertEquals(42.5f, DiagnosticsLogger.parseThermalZoneTempC(425L), 0.01f)
+        assertEquals(42.0f, DiagnosticsLogger.parseThermalZoneTempC(42L), 0.01f)
+        assertEquals(-1f, DiagnosticsLogger.parseThermalZoneTempC(5_000L), 0.01f)
+        assertEquals(-1f, DiagnosticsLogger.parseThermalZoneTempC(150_000L), 0.01f)
+    }
+
+    @Test
+    fun shortsOverlaySummaryAndButtonLabels_reflectActiveLoupesAndShieldSuppression() {
+        assertEquals("Pos:ABOVE", SolStreamService.formatCompactShortsAnchorTag("ABOVE_CHAT"))
+        assertEquals("Pos:CENTER", SolStreamService.formatCompactShortsAnchorTag("CENTER"))
+        assertEquals("MapL:TR", SolStreamService.formatCompactShortsMinimapLoupeTag("TOP_RIGHT", false))
+        assertEquals("MapL:SHIELD", SolStreamService.formatCompactShortsMinimapLoupeTag("TOP_RIGHT", true))
+        assertEquals("MapL:OFF", SolStreamService.formatCompactShortsMinimapLoupeTag("OFF", false))
+        assertEquals("FeedL:TL+K", SolStreamService.formatCompactShortsScoreLoupeTag("TOP_LEFT_FEED"))
+        assertEquals("FeedL:OFF", SolStreamService.formatCompactShortsScoreLoupeTag("OFF"))
+
+        assertTrue(MainActivity.formatShortsScoreLoupeButtonLabel("TOP_LEFT_FEED").contains("Killfeed"))
+        assertEquals("Score+Feed Loupe: OFF", MainActivity.formatShortsScoreLoupeButtonLabel("OFF"))
+        assertTrue(MainActivity.formatShortsMinimapLoupeButtonLabel("TOP_RIGHT", suppressedByShield = true).contains("Paused by Blur"))
+        assertEquals("Minimap Loupe: OFF", MainActivity.formatShortsMinimapLoupeButtonLabel("OFF", suppressedByShield = true))
+
+        val shortsWithLoupes = StreamSettings(
+            isVertical = true,
+            shortsMinimapLoupe = "TOP_RIGHT",
+            shortsScoreLoupe = "TOP_LEFT_FEED",
+            shortsHeaderLayout = true
+        )
+        val summary = SolStreamService.buildActiveOverlaysSummary(shortsWithLoupes)
+        assertTrue(summary.contains("MapLoupe (TR)"))
+        assertTrue(summary.contains("ScoreLoupe (TL+Feed)"))
+        assertTrue(summary.contains("ShortsHeader"))
+
+        // When Minimap Blur Shield covers TOP_RIGHT, MapLoupe must be suppressed from the active summary
+        val shieldedSummary = SolStreamService.buildActiveOverlaysSummary(
+            shortsWithLoupes.copy(minimapShieldEnabled = true, minimapShieldCorner = "TOP_RIGHT")
+        )
+        assertFalse(shieldedSummary.contains("MapLoupe"))
+        assertTrue(shieldedSummary.contains("ScoreLoupe (TL+Feed)"))
+        assertTrue(shieldedSummary.contains("MapBlur (TOP_RIGHT)"))
     }
 }
