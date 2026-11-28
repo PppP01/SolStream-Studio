@@ -1,9 +1,9 @@
 /*
- * ॐ नमः शिवाय (Om Namah Shivaya)
- * SolStream Studio — Ultra-Lightweight Mobile Gaming Broadcast Engine
- * Copyright (c) 2026 Sol (@Sol_CODM / github.com/PppP01). All rights reserved.
- * SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
- * Commercial redistribution, rebranding, or app-store monetization prohibited without written license.
+- ॐ नमः शिवाय (Om Namah Shivaya)
+- SolStream Studio — Ultra-Lightweight Mobile Gaming Broadcast Engine
+- Copyright (c) 2026 Sol (@Sol_CODM / github.com/PppP01). All rights reserved.
+- SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+- Commercial redistribution, rebranding, or app-store monetization prohibited without written license.
  */
 
 package com.solgaming.solstreamstudio
@@ -80,6 +80,16 @@ class MainActivity : AppCompatActivity() {
     private val uiHandler = Handler(Looper.getMainLooper())
     private val micTestBusy = AtomicBoolean(false)
     private val hwScanBusy = AtomicBoolean(false)
+    private val goLiveWaitBusy = AtomicBoolean(false)
+
+    private val serviceStateListener: () -> Unit = {
+        runOnUiThread {
+            if (!isFinishing && !isDestroyed) {
+                settings = KeystoreVault.enforcePlatformLimits(KeystoreVault.loadSettings(this)).first
+                refreshAllUi()
+            }
+        }
+    }
 
     // Responsive Layout Containers (Android 10–18 Phones, Foldables & Tablets)
     private lateinit var fixedHeaderBox: LinearLayout
@@ -362,14 +372,7 @@ class MainActivity : AppCompatActivity() {
 
         setContentView(buildDashboardUi())
 
-        SolStreamService.onStateChangedListener = {
-            runOnUiThread {
-                if (!isFinishing && !isDestroyed) {
-                    settings = KeystoreVault.enforcePlatformLimits(KeystoreVault.loadSettings(this)).first
-                    refreshAllUi()
-                }
-            }
-        }
+        SolStreamService.onStateChangedListener = serviceStateListener
         refreshAllUi()
 
         CodecCapabilityProbe.scanDeviceAsync(this, forceRefresh = false) { verifiedScan ->
@@ -412,10 +415,17 @@ class MainActivity : AppCompatActivity() {
         super.onPause()
     }
 
+    override fun onStop() {
+        // Android 17 Background Audio Hardening: stop offline 10s Mic Test AudioTrack/AudioRecord in background
+        SolDualAudioEngine.stopOfflineMicTestIfActive()
+        super.onStop()
+    }
+
     override fun onDestroy() {
         uiHandler.removeCallbacks(idleTelemetryRefreshRunnable)
         uiHandler.removeCallbacks(dashboardStopResetRunnable)
-        if (SolStreamService.onStateChangedListener != null) {
+        goLiveWaitBusy.set(false)
+        if (SolStreamService.onStateChangedListener === serviceStateListener) {
             SolStreamService.onStateChangedListener = null
         }
         super.onDestroy()
@@ -431,6 +441,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun readAppVersionName(): String {
+        val fallback = DiagnosticsLogger.ENGINE_VERSION.removePrefix("v")
         return try {
             val info = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                 packageManager.getPackageInfo(packageName, PackageManager.PackageInfoFlags.of(0))
@@ -438,9 +449,9 @@ class MainActivity : AppCompatActivity() {
                 @Suppress("DEPRECATION")
                 packageManager.getPackageInfo(packageName, 0)
             }
-            info.versionName?.removeSuffix("-debug") ?: "1.6.0"
+            info.versionName?.removeSuffix("-debug") ?: fallback
         } catch (_: Exception) {
-            "1.6.0"
+            fallback
         }
     }
 
@@ -1846,6 +1857,7 @@ class MainActivity : AppCompatActivity() {
         val isLive = SolStreamService.isBroadcastLive
 
         val longDim = max(settings.width, settings.height)
+        val shortDim = min(settings.width, settings.height)
         val heroResShort = when {
             longDim >= 3840 -> "4K (2160p)"
             longDim >= 2560 -> "1440p (2K)"
@@ -2109,7 +2121,7 @@ class MainActivity : AppCompatActivity() {
         }
         styleToggleBtn(btnSharpen, isOn = settings.gpuSharpen)
 
-        // v1.6.0 SolShorts™ Studio Controls inside Card 3 Drawer
+        // v1.6.1 SolShorts™ Studio Controls inside Card 3 Drawer
         val anchorAbove = settings.shortsVerticalAnchor.equals("ABOVE_CHAT", ignoreCase = true)
         btnShortsAnchor.text = if (anchorAbove) {
             "9:16 Pos: ABOVE CHAT (+10% Up)"
@@ -2135,12 +2147,15 @@ class MainActivity : AppCompatActivity() {
             isOn = !settings.shortsMinimapLoupe.equals("OFF", ignoreCase = true) && !mapSuppressed
         )
 
-        btnShortsCaptureCooler.text = if (settings.shortsCaptureCooler) {
-            "Shorts Capture Cooler (-50% Capture BW): ON$restartSuffix"
-        } else {
-            "Shorts Capture Cooler: OFF (Full Raw Panel Capture)$restartSuffix"
+        btnShortsCaptureCooler.text = when {
+            !settings.shortsCaptureCooler ->
+                "Shorts Capture Cooler: OFF (Full Raw Panel Capture)$restartSuffix"
+            shortDim > 1080 ->
+                "Shorts Capture Cooler: ON (Auto-Bypassed >1080p)$restartSuffix"
+            else ->
+                "Shorts Capture Cooler (-50% Capture BW): ON$restartSuffix"
         }
-        styleToggleBtn(btnShortsCaptureCooler, isOn = settings.shortsCaptureCooler)
+        styleToggleBtn(btnShortsCaptureCooler, isOn = settings.shortsCaptureCooler && shortDim <= 1080)
 
         // Phase 1 (v1.5.0+) Pro Broadcast Overlays inside Card 3 Drawer
         btnHudTelemetryToggle.text = "SolHUD™ Telemetry: ${onOff(settings.hudTelemetryEnabled)}"
@@ -2426,7 +2441,7 @@ class MainActivity : AppCompatActivity() {
         refreshAllUi()
     }
 
-    // === v1.6.0 SOLSHORTS™ STUDIO HANDLERS ===
+    // === v1.6.1 SOLSHORTS™ STUDIO HANDLERS ===
     private fun cycleShortsVerticalAnchor() {
         val order = KeystoreVault.SHORTS_ANCHOR_ORDER
         val curIdx = order.indexOf(settings.shortsVerticalAnchor.uppercase(Locale.US)).let { if (it < 0) 0 else it }
@@ -3364,27 +3379,33 @@ class MainActivity : AppCompatActivity() {
     private fun requestScreenCaptureAndGoLive() {
         CodecCapabilityProbe.isBroadcastStartingOrLive = true
         if (CodecCapabilityProbe.isHardwareProbeCurrentlyRunning()) {
+            if (!goLiveWaitBusy.compareAndSet(false, true)) return
             Toast.makeText(
                 this,
                 "Finishing startup hardware encoder check—launching stream...",
                 Toast.LENGTH_SHORT
             ).show()
             Thread({
-                var waitedMs = 0
-                while (CodecCapabilityProbe.isHardwareProbeCurrentlyRunning() && waitedMs < 5000) {
-                    try { Thread.sleep(50) } catch (_: InterruptedException) { break }
-                    waitedMs += 50
-                }
-                runOnUiThread {
-                    if (!isFinishing && !isDestroyed && !SolStreamService.isBroadcastLive) {
-                        launchScreenCapturePromptSafely()
-                    } else {
-                        CodecCapabilityProbe.isBroadcastStartingOrLive = false
+                try {
+                    var waitedMs = 0
+                    while (CodecCapabilityProbe.isHardwareProbeCurrentlyRunning() && waitedMs < 5000) {
+                        try { Thread.sleep(50) } catch (_: InterruptedException) { break }
+                        waitedMs += 50
+                    }
+                } finally {
+                    runOnUiThread {
+                        goLiveWaitBusy.set(false)
+                        if (!isFinishing && !isDestroyed && !SolStreamService.isBroadcastLive) {
+                            launchScreenCapturePromptSafely()
+                        } else {
+                            CodecCapabilityProbe.isBroadcastStartingOrLive = false
+                        }
                     }
                 }
             }, "SolWaitProbeBeforeLive").start()
             return
         }
+        if (goLiveWaitBusy.get()) return
         launchScreenCapturePromptSafely()
     }
 
