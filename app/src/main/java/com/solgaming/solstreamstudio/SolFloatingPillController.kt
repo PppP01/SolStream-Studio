@@ -1,9 +1,9 @@
 /*
- * ॐ नमः शिवाय (Om Namah Shivaya)
- * SolStream Studio — Ultra-Lightweight Mobile Gaming Broadcast Engine
- * Copyright (c) 2026 Sol (@Sol_CODM / github.com/PppP01). All rights reserved.
- * SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
- * Commercial redistribution, rebranding, or app-store monetization prohibited without written license.
+- ॐ नमः शिवाय (Om Namah Shivaya)
+- SolStream Studio — Ultra-Lightweight Mobile Gaming Broadcast Engine
+- Copyright (c) 2026 Sol (@Sol_CODM / github.com/PppP01). All rights reserved.
+- SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+- Commercial redistribution, rebranding, or app-store monetization prohibited without written license.
  */
 
 package com.solgaming.solstreamstudio
@@ -67,7 +67,8 @@ internal data class PillTelemetrySnapshot(
     val appRamMb: Int,
     val totalRamGb: Int,
     val availRamGb: Float,
-    val activeAuxCount: Int
+    val activeAuxCount: Int,
+    val loupesPaused: Boolean = false
 )
 
 internal interface PillActions {
@@ -116,6 +117,7 @@ internal interface PillActions {
     fun onCycleShortsMinimapLoupe()
     fun onCycleShortsScoreLoupe()
     fun onToggleShortsHeaderLayout()
+    fun onToggleLoupesPaused() {}
     fun onStepLiveBitrate(dir: Int)
     fun onToggleAbr()
     fun onToggleThermal30FpsSaver()
@@ -123,8 +125,8 @@ internal interface PillActions {
 }
 
 /**
- * Self-contained 3-tab Accessibility Ghost Floating Pill & IME Keyboard Blur detector.
- * Keeps SolStreamService focused purely on broadcast lifecycle, networking, ABR, and thermal control.
+- Self-contained 3-tab Accessibility Ghost Floating Pill & IME Keyboard Blur detector.
+- Keeps SolStreamService focused purely on broadcast lifecycle, networking, ABR, and thermal control.
  */
 internal class SolFloatingPillController(
     private val context: Context,
@@ -139,6 +141,7 @@ internal class SolFloatingPillController(
     private var pillStatusText: TextView? = null
     private var pillDrawerContainer: LinearLayout? = null
     private var pillLayoutParams: WindowManager.LayoutParams? = null
+    private var expandedPanelWidthPx: Int = 0
     private var pillExpanded = false
     private var activePillTab = 0 // 0 = Audio, 1 = Video, 2 = Bitrate/Net
     private var lastStopConfirmTapMs = 0L
@@ -190,6 +193,7 @@ internal class SolFloatingPillController(
     private var shortsStudioSection: LinearLayout? = null
     private var btnOvShortsAnchor: TextView? = null
     private var btnOvShortsHeader: TextView? = null
+    private var btnOvShortsLoupesPause: TextView? = null
     private var btnOvShortsScoreLoupe: TextView? = null
     private var btnOvShortsMinimapLoupe: TextView? = null
     private var btnOvOverlayPos: TextView? = null
@@ -224,17 +228,22 @@ internal class SolFloatingPillController(
 
     private fun dp(v: Int): Int = (v * context.resources.displayMetrics.density).roundToInt()
 
-    private fun clampOverlayCoords(rawX: Int, rawY: Int): Pair<Int, Int> {
+    private fun clampOverlayCoords(rawX: Int, rawY: Int, useExpandedWidth: Boolean = false): Pair<Int, Int> {
         val dm = context.resources.displayMetrics
-        val maxX = max(0, dm.widthPixels - dp(72))
+        val widthReserve = if (useExpandedWidth && expandedPanelWidthPx > 0) {
+            expandedPanelWidthPx + dp(20)
+        } else {
+            dp(72)
+        }
+        val maxX = max(0, dm.widthPixels - widthReserve)
         val maxY = max(0, dm.heightPixels - dp(48))
         return rawX.coerceIn(0, maxX) to rawY.coerceIn(0, maxY)
     }
 
-    private fun ensurePillWithinCurrentScreenBounds() {
+    private fun ensurePillWithinCurrentScreenBounds(useExpandedWidth: Boolean = pillExpanded) {
         val root = pillRootView ?: return
         val lp = pillLayoutParams ?: return
-        val (clampedX, clampedY) = clampOverlayCoords(lp.x, lp.y)
+        val (clampedX, clampedY) = clampOverlayCoords(lp.x, lp.y, useExpandedWidth = useExpandedWidth)
         if (clampedX != lp.x || clampedY != lp.y) {
             lp.x = clampedX
             lp.y = clampedY
@@ -250,7 +259,7 @@ internal class SolFloatingPillController(
         if (!SolStreamService.isAccessibilityEnabled(context) || pillRootView != null) return
 
         val screenMinPx = min(context.resources.displayMetrics.widthPixels, context.resources.displayMetrics.heightPixels)
-        val expandedPanelWidthPx = min(dp(344), (screenMinPx * 0.93f).roundToInt().coerceAtLeast(dp(280)))
+        expandedPanelWidthPx = min(dp(344), (screenMinPx * 0.93f).roundToInt().coerceAtLeast(dp(280)))
 
         val root = LinearLayout(context).apply {
             orientation = LinearLayout.VERTICAL
@@ -396,7 +405,7 @@ internal class SolFloatingPillController(
         btnOvFlip180 = makePillMiniBtn("Rot:0°", "#38BDF8") { actions.onToggleLandscapeFlip() }
         videoPane.addView(makeAlignedGridRow(btnOvUpscaler!!, btnOvSharpen!!, btnOvFlip180!!))
 
-        // v1.6.0 SolShorts™ Studio live controls (auto-shown for 9:16 Shorts & Dual-Format Companion)
+        // v1.6.1 SolShorts™ Studio live controls (auto-shown for 9:16 Shorts & Dual-Format Companion)
         val shortsSection = LinearLayout(context).apply {
             orientation = LinearLayout.VERTICAL
             visibility = View.GONE
@@ -406,9 +415,10 @@ internal class SolFloatingPillController(
         btnOvShortsHeader = makePillMiniBtn("Header:OFF", "#94A3B8") { actions.onToggleShortsHeaderLayout() }
         shortsSection.addView(makeAlignedGridRow(btnOvShortsAnchor!!, btnOvShortsHeader!!))
 
+        btnOvShortsLoupesPause = makePillMiniBtn("Loupes:OFF", "#94A3B8") { actions.onToggleLoupesPaused() }
         btnOvShortsScoreLoupe = makePillMiniBtn("FeedL:OFF", "#94A3B8") { actions.onCycleShortsScoreLoupe() }
         btnOvShortsMinimapLoupe = makePillMiniBtn("MapL:OFF", "#94A3B8") { actions.onCycleShortsMinimapLoupe() }
-        shortsSection.addView(makeAlignedGridRow(btnOvShortsScoreLoupe!!, btnOvShortsMinimapLoupe!!))
+        shortsSection.addView(makeAlignedGridRow(btnOvShortsLoupesPause!!, btnOvShortsScoreLoupe!!, btnOvShortsMinimapLoupe!!))
         shortsStudioSection = shortsSection
         videoPane.addView(shortsSection)
 
@@ -484,7 +494,7 @@ internal class SolFloatingPillController(
         }
 
         val savedPos = loadOverlayPositionPrefs()
-        val (clampedX, clampedY) = clampOverlayCoords(savedPos.first, savedPos.second)
+        val (clampedX, clampedY) = clampOverlayCoords(savedPos.first, savedPos.second, useExpandedWidth = false)
         val lp = WindowManager.LayoutParams(
             WindowManager.LayoutParams.WRAP_CONTENT,
             WindowManager.LayoutParams.WRAP_CONTENT,
@@ -525,7 +535,7 @@ internal class SolFloatingPillController(
                     val dy = (ev.rawY - downRawY).roundToInt()
                     if (abs(dx) > touchSlop || abs(dy) > touchSlop) {
                         dragging = true
-                        val (nx, ny) = clampOverlayCoords(startWinX + dx, startWinY + dy)
+                        val (nx, ny) = clampOverlayCoords(startWinX + dx, startWinY + dy, useExpandedWidth = pillExpanded)
                         lp.x = nx
                         lp.y = ny
                         try { windowManager.updateViewLayout(root, lp) } catch (_: Exception) {}
@@ -581,9 +591,9 @@ internal class SolFloatingPillController(
     }
 
     /**
-     * Orientation-safe IME keyboard detector:
-     * - Android 11+ (API 30+): strictly uses WindowInsets.Type.ime() (never false-triggers on screen rotation).
-     * - Android 10 (API 29): tracks max viewport height separately per portrait/landscape orientation.
+- Orientation-safe IME keyboard detector:
+- - Android 11+ (API 30+): strictly uses WindowInsets.Type.ime() (never false-triggers on screen rotation).
+- - Android 10 (API 29): tracks max viewport height separately per portrait/landscape orientation.
      */
     private fun attachInvisibleImeDetectorView() {
         if (imeDetectorView != null) return
@@ -638,6 +648,7 @@ internal class SolFloatingPillController(
         mainHandler.removeCallbacks(ghostAlphaRunnable)
         mainHandler.removeCallbacks(stopConfirmResetRunnable)
         pillExpanded = false
+        lastStopConfirmTapMs = 0L
         lastObservedImeVisible = false
 
         val det = imeDetectorView
@@ -667,7 +678,7 @@ internal class SolFloatingPillController(
         btnOvFilmic = null; btnOvVivid = null; btnOvShadowBoost = null; btnOvColorTemp = null
         btnOvFlip180 = null; btnOvSharpen = null
         shortsStudioSection = null; btnOvShortsAnchor = null; btnOvShortsHeader = null
-        btnOvShortsScoreLoupe = null; btnOvShortsMinimapLoupe = null
+        btnOvShortsLoupesPause = null; btnOvShortsScoreLoupe = null; btnOvShortsMinimapLoupe = null
         btnOvOverlayPos = null; btnOvLiveBanner = null
         btnOvCleanShot = null; btnOvHudTelemetry = null; btnOvQrOverlay = null; btnOvPngTuber = null
         btnOvMinimapShield = null; btnOvKeyboardBlur = null
@@ -680,7 +691,7 @@ internal class SolFloatingPillController(
     fun updateTelemetry() {
         val statusTv = pillStatusText ?: return
         val dot = pillStatusDot ?: return
-        ensurePillWithinCurrentScreenBounds()
+        ensurePillWithinCurrentScreenBounds(useExpandedWidth = pillExpanded)
         val snap = actions.getSnapshot()
 
         val mm = snap.elapsedSec / 60L
@@ -818,23 +829,38 @@ internal class SolFloatingPillController(
                 label = if (s.shortsHeaderLayout) "Header:ON" else "Header:OFF",
                 isOn = s.shortsHeaderLayout
             )
-            val scoreOn = !s.shortsScoreLoupe.equals("OFF", ignoreCase = true)
-            stylePillControlBtn(
-                btnOvShortsScoreLoupe,
-                label = SolStreamService.formatCompactShortsScoreLoupeTag(s.shortsScoreLoupe),
-                isOn = scoreOn
-            )
+
             val mapSuppressed = SolVideoPipeline.isMinimapLoupeSuppressedByShield(
                 s.shortsMinimapLoupe,
                 s.minimapShieldEnabled,
                 s.minimapShieldCorner
             )
+            val scoreOn = !s.shortsScoreLoupe.equals("OFF", ignoreCase = true)
             val mapActive = !s.shortsMinimapLoupe.equals("OFF", ignoreCase = true) && !mapSuppressed
+            val hasAnyLoupeConfigured = scoreOn || mapActive
+
+            val loupesPauseLabel = when {
+                !hasAnyLoupeConfigured -> "Loupes:OFF"
+                snap.loupesPaused -> "Loupes:HIDE"
+                else -> "Loupes:ON"
+            }
+            stylePillControlBtn(
+                btnOvShortsLoupesPause,
+                label = loupesPauseLabel,
+                isOn = hasAnyLoupeConfigured && !snap.loupesPaused,
+                isSelector = hasAnyLoupeConfigured && snap.loupesPaused
+            )
+            stylePillControlBtn(
+                btnOvShortsScoreLoupe,
+                label = SolStreamService.formatCompactShortsScoreLoupeTag(s.shortsScoreLoupe),
+                isOn = scoreOn && !snap.loupesPaused,
+                isSelector = scoreOn && snap.loupesPaused
+            )
             stylePillControlBtn(
                 btnOvShortsMinimapLoupe,
                 label = SolStreamService.formatCompactShortsMinimapLoupeTag(s.shortsMinimapLoupe, mapSuppressed),
-                isOn = mapActive,
-                isSelector = mapSuppressed
+                isOn = mapActive && !snap.loupesPaused,
+                isSelector = mapSuppressed || (mapActive && snap.loupesPaused)
             )
         }
 
@@ -930,8 +956,10 @@ internal class SolFloatingPillController(
         if (expand) {
             mainHandler.removeCallbacks(ghostAlphaRunnable)
             pillRootView?.alpha = 0.98f
+            ensurePillWithinCurrentScreenBounds(useExpandedWidth = true)
             refreshExpandedControls()
         } else {
+            ensurePillWithinCurrentScreenBounds(useExpandedWidth = false)
             scheduleGhostFade()
         }
     }
