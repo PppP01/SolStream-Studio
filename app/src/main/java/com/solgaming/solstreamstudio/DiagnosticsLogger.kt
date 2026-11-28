@@ -1,9 +1,9 @@
 /*
- * ॐ नमः शिवाय (Om Namah Shivaya)
- * SolStream Studio — Ultra-Lightweight Mobile Gaming Broadcast Engine
- * Copyright (c) 2026 Sol (@Sol_CODM / github.com/PppP01). All rights reserved.
- * SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
- * Commercial redistribution, rebranding, or app-store monetization prohibited without written license.
+- ॐ नमः शिवाय (Om Namah Shivaya)
+- SolStream Studio — Ultra-Lightweight Mobile Gaming Broadcast Engine
+- Copyright (c) 2026 Sol (@Sol_CODM / github.com/PppP01). All rights reserved.
+- SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+- Commercial redistribution, rebranding, or app-store monetization prohibited without written license.
  */
 
 package com.solgaming.solstreamstudio
@@ -91,7 +91,7 @@ data class BenchmarkSnapshot(
 
 object DiagnosticsLogger {
 
-    const val ENGINE_VERSION = "v1.6.0"
+    const val ENGINE_VERSION = "v1.6.1"
 
     private const val MAX_EVENTS = 160
     private const val MAX_CLIPS = 60
@@ -171,16 +171,16 @@ object DiagnosticsLogger {
     }
 
     /**
-     * Prevents idle post-stop report views from overwriting locked end-of-stream power,
-     * thermal headroom, battery %, and heap metrics.
+- Prevents idle post-stop report views from overwriting locked end-of-stream power,
+- thermal headroom, battery %, and heap metrics.
      */
     internal fun shouldSampleHealthOnReport(isLive: Boolean): Boolean {
         return isLive || sessionStartMs == 0L || !isSessionFinalized
     }
 
     /**
-     * Shows "COMPETITOR vs. SOLSTREAM" only when a competitor benchmark actually exists;
-     * otherwise labels the saved SolStream entry clearly as a previous SolStream session.
+- Shows "COMPETITOR vs. SOLSTREAM" only when a competitor benchmark actually exists;
+- otherwise labels the saved SolStream entry clearly as a previous SolStream session.
      */
     internal fun resolveBenchmarkSectionHeader(hasCompetitorBenchmark: Boolean): String {
         return if (hasCompetitorBenchmark) {
@@ -191,8 +191,8 @@ object DiagnosticsLogger {
     }
 
     /**
-     * Verifies a sysfs /sys/class/thermal/thermal_zoneN/type string represents a real CPU/SoC/GPU
-     * silicon sensor and explicitly rejects battery, charger, USB, skin, and RF sensors.
+- Verifies a sysfs /sys/class/thermal/thermal_zoneN/type string represents a real CPU/SoC/GPU
+- silicon sensor and explicitly rejects battery, charger, USB, skin, and RF sensors.
      */
     internal fun isVerifiedSocThermalZoneType(rawType: String): Boolean {
         val t = rawType.trim().lowercase(Locale.US)
@@ -204,8 +204,8 @@ object DiagnosticsLogger {
     }
 
     /**
-     * Parses sysfs thermal_zone temp readings reported in millidegrees (42500 -> 42.5°C),
-     * decidegrees (425 -> 42.5°C), or whole degrees (42 -> 42.0°C). Returns -1f if out of range.
+- Parses sysfs thermal_zone temp readings reported in millidegrees (42500 -> 42.5°C),
+- decidegrees (425 -> 42.5°C), or whole degrees (42 -> 42.0°C). Returns -1f if out of range.
      */
     internal fun parseThermalZoneTempC(rawValue: Long): Float {
         val degC = when {
@@ -285,8 +285,8 @@ object DiagnosticsLogger {
     }
 
     /**
-     * Snapshots the live active microphone status right BEFORE cleanupResources() stops the audio
-     * engine so the final Session Report header always shows the true active mic status instead of "MIC STOPPED".
+- Snapshots the live active microphone status right BEFORE cleanupResources() stops the audio
+- engine so the final Session Report header always shows the true active mic status instead of "MIC STOPPED".
      */
     @Synchronized
     fun lockFinalMicStatusBeforeStop() {
@@ -473,7 +473,12 @@ object DiagnosticsLogger {
     }
 
     @Synchronized
-    fun startNewSession(context: Context, modeTitle: String, pipelineDesc: String) {
+    fun startNewSession(
+        context: Context,
+        modeTitle: String,
+        pipelineDesc: String,
+        saveInitialCheckpoint: Boolean = true
+    ) {
         events.clear()
         clipHighlights.clear()
         persistSavedClips(context)
@@ -523,6 +528,19 @@ object DiagnosticsLogger {
             "$modeTitle started ($pipelineDesc).",
             "startTemp=${formatTempOrNa(temp)} batt=${lastBatteryPercent}% power=$startPowerSourceLabel thermal=${thermalStatusName(worstThermalState)}"
         )
+        if (saveInitialCheckpoint) {
+            saveLiveCheckpoint(context, skipHealthResample = true)
+        }
+    }
+
+    /**
+- Updates the negotiated hardware pipeline summary after video/audio initialization succeeds
+- without clearing early [GL_INIT], [VIDEO_FMT], [GAME_AUDIO], or [AUDIO_ENC] startup events.
+     */
+    @Synchronized
+    fun updateActivePipelineAndCheckpoint(context: Context, pipelineDesc: String) {
+        activePipelineDesc = pipelineDesc
+        log("PIPELINE_READY", "Broadcast pipeline ready ($pipelineDesc).")
         saveLiveCheckpoint(context, skipHealthResample = true)
     }
 
@@ -649,13 +667,14 @@ object DiagnosticsLogger {
     }
 
     /**
-     * Reads peak temperature across verified CPU/SoC/GPU thermal zones only (checking each zone's `type`
-     * file first). Supports millidegrees, decidegrees, and whole degrees. Returns -1f if SELinux blocks /sys/class/thermal.
+- Reads peak temperature across verified CPU/SoC/GPU thermal zones only (checking each zone's `type`
+- file first). Per-zone error handling prevents a single unreadable sysfs node from aborting the scan.
+- Supports millidegrees, decidegrees, and whole degrees. Returns -1f if SELinux blocks /sys/class/thermal.
      */
     private fun readOptionalSocTempC(): Float {
-        return try {
-            var maxSocTemp = -1f
-            for (idx in 0..25) {
+        var maxSocTemp = -1f
+        for (idx in 0..25) {
+            try {
                 val typeFile = File("/sys/class/thermal/thermal_zone$idx/type")
                 if (!typeFile.canRead()) continue
                 val zoneType = typeFile.readText().trim()
@@ -668,11 +687,11 @@ object DiagnosticsLogger {
                 if (degC > maxSocTemp) {
                     maxSocTemp = degC
                 }
+            } catch (_: Throwable) {
+                continue
             }
-            maxSocTemp
-        } catch (_: Throwable) {
-            -1f
         }
+        return maxSocTemp
     }
 
     fun readBatteryPercentage(context: Context): Int {
