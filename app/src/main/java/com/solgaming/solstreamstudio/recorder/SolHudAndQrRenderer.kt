@@ -1,9 +1,9 @@
 /*
- * ॐ नमः शिवाय (Om Namah Shivaya)
- * SolStream Studio — Ultra-Lightweight Mobile Gaming Broadcast Engine
- * Copyright (c) 2026 Sol (@Sol_CODM / github.com/PppP01). All rights reserved.
- * SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
- * Commercial redistribution, rebranding, or app-store monetization prohibited without written license.
+- ॐ नमः शिवाय (Om Namah Shivaya)
+- SolStream Studio — Ultra-Lightweight Mobile Gaming Broadcast Engine
+- Copyright (c) 2026 Sol (@Sol_CODM / github.com/PppP01). All rights reserved.
+- SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+- Commercial redistribution, rebranding, or app-store monetization prohibited without written license.
  */
 
 package com.solgaming.solstreamstudio.recorder
@@ -31,12 +31,12 @@ import kotlin.math.max
 import kotlin.math.min
 
 /**
- * Pure-Kotlin GPU Overlay & Media Utility for SolStream Studio Phase 1 (v1.5.0):
- * 1. SolHUD™ Live Telemetry Badge (480x72 = 138 KB reused scratch bitmap, zero per-frame GC).
- * 2. ISO/IEC 18004 QR Code Generator (Versions 1..10, Error Correction Level M, Byte Mode, up to 213 UTF-8 bytes)
- *    with zero third-party dependencies and crisp 256x256 white-bordered card output.
- * 3. Pure-Kotlin 4x4 Column-Major OpenGL Corner Quad MVP Matrix calculator (100% JVM unit-testable).
- * 4. Zero-permission Android 10–18 MediaStore Screenshot saver (IS_PENDING = 1 -> 0, JPEG quality 92).
+- Pure-Kotlin GPU Overlay & Media Utility for SolStream Studio (v1.6.1):
+- 1. SolHUD™ Live Telemetry Badge (480x72 = 138 KB reused scratch bitmap, zero per-frame GC) + 3s EMA bitrate smoother.
+- 2. ISO/IEC 18004 QR Code Generator (Versions 1..10, Error Correction Level M, Byte Mode, up to 213 UTF-8 bytes)
+-    with zero third-party dependencies and crisp 256x256 white-bordered card output.
+- 3. Pure-Kotlin 4x4 Column-Major OpenGL Corner Quad & 9:16 Shorts Safe-Stack Layout Calculator (100% JVM unit-testable).
+- 4. Zero-permission Android 10–18 MediaStore Screenshot saver (IS_PENDING = 1 -> 0, JPEG quality 92).
  */
 object SolHudAndQrRenderer {
 
@@ -44,6 +44,45 @@ object SolHudAndQrRenderer {
     const val HUD_HEIGHT_PX = 72
     const val QR_SIZE_PX = 256
     const val MAX_QR_UTF8_BYTES = 213
+
+    // Strictly clears YouTube Shorts Mobile top header (0%..15% = +1.00..+0.700 NDC = 288 px on 1080x1920)
+    const val SHORTS_TOP_SAFE_NDC = 0.700f
+
+    // 55% Left Score+Killfeed Loupe & 38% Right Minimap Loupe (32.4 px horizontal gap on 1080px width)
+    const val SHORTS_SCORE_SLOT_LEFT_NDC = -0.96f
+    const val SHORTS_SCORE_SLOT_RIGHT_NDC = 0.14f
+    const val SHORTS_MINIMAP_SLOT_LEFT_NDC = 0.20f
+    const val SHORTS_MINIMAP_SLOT_RIGHT_NDC = 0.96f
+
+    data class NdcRect(
+        val left: Float,
+        val bottom: Float,
+        val right: Float,
+        val top: Float
+    ) {
+        val width: Float get() = right - left
+        val height: Float get() = top - bottom
+
+        fun overlaps(other: NdcRect, eps: Float = 0.0005f): Boolean {
+            return left < other.right - eps &&
+                right > other.left + eps &&
+                bottom < other.top - eps &&
+                top > other.bottom + eps
+        }
+    }
+
+    data class ShortsTopLayout(
+        val hasLoupeBand: Boolean,
+        val loupeBottomNdc: Float,
+        val loupeTopNdc: Float,
+        val scoreSlotLeftNdc: Float,
+        val scoreSlotRightNdc: Float,
+        val minimapSlotLeftNdc: Float,
+        val minimapSlotRightNdc: Float,
+        val hudRect: NdcRect?,
+        val pngTuberRect: NdcRect?,
+        val qrRect: NdcRect?
+    )
 
     data class QrMatrix(
         val version: Int,
@@ -80,7 +119,7 @@ object SolHudAndQrRenderer {
         QrVersionSpecM(10, 346, 216, 26, 4, 43, 1, 44, intArrayOf(6, 28, 50))
     )
 
-    // === 1. PURE-KOTLIN OPENGL CORNER QUAD MVP MATRIX (COLUMN-MAJOR, JVM UNIT-TESTABLE) ===
+    // === 1. PURE-KOTLIN OPENGL QUAD & 9:16 SHORTS SAFE-STACK CALCULATORS (JVM UNIT-TESTABLE) ===
 
     fun computeCornerQuadMvp(
         mvp: FloatArray,
@@ -116,7 +155,7 @@ object SolHudAndQrRenderer {
         val marginY = 0.055f
 
         val tx: Float
-        var ty: Float
+        val ty: Float
         when (corner.trim().uppercase(Locale.US)) {
             "TOP_LEFT" -> {
                 tx = -1.0f + marginX + scaleX
@@ -147,6 +186,202 @@ object SolHudAndQrRenderer {
         mvp[12] = clampedTx
         mvp[13] = clampedTy
         mvp[15] = 1.0f
+    }
+
+    fun computeRectQuadMvp(mvp: FloatArray, rect: NdcRect) {
+        val sx = ((rect.right - rect.left) * 0.5f).coerceIn(0.005f, 1.0f)
+        val sy = ((rect.top - rect.bottom) * 0.5f).coerceIn(0.005f, 1.0f)
+        val tx = ((rect.left + rect.right) * 0.5f).coerceIn(-1.0f + sx, 1.0f - sx)
+        val ty = ((rect.bottom + rect.top) * 0.5f).coerceIn(-1.0f + sy, 1.0f - sy)
+        mvp.fill(0f)
+        mvp[0] = sx
+        mvp[5] = sy
+        mvp[10] = 1.0f
+        mvp[12] = tx
+        mvp[13] = ty
+        mvp[15] = 1.0f
+    }
+
+    /**
+     * Single source of truth for 9:16 YouTube Shorts top-area stacking (v1.6.1):
+     * - Strictly anchors everything at or below SHORTS_TOP_SAFE_NDC (+0.700 = 15% from top) so
+     *   YouTube's mobile @channel bar, viewer counter, and crown never cover SolHUD, Avatar, QR, or Loupes.
+     * - Separates Row 1 (SolHUD Left | PNGTuber Center-Right | QR Right) cleanly above Row 2 (Loupes)
+     *   with mathematically guaranteed zero overlap across CENTER (0%), ABOVE_CHAT (+10%), and Lobby Pause.
+     */
+    fun computeShortsTopLayout(
+        dstW: Int,
+        dstH: Int,
+        gameTopNdc: Float,
+        hasScoreLoupe: Boolean,
+        hasMinimapLoupe: Boolean,
+        loupesPaused: Boolean,
+        shortsHeaderLayout: Boolean,
+        hudEnabled: Boolean,
+        qrEnabled: Boolean,
+        pngTuberEnabled: Boolean,
+        pngTuberAspect: Float = 1.0f,
+        pngTuberBounceNdc: Float = 0f
+    ): ShortsTopLayout {
+        val safeDstW = max(1, dstW).toFloat()
+        val safeDstH = max(1, dstH).toFloat()
+        val invDstAspect = safeDstH / safeDstW
+        val safePngAspect = if (pngTuberAspect.isFinite() && pngTuberAspect > 0.1f) {
+            pngTuberAspect.coerceIn(0.25f, 4.0f)
+        } else {
+            1.0f
+        }
+
+        val wantsLoupes = (hasScoreLoupe || hasMinimapLoupe) && !loupesPaused
+        val hasHeaderOverlays = shortsHeaderLayout && (hudEnabled || qrEnabled || pngTuberEnabled)
+        val topCeilingNdc = SHORTS_TOP_SAFE_NDC
+        val bottomFloorNdc = gameTopNdc.coerceIn(-0.60f, 0.92f) + 0.015f
+        val totalBandNdc = topCeilingNdc - bottomFloorNdc
+        val rowGapNdc = 0.012f
+        val minLoupeNdc = 0.095f
+
+        var hasLoupeBand = false
+        var loupeBottomNdc = 0f
+        var loupeTopNdc = 0f
+        var headerTopNdc = topCeilingNdc
+        var headerBandNdc = 0f
+
+        if (hasHeaderOverlays) {
+            val desiredHeaderNdc = when {
+                !wantsLoupes -> if (qrEnabled || pngTuberEnabled) 0.188f else 0.084f
+                qrEnabled -> 0.150f
+                pngTuberEnabled -> 0.112f
+                else -> 0.078f
+            }
+
+            if (wantsLoupes && totalBandNdc >= (0.060f + rowGapNdc + minLoupeNdc)) {
+                val maxHeaderForLoupes = (totalBandNdc - rowGapNdc - minLoupeNdc).coerceAtLeast(0.060f)
+                headerBandNdc = min(desiredHeaderNdc, maxHeaderForLoupes)
+                loupeBottomNdc = bottomFloorNdc
+                loupeTopNdc = headerTopNdc - headerBandNdc - rowGapNdc
+                hasLoupeBand = (loupeTopNdc - loupeBottomNdc) >= 0.080f
+            } else {
+                // Either Loupes are OFF/Paused (Mode C) or FILL mode leaves no Loupe band
+                headerBandNdc = if (totalBandNdc >= 0.075f) {
+                    min(desiredHeaderNdc, totalBandNdc)
+                } else {
+                    desiredHeaderNdc
+                }
+                hasLoupeBand = false
+            }
+        } else if (wantsLoupes && totalBandNdc >= 0.080f) {
+            // Mode A: Loupes ON, Shorts Pro Header OFF
+            loupeBottomNdc = bottomFloorNdc
+            loupeTopNdc = min(topCeilingNdc, loupeBottomNdc + 0.285f)
+            hasLoupeBand = (loupeTopNdc - loupeBottomNdc) >= 0.080f
+        }
+
+        var hudRect: NdcRect? = null
+        var pngTuberRect: NdcRect? = null
+        var qrRect: NdcRect? = null
+
+        if (hasHeaderOverlays && headerBandNdc > 0.02f) {
+            val headerBottomNdc = headerTopNdc - headerBandNdc
+            val leftEdge = -0.96f
+            var rightCursor = 0.96f
+            val gapX = 0.04f
+
+            // 1. Corner QR (Rightmost inside Row 1)
+            if (qrEnabled) {
+                var qrH = headerBandNdc
+                var qrW = qrH * invDstAspect
+                val maxQrW = 0.44f
+                if (qrW > maxQrW) {
+                    qrW = maxQrW
+                    qrH = qrW / invDstAspect
+                }
+                val qrRight = rightCursor
+                val qrLeft = qrRight - qrW
+                val cy = (headerTopNdc + headerBottomNdc) * 0.5f
+                qrRect = NdcRect(
+                    left = qrLeft,
+                    bottom = cy - qrH * 0.5f,
+                    right = qrRight,
+                    top = cy + qrH * 0.5f
+                )
+                rightCursor = qrLeft - gapX
+            }
+
+            // 2. PNGTuber Avatar (Directly left of QR, or rightmost when QR is OFF)
+            if (pngTuberEnabled) {
+                val bounceHeadroom = min(0.014f, headerBandNdc * 0.12f)
+                val maxAvH = (headerBandNdc - bounceHeadroom).coerceAtLeast(0.036f)
+                var avH = if (qrEnabled) min(maxAvH, 0.138f) else min(maxAvH, 0.160f)
+                var avW = avH * safePngAspect * invDstAspect
+                val maxAvW = 0.36f
+                if (avW > maxAvW) {
+                    avW = maxAvW
+                    avH = avW / (safePngAspect * invDstAspect)
+                }
+                val avRight = rightCursor
+                val avLeft = avRight - avW
+                val baseBottom = headerBottomNdc + (headerBandNdc - bounceHeadroom - avH) * 0.5f
+                val clampedBounce = if (pngTuberBounceNdc.isFinite()) {
+                    pngTuberBounceNdc.coerceIn(0f, bounceHeadroom)
+                } else {
+                    0f
+                }
+                val avBottom = (baseBottom + clampedBounce).coerceIn(headerBottomNdc, headerTopNdc - avH)
+                pngTuberRect = NdcRect(
+                    left = avLeft,
+                    bottom = avBottom,
+                    right = avRight,
+                    top = avBottom + avH
+                )
+                rightCursor = avLeft - gapX
+            }
+
+            // 3. SolHUD™ Live Telemetry Badge (Leftmost inside Row 1)
+            if (hudEnabled) {
+                val availW = (rightCursor - leftEdge).coerceAtLeast(0.24f)
+                val targetMaxW = min(0.94f, availW)
+                val hudAspect = HUD_WIDTH_PX.toFloat() / HUD_HEIGHT_PX.toFloat()
+                val hFromW = targetMaxW / (hudAspect * invDstAspect)
+                val hudH = min(headerBandNdc, hFromW)
+                val hudW = min(targetMaxW, hudH * hudAspect * invDstAspect)
+                val cy = (headerTopNdc + headerBottomNdc) * 0.5f
+                hudRect = NdcRect(
+                    left = leftEdge,
+                    bottom = cy - hudH * 0.5f,
+                    right = leftEdge + hudW,
+                    top = cy + hudH * 0.5f
+                )
+            }
+        }
+
+        return ShortsTopLayout(
+            hasLoupeBand = hasLoupeBand,
+            loupeBottomNdc = loupeBottomNdc,
+            loupeTopNdc = loupeTopNdc,
+            scoreSlotLeftNdc = SHORTS_SCORE_SLOT_LEFT_NDC,
+            scoreSlotRightNdc = SHORTS_SCORE_SLOT_RIGHT_NDC,
+            minimapSlotLeftNdc = SHORTS_MINIMAP_SLOT_LEFT_NDC,
+            minimapSlotRightNdc = SHORTS_MINIMAP_SLOT_RIGHT_NDC,
+            hudRect = hudRect,
+            pngTuberRect = pngTuberRect,
+            qrRect = qrRect
+        )
+    }
+
+    /**
+     * 3-second EMA bitrate smoother for SolHUD™ so a single static dark/lobby frame
+     * never causes an abrupt 0.1M readout flash.
+     */
+    fun smoothHudBitrateMbps(
+        previousMbps: Float,
+        currentMbps: Float,
+        alpha: Float = 0.35f
+    ): Float {
+        val safePrev = if (previousMbps.isFinite() && previousMbps > 0f) previousMbps else 0f
+        if (!currentMbps.isFinite() || currentMbps < 0f) return safePrev
+        if (safePrev <= 0.05f) return currentMbps
+        val a = alpha.coerceIn(0.05f, 1.0f)
+        return (a * currentMbps) + ((1.0f - a) * safePrev)
     }
 
     // === 2. SOLHUD™ LIVE GPU TELEMETRY BADGE (ZERO-ALLOCATION REUSED SCRATCH BITMAP) ===
@@ -413,7 +648,7 @@ object SolHudAndQrRenderer {
     }
 
     private fun rsComputeGeneratorPoly(degree: Int): ByteArray {
-        var poly = ByteArray(degree)
+        val poly = ByteArray(degree)
         poly[degree - 1] = 1
         var root = 1
         for (i in 0 until degree) {
