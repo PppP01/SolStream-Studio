@@ -1,9 +1,9 @@
 /*
- * ॐ नमः शिवाय (Om Namah Shivaya)
- * SolStream Studio — Ultra-Lightweight Mobile Gaming Broadcast Engine
- * Copyright (c) 2026 Sol (@Sol_CODM / github.com/PppP01). All rights reserved.
- * SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
- * Commercial redistribution, rebranding, or app-store monetization prohibited without written license.
+- ॐ नमः शिवाय (Om Namah Shivaya)
+- SolStream Studio — Ultra-Lightweight Mobile Gaming Broadcast Engine
+- Copyright (c) 2026 Sol (@Sol_CODM / github.com/PppP01). All rights reserved.
+- SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+- Commercial redistribution, rebranding, or app-store monetization prohibited without written license.
  */
 
 package com.solgaming.solstreamstudio
@@ -80,10 +80,10 @@ data class MicCalibrationAdvice(
 }
 
 /**
- * Per-session exact-launched worker completion barrier.
- * Ensures shared AudioRecord / MicDspProcessor / AAC MediaCodec resources are released
- * strictly ONCE and ONLY after ALL launched audio workers (SolFloatAudioMixer + SolAacDrain)
- * have fully exited their finally blocks.
+- Per-session exact-launched worker completion barrier.
+- Ensures shared AudioRecord / MicDspProcessor / AAC MediaCodec resources are released
+- strictly ONCE and ONLY after ALL launched audio workers (SolFloatAudioMixer + SolAacDrain)
+- have fully exited their finally blocks.
  */
 internal class AudioWorkerBarrier {
     private var activeWorkers = 0
@@ -96,8 +96,8 @@ internal class AudioWorkerBarrier {
     }
 
     /**
-     * Called inside each launched worker's finally block.
-     * Returns true ONLY for the final worker to exit after [requestRelease] has been invoked.
+- Called inside each launched worker's finally block.
+- Returns true ONLY for the final worker to exit after [requestRelease] has been invoked.
      */
     @Synchronized
     fun onWorkerExited(): Boolean {
@@ -110,9 +110,9 @@ internal class AudioWorkerBarrier {
     }
 
     /**
-     * Called by [SolDualAudioEngine.stopStreamingAudio] after joining workers.
-     * Returns true immediately if all workers have already exited; otherwise defers
-     * release cleanly to the last remaining worker's [onWorkerExited].
+- Called by [SolDualAudioEngine.stopStreamingAudio] after joining workers.
+- Returns true immediately if all workers have already exited; otherwise defers
+- release cleanly to the last remaining worker's [onWorkerExited].
      */
     @Synchronized
     fun requestRelease(): Boolean {
@@ -132,12 +132,12 @@ internal class AudioWorkerBarrier {
 }
 
 /**
- * Zero-allocation, phase-continuous causal linear resampler for strict OEM microphone HALs
- * that reject 48 kHz capture and only expose 44.1 kHz or 16 kHz PCM_16BIT.
+- Zero-allocation, phase-continuous causal linear resampler for strict OEM microphone HALs
+- that reject 48 kHz capture and only expose 44.1 kHz or 16 kHz PCM_16BIT.
  *
- * Uses a deliberate 1-input-sample causal lookahead (constant linear-phase group delay of
- * 22.7 us at 44.1 kHz or 62.5 us at 16 kHz) so every 10 ms block boundary maintains exact
- * uniform time spacing without clamping or needing samples from the next uncaptured block.
+- Uses a deliberate 1-input-sample causal lookahead (constant linear-phase group delay of
+- 22.7 us at 44.1 kHz or 62.5 us at 16 kHz) so every 10 ms block boundary maintains exact
+- uniform time spacing without clamping or needing samples from the next uncaptured block.
  */
 internal class LinearMonoResampler48k(val sourceRateHz: Int) {
     val sourceSamplesPer10ms: Int = max(1, (sourceRateHz * 10) / 1000)
@@ -378,6 +378,7 @@ class SolDualAudioEngine(private val context: Context) {
         onEncodedAac: (ByteBuffer, MediaCodec.BufferInfo) -> Unit
     ): Boolean {
         if (isRunning) return false
+        stopOfflineMicTestIfActive()
         fatalErrorReported.set(false)
         fastBtEscapeReverifyRequested = false
 
@@ -473,9 +474,9 @@ class SolDualAudioEngine(private val context: Context) {
     }
 
     /**
-     * Watches for hot-plugged Wired/USB-C/Bluetooth headsets AND output headphones so both
-     * HardwareAcousticMode AND effectiveSpeakerAec refresh immediately without leaving hardware
-     * AEC active on headphones.
+- Watches for hot-plugged Wired/USB-C/Bluetooth headsets AND output headphones so both
+- HardwareAcousticMode AND effectiveSpeakerAec refresh immediately without leaving hardware
+- AEC active on headphones.
      */
     private fun registerDynamicAudioRouteWatcher() {
         try {
@@ -530,10 +531,10 @@ class SolDualAudioEngine(private val context: Context) {
     }
 
     /**
-     * Universal 2-Pass AAC-LC Encoder Configurator:
-     * Attempt 1 configures with explicit KEY_MAX_INPUT_SIZE = 32768 and requested bitrate;
-     * Attempt 2 falls back to a bare-metal AAC-LC format (without KEY_MAX_INPUT_SIZE and clamped
-     * to <= 192 kbps) so older Android 10/11 MediaTek/Unisoc audio codecs never fail initialization.
+- Universal 2-Pass AAC-LC Encoder Configurator:
+- Attempt 1 configures with explicit KEY_MAX_INPUT_SIZE = 32768 and requested bitrate;
+- Attempt 2 falls back to a bare-metal AAC-LC format (without KEY_MAX_INPUT_SIZE and clamped
+- to <= 192 kbps) so older Android 10/11 MediaTek/Unisoc audio codecs never fail initialization.
      */
     private fun createAndConfigureAacEncoder(bitrateBps: Int): MediaCodec? {
         val hwAacName = try {
@@ -1438,8 +1439,8 @@ class SolDualAudioEngine(private val context: Context) {
     }
 
     /**
-     * Strictly matches ONLY our own AudioRecord.audioSessionId so another app's in-game voice chat
-     * session never triggers false [MIC_OK] or silence events.
+- Strictly matches ONLY our own AudioRecord.audioSessionId so another app's in-game voice chat
+- session never triggers false [MIC_OK] or silence events.
      */
     private fun findOurRecordingConfiguration(rec: AudioRecord): AudioRecordingConfiguration? {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.N) return null
@@ -1663,9 +1664,9 @@ class SolDualAudioEngine(private val context: Context) {
     }
 
     /**
-     * Wraps an active microphone AudioRecord across 48 kHz PCM_FLOAT, 48 kHz PCM_16BIT,
-     * and alternate-sample-rate PCM_16BIT fallbacks, always delivering exact 480-sample / 48 kHz
-     * mono float frames with zero per-frame allocations.
+- Wraps an active microphone AudioRecord across 48 kHz PCM_FLOAT, 48 kHz PCM_16BIT,
+- and alternate-sample-rate PCM_16BIT fallbacks, always delivering exact 480-sample / 48 kHz
+- mono float frames with zero per-frame allocations.
      */
     private class OpenedMicSession(
         val record: AudioRecord,
@@ -1761,12 +1762,12 @@ class SolDualAudioEngine(private val context: Context) {
         }
 
         /**
-         * Guards automatic microphone rebuilds against false triggers on legitimate digital silence:
-         * - Enforces a strict 15-second cooldown between recovery attempts.
-         * - Recovers quickly (~300 ms) on real AudioRecord read errors.
-         * - Recovers after 1.5s of exact zeros ONLY when Android confirms isClientSilenced == true.
-         * - NEVER restarts a healthy silent mic when Android reports isClientSilenced == false.
-         * - Allows an 8-second exact-zero fallback only if recording configuration is unavailable (null).
+- Guards automatic microphone rebuilds against false triggers on legitimate digital silence:
+- - Enforces a strict 15-second cooldown between recovery attempts.
+- - Recovers quickly (~300 ms) on real AudioRecord read errors.
+- - Recovers after 1.5s of exact zeros ONLY when Android confirms isClientSilenced == true.
+- - NEVER restarts a healthy silent mic when Android reports isClientSilenced == false.
+- - Allows an 8-second exact-zero fallback only if recording configuration is unavailable (null).
          */
         internal fun shouldTriggerMicRecovery(
             consecutiveReadErrors: Int,
@@ -1790,12 +1791,38 @@ class SolDualAudioEngine(private val context: Context) {
 
         private val isCalibrationRecording = AtomicBoolean(false)
         private val isCalibrationPlaying = AtomicBoolean(false)
+        @Volatile private var calibrationRecordCancelRequested = false
+        @Volatile private var calibrationPlaybackCancelRequested = false
+        @Volatile private var activeCalibrationTrack: AudioTrack? = null
+        @Volatile private var activeCalibrationRecord: AudioRecord? = null
 
         @Volatile var lastCalibrationAdvice: MicCalibrationAdvice? = null
 
         /**
-         * Determines the active HardwareAcousticMode from the connected/routed microphone
-         * and speakerphone setting so SolLuxe™ 3.0 Pure tunes its 4x3 matrix automatically.
+- Android 17 Background Audio Hardening helper (v1.6.1):
+- Immediately stops any active offline 10s Mic Test recording or AudioTrack playback
+- when MainActivity moves to background (onStop), preventing background AudioTrack
+- playback outside a Foreground Service. Zero impact on live streaming audio.
+         */
+        fun stopOfflineMicTestIfActive() {
+            if (isCalibrationRecording.get()) {
+                calibrationRecordCancelRequested = true
+                try { activeCalibrationRecord?.stop() } catch (_: Exception) {}
+            }
+            if (isCalibrationPlaying.get()) {
+                calibrationPlaybackCancelRequested = true
+                val tr = activeCalibrationTrack
+                if (tr != null) {
+                    try { tr.pause() } catch (_: Exception) {}
+                    try { tr.flush() } catch (_: Exception) {}
+                    try { tr.stop() } catch (_: Exception) {}
+                }
+            }
+        }
+
+        /**
+- Determines the active HardwareAcousticMode from the connected/routed microphone
+- and speakerphone setting so SolLuxe™ 3.0 Pure tunes its 4x3 matrix automatically.
          */
         fun detectHardwareAcousticMode(
             context: Context,
@@ -1821,8 +1848,8 @@ class SolDualAudioEngine(private val context: Context) {
         }
 
         /**
-         * Computes whether Speakerphone AEC should actually be enabled on the microphone route.
-         * Strictly returns FALSE whenever wired/USB/Bluetooth headphones or headsets are connected.
+- Computes whether Speakerphone AEC should actually be enabled on the microphone route.
+- Strictly returns FALSE whenever wired/USB/Bluetooth headphones or headsets are connected.
          */
         fun computeEffectiveSpeakerAec(
             context: Context,
@@ -2131,53 +2158,72 @@ class SolDualAudioEngine(private val context: Context) {
                 onComplete(false, "10-second voice test is already recording.", null)
                 return
             }
+            calibrationRecordCancelRequested = false
 
             val appCtx = context.applicationContext ?: context
             Thread({
-                val wantHwNs = settings.noiseSuppressMode.equals("HW_NS", ignoreCase = true) && settings.rnnoiseLevel > 0
-                val effectiveAec = computeEffectiveSpeakerAec(appCtx, settings.speakerAecEnabled, settings.micDeviceId)
-                val opened = buildMicAudioRecord(
-                    context = appCtx,
-                    requestedSource = settings.micAudioSource,
-                    preferredDeviceId = settings.micDeviceId,
-                    enableHwNs = wantHwNs,
-                    effectiveSpeakerAec = effectiveAec
-                )
-                if (opened == null) {
-                    isCalibrationRecording.set(false)
-                    onComplete(false, "Microphone busy or permission denied.", null)
-                    return@Thread
-                }
-
-                val hwMode = detectHardwareAcousticMode(
-                    context = appCtx,
-                    preferredDeviceId = settings.micDeviceId,
-                    speakerAecEnabled = settings.speakerAecEnabled,
-                    routedDeviceOverride = opened.record.routedDevice
-                )
-                val dsp = MicDspProcessor(SAMPLE_RATE).apply {
-                    platformHwNsAttached = (opened.hwNoiseSuppressor != null)
-                    applyHardwareAcousticMode(hwMode)
-                    applySettings(settings)
-                }
-
-                val outFile = File(appCtx.cacheDir, TEST_PCM_FILENAME)
-                val floatBuf = FloatArray(MONO_SAMPLES_PER_10MS)
-                val pcmOut = ByteArray(MONO_SAMPLES_PER_10MS * 2)
-                val bb = ByteBuffer.wrap(pcmOut).order(ByteOrder.LITTLE_ENDIAN)
-
-                var quietEnergySum = 0.0
-                var quietCount = 0
-                var speechEnergySum = 0.0
-                var speechCount = 0
-                var maxSpeechPeakDb = -90.0f
-                var sibilanceTriggerFrames = 0
-
+                var opened: OpenedMicSession? = null
+                var dsp: MicDspProcessor? = null
                 try {
+                    if (calibrationRecordCancelRequested) {
+                        onComplete(false, "10s voice test stopped.", null)
+                        return@Thread
+                    }
+                    val wantHwNs = settings.noiseSuppressMode.equals("HW_NS", ignoreCase = true) && settings.rnnoiseLevel > 0
+                    val effectiveAec = computeEffectiveSpeakerAec(appCtx, settings.speakerAecEnabled, settings.micDeviceId)
+                    opened = buildMicAudioRecord(
+                        context = appCtx,
+                        requestedSource = settings.micAudioSource,
+                        preferredDeviceId = settings.micDeviceId,
+                        enableHwNs = wantHwNs,
+                        effectiveSpeakerAec = effectiveAec
+                    )
+                    if (opened == null) {
+                        onComplete(false, "Microphone busy or permission denied.", null)
+                        return@Thread
+                    }
+                    activeCalibrationRecord = opened.record
+                    if (calibrationRecordCancelRequested) {
+                        onComplete(false, "10s voice test stopped.", null)
+                        return@Thread
+                    }
+
+                    val hwMode = detectHardwareAcousticMode(
+                        context = appCtx,
+                        preferredDeviceId = settings.micDeviceId,
+                        speakerAecEnabled = settings.speakerAecEnabled,
+                        routedDeviceOverride = opened.record.routedDevice
+                    )
+                    val activeDsp = MicDspProcessor(SAMPLE_RATE).apply {
+                        platformHwNsAttached = (opened.hwNoiseSuppressor != null)
+                        applyHardwareAcousticMode(hwMode)
+                        applySettings(settings)
+                    }
+                    dsp = activeDsp
+
+                    val outFile = File(appCtx.cacheDir, TEST_PCM_FILENAME)
+                    val floatBuf = FloatArray(MONO_SAMPLES_PER_10MS)
+                    val pcmOut = ByteArray(MONO_SAMPLES_PER_10MS * 2)
+                    val bb = ByteBuffer.wrap(pcmOut).order(ByteOrder.LITTLE_ENDIAN)
+
+                    var quietEnergySum = 0.0
+                    var quietCount = 0
+                    var speechEnergySum = 0.0
+                    var speechCount = 0
+                    var maxSpeechPeakDb = -90.0f
+                    var sibilanceTriggerFrames = 0
+                    var abortedEarly = false
+
                     FileOutputStream(outFile).use { fos ->
                         val totalFrames = 1000 // 10.0 seconds (1000 * 10ms)
                         for (frame in 0 until totalFrames) {
-                            if (SolStreamService.isBroadcastLive || CodecCapabilityProbe.isBroadcastStartingOrLive) break
+                            if (calibrationRecordCancelRequested ||
+                                SolStreamService.isBroadcastLive ||
+                                CodecCapabilityProbe.isBroadcastStartingOrLive
+                            ) {
+                                abortedEarly = true
+                                break
+                            }
                             if (frame % 100 == 0) {
                                 val secLeft = 10 - (frame / 100)
                                 val phaseInstruction = if (frame < 300) {
@@ -2189,15 +2235,19 @@ class SolDualAudioEngine(private val context: Context) {
                             }
 
                             val r = opened.readMono48kFrame(floatBuf)
+                            if (r <= 0 && calibrationRecordCancelRequested) {
+                                abortedEarly = true
+                                break
+                            }
                             if (r > 0) {
-                                dsp.processMonoFrameInPlace(floatBuf, MONO_SAMPLES_PER_10MS)
+                                activeDsp.processMonoFrameInPlace(floatBuf, MONO_SAMPLES_PER_10MS)
 
-                                val frameRmsLin = MicDspProcessor.dbToLinear(dsp.lastRmsDb).toDouble()
-                                val framePeakDb = dsp.lastPeakDb
+                                val frameRmsLin = MicDspProcessor.dbToLinear(activeDsp.lastRmsDb).toDouble()
+                                val framePeakDb = activeDsp.lastPeakDb
                                 if (frame in 30 until 290) {
                                     quietEnergySum += frameRmsLin * frameRmsLin
                                     quietCount++
-                                } else if (frame >= 310 && dsp.vadSpeechActive) {
+                                } else if (frame >= 310 && activeDsp.vadSpeechActive) {
                                     speechEnergySum += frameRmsLin * frameRmsLin
                                     speechCount++
                                     if (framePeakDb > maxSpeechPeakDb) maxSpeechPeakDb = framePeakDb
@@ -2212,6 +2262,12 @@ class SolDualAudioEngine(private val context: Context) {
                                 fos.write(pcmOut)
                             }
                         }
+                    }
+
+                    if (abortedEarly) {
+                        try { if (outFile.exists()) outFile.delete() } catch (_: Exception) {}
+                        onComplete(false, "10s voice test stopped (app moved to background).", null)
+                        return@Thread
                     }
 
                     val avgQuietDb = if (quietCount > 0) {
@@ -2269,11 +2325,16 @@ class SolDualAudioEngine(private val context: Context) {
                     lastCalibrationAdvice = advice
                     onComplete(true, summary, advice)
                 } catch (e: Exception) {
-                    onComplete(false, "Test failed: ${e.javaClass.simpleName}", null)
+                    if (calibrationRecordCancelRequested) {
+                        onComplete(false, "10s voice test stopped.", null)
+                    } else {
+                        onComplete(false, "Test failed: ${e.javaClass.simpleName}", null)
+                    }
                 } finally {
+                    activeCalibrationRecord = null
                     isCalibrationRecording.set(false)
-                    dsp.release()
-                    opened.release()
+                    try { dsp?.release() } catch (_: Exception) {}
+                    try { opened?.release() } catch (_: Exception) {}
                 }
             }, "SolMicGripCalibrator").start()
         }
@@ -2287,18 +2348,22 @@ class SolDualAudioEngine(private val context: Context) {
                 onComplete("Test sample is already playing.")
                 return
             }
+            calibrationPlaybackCancelRequested = false
 
             val appCtx = context.applicationContext ?: context
             Thread({
-                val inFile = File(appCtx.cacheDir, TEST_PCM_FILENAME)
-                if (!inFile.exists() || inFile.length() == 0L) {
-                    isCalibrationPlaying.set(false)
-                    onComplete("Record a 10s Voice Test sample first.")
-                    return@Thread
-                }
-
                 var track: AudioTrack? = null
                 try {
+                    if (calibrationPlaybackCancelRequested) {
+                        onComplete("Playback stopped.")
+                        return@Thread
+                    }
+                    val inFile = File(appCtx.cacheDir, TEST_PCM_FILENAME)
+                    if (!inFile.exists() || inFile.length() == 0L) {
+                        onComplete("Record a 10s Voice Test sample first.")
+                        return@Thread
+                    }
+
                     val minBuf = AudioTrack.getMinBufferSize(
                         SAMPLE_RATE,
                         AudioFormat.CHANNEL_OUT_MONO,
@@ -2323,20 +2388,36 @@ class SolDualAudioEngine(private val context: Context) {
                         .setTransferMode(AudioTrack.MODE_STREAM)
                         .build()
 
+                    activeCalibrationTrack = track
+                    if (calibrationPlaybackCancelRequested) {
+                        onComplete("Playback stopped.")
+                        return@Thread
+                    }
+
                     track.play()
                     val buf = ByteArray(4096)
                     FileInputStream(inFile).use { fis ->
-                        while (true) {
+                        while (!calibrationPlaybackCancelRequested) {
                             if (SolStreamService.isBroadcastLive || CodecCapabilityProbe.isBroadcastStartingOrLive) break
                             val r = fis.read(buf)
                             if (r <= 0) break
-                            track.write(buf, 0, r)
+                            val written = track.write(buf, 0, r)
+                            if (written < 0) break
                         }
                     }
-                    onComplete("Playback complete! Tap 'Apply Advisor' if you want the recommended gain.")
+                    if (calibrationPlaybackCancelRequested) {
+                        onComplete("Playback stopped (app moved to background).")
+                    } else {
+                        onComplete("Playback complete! Tap 'Apply Advisor' if you want the recommended gain.")
+                    }
                 } catch (e: Exception) {
-                    onComplete("Playback error: ${e.javaClass.simpleName}")
+                    if (calibrationPlaybackCancelRequested) {
+                        onComplete("Playback stopped.")
+                    } else {
+                        onComplete("Playback error: ${e.javaClass.simpleName}")
+                    }
                 } finally {
+                    activeCalibrationTrack = null
                     isCalibrationPlaying.set(false)
                     try { track?.stop(); track?.release() } catch (_: Exception) {}
                 }
