@@ -1,9 +1,9 @@
 /*
- * ॐ नमः शिवाय (Om Namah Shivaya)
- * SolStream Studio — Ultra-Lightweight Mobile Gaming Broadcast Engine
- * Copyright (c) 2026 Sol (@Sol_CODM / github.com/PppP01). All rights reserved.
- * SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
- * Commercial redistribution, rebranding, or app-store monetization prohibited without written license.
+- ॐ नमः शिवाय (Om Namah Shivaya)
+- SolStream Studio — Ultra-Lightweight Mobile Gaming Broadcast Engine
+- Copyright (c) 2026 Sol (@Sol_CODM / github.com/PppP01). All rights reserved.
+- SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+- Commercial redistribution, rebranding, or app-store monetization prohibited without written license.
  */
 
 package com.solgaming.solstreamstudio
@@ -173,9 +173,9 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
     }
 
     /**
-     * Per-session primary RTMP callback wrapper holding a direct reference to the exact
-     * RtmpClient instance it was created for (clientRef), so a delayed callback from a stopped
-     * or replaced client can only disconnect its own old socket and never the active client.
+- Per-session primary RTMP callback wrapper holding a direct reference to the exact
+- RtmpClient instance it was created for (clientRef), so a delayed callback from a stopped
+- or replaced client can only disconnect its own old socket and never the active client.
      */
     private class PrimaryRtmpCallback(
         private val sessionGen: Long,
@@ -263,6 +263,7 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
         override fun onCycleShortsMinimapLoupe() = cycleShortsMinimapLoupeLive()
         override fun onCycleShortsScoreLoupe() = cycleShortsScoreLoupeLive()
         override fun onToggleShortsHeaderLayout() = toggleShortsHeaderLayoutLive()
+        override fun onToggleLoupesPaused() = toggleLoupesPausedLive()
         override fun onStepLiveBitrate(dir: Int) = stepLiveBitrate(dir)
         override fun onToggleAbr() = toggleAbrLive()
         override fun onToggleThermal30FpsSaver() = toggleThermal30FpsSaverLive()
@@ -324,8 +325,8 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
     }
 
     /**
-     * Mandatory Android 15 / 16 / 17 (API 35+) Foreground Service timeout handler:
-     * Saves the Session Report and stops the service cleanly so Google Play Vitals never flags an ANR.
+- Mandatory Android 15 / 16 / 17 (API 35+) Foreground Service timeout handler:
+- Saves the Session Report and stops the service cleanly so Google Play Vitals never flags an ANR.
      */
     override fun onTimeout(startId: Int, fgsType: Int) {
         DiagnosticsLogger.log(
@@ -347,11 +348,13 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
             } catch (_: Exception) {
             }
         }
+        notifyDashboardStateChanged()
     }
 
     override fun onDestroy() {
         unregisterThermalStatusListenerIfSupported()
         stopLiveBroadcast("Service destroyed")
+        mainHandler.removeCallbacksAndMessages(null)
         try { rttProbeExecutor.shutdownNow() } catch (_: Exception) {}
         try { checkpointExecutor.shutdownNow() } catch (_: Exception) {}
         if (instance === this) instance = null
@@ -434,6 +437,7 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
         } catch (e: Exception) {
             DiagnosticsLogger.log("BENCH_ERR", "Benchmark foreground service blocked (${e.javaClass.simpleName}).")
             Toast.makeText(this, "Could not start Benchmark service (${e.javaClass.simpleName}).", Toast.LENGTH_LONG).show()
+            notifyDashboardStateChanged()
             return
         }
 
@@ -491,10 +495,10 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
     }
 
     /**
-     * Builds a fresh, clean RtmpClient instance configured with TLS Hostname Verification,
-     * active RTMP Ping RTT tracking, setCheckServerAlive(false) (disabling Pedro's ICMP probe),
-     * Network-Adaptive RTMP write chunk sizing (65535 Wi-Fi / 4096 Cellular & Custom),
-     * negotiated video resolution/FPS/codec, and cached SPS/PPS/VPS headers.
+- Builds a fresh, clean RtmpClient instance configured with TLS Hostname Verification,
+- active RTMP Ping RTT tracking, setCheckServerAlive(false) (disabling Pedro's ICMP probe),
+- Network-Adaptive RTMP write chunk sizing (65535 Wi-Fi / 4096 Cellular & Custom),
+- negotiated video resolution/FPS/codec, and cached SPS/PPS/VPS headers.
      */
     private fun buildConfiguredPrimaryRtmpClient(sessionGen: Long, targetUrl: String): RtmpClient {
         val cb = PrimaryRtmpCallback(sessionGen, this)
@@ -527,7 +531,10 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
 
     private fun startLiveBroadcast(resultCode: Int, resultData: Intent) {
         if (broadcastActive || !broadcastStarting.compareAndSet(false, true)) return
-        if (benchmarkOnlyActive) stopLiveBroadcast("Switching to Live Broadcast")
+        if (benchmarkOnlyActive) {
+            stopLiveBroadcast("Switching to Live Broadcast")
+            broadcastStarting.set(true)
+        }
 
         CodecCapabilityProbe.isBroadcastStartingOrLive = true
 
@@ -548,6 +555,7 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
             CodecCapabilityProbe.isBroadcastStartingOrLive = false
             DiagnosticsLogger.log("FGS_ERR", "Foreground service promotion failed (${e.javaClass.simpleName}).")
             Toast.makeText(this, "Screen capture token expired. Please tap Go Live again.", Toast.LENGTH_LONG).show()
+            notifyDashboardStateChanged()
             return
         }
 
@@ -590,8 +598,13 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
     }
 
     private fun continueStartLiveBroadcast(resultCode: Int, resultData: Intent) {
-        if (broadcastActive) {
+        if (broadcastActive || !broadcastStarting.get()) {
             broadcastStarting.set(false)
+            if (!broadcastActive && !benchmarkOnlyActive) {
+                CodecCapabilityProbe.isBroadcastStartingOrLive = false
+                try { stopForeground(STOP_FOREGROUND_REMOVE) } catch (_: Exception) {}
+                notifyDashboardStateChanged()
+            }
             return
         }
 
@@ -635,6 +648,7 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
             broadcastStarting.set(false)
             CodecCapabilityProbe.isBroadcastStartingOrLive = false
             stopForeground(STOP_FOREGROUND_REMOVE)
+            notifyDashboardStateChanged()
             Toast.makeText(this, "Save your YouTube/RTMPS Stream Key in the Vault first.", Toast.LENGTH_LONG).show()
             return
         }
@@ -659,6 +673,7 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
             CodecCapabilityProbe.isBroadcastStartingOrLive = false
             DiagnosticsLogger.log("PROJ_ERR", "MediaProjection returned null.")
             stopForeground(STOP_FOREGROUND_REMOVE)
+            notifyDashboardStateChanged()
             return
         }
         mediaProjection = projection
@@ -730,7 +745,16 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
         ) {
             splitEncodeSimulcastActive = true
         }
+
+        // Start DiagnosticsLogger session BEFORE pipeline init so [GL_INIT], [VIDEO_FMT], [GAME_AUDIO] & [AUDIO_ENC] stay logged
         DiagnosticsLogger.activeSimulcastDesc = targetNames.joinToString(" + ")
+        DiagnosticsLogger.startNewSession(
+            context = this,
+            modeTitle = "Live Broadcast",
+            pipelineDesc = "Initializing ${activeSettings.codec} ${activeSettings.width}x${activeSettings.height}@${activeSettings.fps}fps...",
+            saveInitialCheckpoint = false
+        )
+        DiagnosticsLogger.activeOverlaysDesc = buildActiveOverlaysSummary(activeSettings)
 
         val sessionAuxList = auxTargets.toList()
         val sessionCompTarget = companionTarget
@@ -876,6 +900,7 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
         if (videoInfo == null) {
             broadcastStarting.set(false)
             CodecCapabilityProbe.isBroadcastStartingOrLive = false
+            DiagnosticsLogger.activePipelineDesc = "Start Aborted (Video Encoder Rejected)"
             Toast.makeText(
                 this,
                 "Hardware video encoder rejected settings. Try 1080p60 or H.264.",
@@ -883,6 +908,7 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
             ).show()
             cleanupResources()
             stopForeground(STOP_FOREGROUND_REMOVE)
+            notifyDashboardStateChanged()
             return
         }
 
@@ -960,10 +986,12 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
         if (!audioOk) {
             broadcastStarting.set(false)
             CodecCapabilityProbe.isBroadcastStartingOrLive = false
+            DiagnosticsLogger.activePipelineDesc = "Start Aborted (Microphone Init Failed)"
             Toast.makeText(this, "Microphone initialization failed. Check Mic permission.", Toast.LENGTH_LONG).show()
             vPipeline.stopPipeline()
             cleanupResources()
             stopForeground(STOP_FOREGROUND_REMOVE)
+            notifyDashboardStateChanged()
             return
         }
 
@@ -995,8 +1023,8 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
 
         DiagnosticsLogger.activeAudioDspDesc =
             "${aEngine.micDsp.voiceGenderProfile}/${aEngine.micDsp.voicePreset} • ${aEngine.micDsp.activeDenoiserSummary} • ${activeSettings.audioBitrateKbps}k AAC"
-        DiagnosticsLogger.startNewSession(this, "Live Broadcast", pipeSummary)
         DiagnosticsLogger.activeOverlaysDesc = buildActiveOverlaysSummary(activeSettings)
+        DiagnosticsLogger.updateActivePipelineAndCheckpoint(this, pipeSummary)
         val initHealth = refreshCachedHardwareSnapshot()
         vPipeline.liveHudTempC = initHealth.batteryTempC
 
@@ -1051,9 +1079,9 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
     }
 
     /**
-     * Fast Network Handover Watcher (Wi-Fi <-> Cellular):
-     * Detects when Android switches default internet routes and triggers a fast 300 ms
-     * RTMP reconnect over the new network (re-evaluating adaptive chunk size).
+- Fast Network Handover Watcher (Wi-Fi <-> Cellular):
+- Detects when Android switches default internet routes and triggers a fast 300 ms
+- RTMP reconnect over the new network (re-evaluating adaptive chunk size).
      */
     private fun registerFastNetworkHandoverWatcher(sessionGen: Long) {
         unregisterFastNetworkHandoverWatcher()
@@ -1759,7 +1787,8 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
             appRamMb = appRamMb,
             totalRamGb = cachedTotalRamGb,
             availRamGb = cachedAvailRamGb,
-            activeAuxCount = activeAuxCount
+            activeAuxCount = activeAuxCount,
+            loupesPaused = vPipe?.liveShortsLoupesPaused == true
         )
     }
 
@@ -2097,6 +2126,9 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
         val order = KeystoreVault.SHORTS_MINIMAP_LOUPE_ORDER
         val curIdx = order.indexOf(activeSettings.shortsMinimapLoupe.uppercase(Locale.US))
         val next = order[(curIdx + 1) % order.size]
+        if (!next.equals("OFF", ignoreCase = true)) {
+            videoPipeline?.setLoupesPaused(false)
+        }
         saveAndPushSettings(activeSettings.copy(shortsMinimapLoupe = next))
     }
 
@@ -2104,11 +2136,35 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
         val order = KeystoreVault.SHORTS_SCORE_LOUPE_ORDER
         val curIdx = order.indexOf(activeSettings.shortsScoreLoupe.uppercase(Locale.US))
         val next = order[(curIdx + 1) % order.size]
+        if (!next.equals("OFF", ignoreCase = true)) {
+            videoPipeline?.setLoupesPaused(false)
+        }
         saveAndPushSettings(activeSettings.copy(shortsScoreLoupe = next))
     }
 
     private fun toggleShortsHeaderLayoutLive() =
         saveAndPushSettings(activeSettings.copy(shortsHeaderLayout = !activeSettings.shortsHeaderLayout))
+
+    private fun toggleLoupesPausedLive() {
+        val vPipe = videoPipeline ?: return
+        val hasAnyLoupe = !activeSettings.shortsScoreLoupe.equals("OFF", ignoreCase = true) ||
+            (!activeSettings.shortsMinimapLoupe.equals("OFF", ignoreCase = true) &&
+                !SolVideoPipeline.isMinimapLoupeSuppressedByShield(
+                    activeSettings.shortsMinimapLoupe,
+                    activeSettings.minimapShieldEnabled,
+                    activeSettings.minimapShieldCorner
+                ))
+        if (!hasAnyLoupe) {
+            Toast.makeText(
+                this,
+                "Turn on FeedL or MapL first to use 1-tap Lobby Loupe Pause.",
+                Toast.LENGTH_SHORT
+            ).show()
+            return
+        }
+        vPipe.setLoupesPaused(!vPipe.liveShortsLoupesPaused)
+        pillController?.refreshExpandedControls()
+    }
 
     private fun stepLiveBitrate(dir: Int) {
         val destMaxKbps = KeystoreVault.maxVideoBitrateKbpsForDestination(activeSettings)
@@ -2559,9 +2615,9 @@ class SolStreamService : AccessibilityService(), ConnectChecker {
             SolReportArchiveStore.clearReports(context)
 
         /**
-         * Network-Adaptive RTMP Write Chunk Size:
-         * - 65,535 bytes (64 KB) on Wi-Fi/Ethernet for major broadcast ingests (YouTube, Twitch, Kick)
-         * - 4,096 bytes (4 KB) on Mobile Data/Cellular AND unknown custom RTMP relays
+- Network-Adaptive RTMP Write Chunk Size:
+- 65,535 bytes (64 KB) on Wi-Fi/Ethernet for major broadcast ingests (YouTube, Twitch, Kick)
+- 4,096 bytes (4 KB) on Mobile Data/Cellular AND unknown custom RTMP relays
          */
         internal fun resolveAdaptiveRtmpChunkSize(
             isWifiOrEthernet: Boolean,
