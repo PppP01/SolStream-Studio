@@ -1,9 +1,9 @@
 /*
- * ॐ नमः शिवाय (Om Namah Shivaya)
- * SolStream Studio — Ultra-Lightweight Mobile Gaming Broadcast Engine
- * Copyright (c) 2026 Sol (@Sol_CODM / github.com/PppP01). All rights reserved.
- * SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
- * Commercial redistribution, rebranding, or app-store monetization prohibited without written license.
+- ॐ नमः शिवाय (Om Namah Shivaya)
+- SolStream Studio — Ultra-Lightweight Mobile Gaming Broadcast Engine
+- Copyright (c) 2026 Sol (@Sol_CODM / github.com/PppP01). All rights reserved.
+- SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+- Commercial redistribution, rebranding, or app-store monetization prohibited without written license.
  */
 
 package com.solgaming.solstreamstudio
@@ -1022,11 +1022,11 @@ class SolStreamUnitTests {
         assertEquals("SOL LUXE 3.0 (Pure Condenser)", MicDspProcessor.presetDisplayName("SOL_LUXE"))
     }
 
-    // === PHASE 1 (v1.5.0 / v1.5.1 / v1.5.2 / v1.6.0) UNIT TESTS ===
+    // === PHASE 1 (v1.5.0 / v1.5.1 / v1.5.2 / v1.6.0 / v1.6.1) UNIT TESTS ===
 
     @Test
     fun diagnosticsReportFreeze_stopsResamplingAfterSessionFinalized() {
-        assertEquals("v1.6.0", DiagnosticsLogger.ENGINE_VERSION)
+        assertEquals("v1.6.1", DiagnosticsLogger.ENGINE_VERSION)
         try {
             DiagnosticsLogger.resetSessionLifecycleForTests()
             // Before any session starts -> allowed to sample idle hardware health
@@ -2238,5 +2238,264 @@ class SolStreamUnitTests {
         assertFalse(shieldedSummary.contains("MapLoupe"))
         assertTrue(shieldedSummary.contains("ScoreLoupe (TL+Feed)"))
         assertTrue(shieldedSummary.contains("MapBlur (TOP_RIGHT)"))
+    }
+
+    // === v1.6.1 SHORTS SAFE-STACK, TIGHT CROPS, EMA SMOOTHER & CAPTURE COOLER GATE UNIT TESTS ===
+
+    @Test
+    fun shortsTopLayout_guaranteesZeroOverlapAcrossModesAB1B2CAndAboveChat() {
+        val topSafe = SolHudAndQrRenderer.SHORTS_TOP_SAFE_NDC
+        assertEquals(0.700f, topSafe, 1e-4f)
+
+        // Mode A: Loupes ON, ShortsHeader OFF (CENTER 0% -> gameTopNdc = 0.350f)
+        val modeA = SolHudAndQrRenderer.computeShortsTopLayout(
+            dstW = 1080,
+            dstH = 1920,
+            gameTopNdc = 0.350f,
+            hasScoreLoupe = true,
+            hasMinimapLoupe = true,
+            loupesPaused = false,
+            shortsHeaderLayout = false,
+            hudEnabled = false,
+            qrEnabled = false,
+            pngTuberEnabled = false
+        )
+        assertTrue(modeA.hasLoupeBand)
+        assertNull(modeA.hudRect)
+        assertNull(modeA.pngTuberRect)
+        assertNull(modeA.qrRect)
+        assertTrue("Mode A Loupes must stay below YT 15% header", modeA.loupeTopNdc <= topSafe + 1e-4f)
+        assertTrue("Mode A Loupes must stay above gameplay", modeA.loupeBottomNdc > 0.350f)
+        assertEquals(-0.96f, modeA.scoreSlotLeftNdc, 1e-4f)
+        assertEquals(0.14f, modeA.scoreSlotRightNdc, 1e-4f)
+        assertEquals(0.20f, modeA.minimapSlotLeftNdc, 1e-4f)
+        assertEquals(0.96f, modeA.minimapSlotRightNdc, 1e-4f)
+        assertTrue("Score (55%) and Minimap (38%) slots must keep horizontal gap", modeA.scoreSlotRightNdc < modeA.minimapSlotLeftNdc)
+
+        // Mode B1: Loupes ON + SolHUD + PNGTuber (No QR)
+        val modeB1 = SolHudAndQrRenderer.computeShortsTopLayout(
+            dstW = 1080,
+            dstH = 1920,
+            gameTopNdc = 0.350f,
+            hasScoreLoupe = true,
+            hasMinimapLoupe = true,
+            loupesPaused = false,
+            shortsHeaderLayout = true,
+            hudEnabled = true,
+            qrEnabled = false,
+            pngTuberEnabled = true,
+            pngTuberBounceNdc = 0.014f
+        )
+        assertTrue(modeB1.hasLoupeBand)
+        assertNotNull(modeB1.hudRect)
+        assertNotNull(modeB1.pngTuberRect)
+        assertNull(modeB1.qrRect)
+        assertFalse("SolHUD and PNGTuber must never overlap in Mode B1", modeB1.hudRect!!.overlaps(modeB1.pngTuberRect!!))
+        assertTrue(modeB1.hudRect!!.top <= topSafe + 1e-4f)
+        assertTrue(modeB1.pngTuberRect!!.top <= topSafe + 1e-4f)
+        assertTrue("Row 1 SolHUD must sit strictly above Row 2 Loupes", modeB1.hudRect!!.bottom > modeB1.loupeTopNdc)
+        assertTrue("Row 1 PNGTuber must sit strictly above Row 2 Loupes", modeB1.pngTuberRect!!.bottom > modeB1.loupeTopNdc)
+
+        // Mode B2: Loupes ON + SolHUD + PNGTuber + Corner QR
+        val modeB2 = SolHudAndQrRenderer.computeShortsTopLayout(
+            dstW = 1080,
+            dstH = 1920,
+            gameTopNdc = 0.350f,
+            hasScoreLoupe = true,
+            hasMinimapLoupe = true,
+            loupesPaused = false,
+            shortsHeaderLayout = true,
+            hudEnabled = true,
+            qrEnabled = true,
+            pngTuberEnabled = true,
+            pngTuberBounceNdc = 0.014f
+        )
+        assertTrue(modeB2.hasLoupeBand)
+        val hudB2 = modeB2.hudRect!!
+        val avB2 = modeB2.pngTuberRect!!
+        val qrB2 = modeB2.qrRect!!
+        assertFalse(hudB2.overlaps(avB2))
+        assertFalse(hudB2.overlaps(qrB2))
+        assertFalse(avB2.overlaps(qrB2))
+        assertTrue(hudB2.top <= topSafe + 1e-4f && avB2.top <= topSafe + 1e-4f && qrB2.top <= topSafe + 1e-4f)
+        assertTrue(hudB2.bottom > modeB2.loupeTopNdc && avB2.bottom > modeB2.loupeTopNdc && qrB2.bottom > modeB2.loupeTopNdc)
+
+        // Mode C: Loupes PAUSED (Lobby) + ShortsHeader ON
+        val modeC = SolHudAndQrRenderer.computeShortsTopLayout(
+            dstW = 1080,
+            dstH = 1920,
+            gameTopNdc = 0.350f,
+            hasScoreLoupe = true,
+            hasMinimapLoupe = true,
+            loupesPaused = true,
+            shortsHeaderLayout = true,
+            hudEnabled = true,
+            qrEnabled = true,
+            pngTuberEnabled = true
+        )
+        assertFalse(modeC.hasLoupeBand)
+        assertFalse(modeC.hudRect!!.overlaps(modeC.pngTuberRect!!))
+        assertFalse(modeC.pngTuberRect!!.overlaps(modeC.qrRect!!))
+        assertTrue(modeC.qrRect!!.top <= topSafe + 1e-4f)
+
+        // ABOVE_CHAT (+10% Up -> gameTopNdc = 0.460f) Dynamic Clamp keeps Row 1 & Row 2 non-overlapping
+        val aboveChat = SolHudAndQrRenderer.computeShortsTopLayout(
+            dstW = 1080,
+            dstH = 1920,
+            gameTopNdc = 0.460f,
+            hasScoreLoupe = true,
+            hasMinimapLoupe = true,
+            loupesPaused = false,
+            shortsHeaderLayout = true,
+            hudEnabled = true,
+            qrEnabled = true,
+            pngTuberEnabled = true,
+            pngTuberBounceNdc = 0.014f
+        )
+        assertTrue(aboveChat.hasLoupeBand)
+        assertFalse(aboveChat.hudRect!!.overlaps(aboveChat.pngTuberRect!!))
+        assertFalse(aboveChat.pngTuberRect!!.overlaps(aboveChat.qrRect!!))
+        assertTrue(aboveChat.qrRect!!.top <= topSafe + 1e-4f)
+        assertTrue(aboveChat.qrRect!!.bottom > aboveChat.loupeTopNdc)
+        assertTrue(aboveChat.loupeBottomNdc > 0.460f)
+
+        // Verify computeRectQuadMvp maps NdcRect back to exact quad edges
+        val mvp = FloatArray(16)
+        SolHudAndQrRenderer.computeRectQuadMvp(mvp, qrB2)
+        assertEquals(qrB2.left, mvp[12] - mvp[0], 1e-4f)
+        assertEquals(qrB2.right, mvp[12] + mvp[0], 1e-4f)
+        assertEquals(qrB2.bottom, mvp[13] - mvp[5], 1e-4f)
+        assertEquals(qrB2.top, mvp[13] + mvp[5], 1e-4f)
+    }
+
+    @Test
+    fun shortsLoupeCrops_v161TightBoundsClearStrayHudIconsAndUnclipRightEdge() {
+        val mapTr = SolVideoPipeline.resolveShortsLoupeSourceCrop("TOP_RIGHT", isMinimap = true)!!
+        assertEquals(0.835f, mapTr.x0, 1e-4f)
+        assertEquals(0.015f, mapTr.yTop, 1e-4f)
+        assertEquals(1.00f, mapTr.x1, 1e-4f)
+        assertEquals(0.265f, mapTr.yBot, 1e-4f)
+
+        val mapTl = SolVideoPipeline.resolveShortsLoupeSourceCrop("TOP_LEFT", isMinimap = true)!!
+        assertEquals(0.00f, mapTl.x0, 1e-4f)
+        assertEquals(0.015f, mapTl.yTop, 1e-4f)
+        assertEquals(0.165f, mapTl.x1, 1e-4f)
+        assertEquals(0.265f, mapTl.yBot, 1e-4f)
+
+        val scoreFeed = SolVideoPipeline.resolveShortsLoupeSourceCrop("TOP_LEFT_FEED", isMinimap = false)!!
+        assertEquals(0.00f, scoreFeed.x0, 1e-4f)
+        assertEquals(0.00f, scoreFeed.yTop, 1e-4f)
+        assertEquals(0.28f, scoreFeed.x1, 1e-4f)
+        assertEquals(0.27f, scoreFeed.yBot, 1e-4f)
+    }
+
+    @Test
+    fun shortsCaptureCooler_bypassesCapAbove1080pVertical() {
+        // <= 1080p vertical uses the 1600px Capture Cooler
+        assertEquals(
+            1600 to 738,
+            SolVideoPipeline.scaleCaptureForShortsCooler(
+                rawW = 2340,
+                rawH = 1080,
+                framingMode = "SMART",
+                smartZoomPercent = 150,
+                coolerEnabled = true,
+                outShortSidePx = 1080
+            )
+        )
+        // 1440p vertical (outShortSidePx = 1440) bypasses cap cleanly so high-res vertical never downscales
+        assertEquals(
+            2340 to 1080,
+            SolVideoPipeline.scaleCaptureForShortsCooler(
+                rawW = 2340,
+                rawH = 1080,
+                framingMode = "SMART",
+                smartZoomPercent = 150,
+                coolerEnabled = true,
+                outShortSidePx = 1440
+            )
+        )
+        // 4K vertical (outShortSidePx = 2160) also bypasses cap cleanly
+        assertEquals(
+            3200 to 1440,
+            SolVideoPipeline.scaleCaptureForShortsCooler(
+                rawW = 3200,
+                rawH = 1440,
+                framingMode = "FIT",
+                smartZoomPercent = 100,
+                coolerEnabled = true,
+                outShortSidePx = 2160
+            )
+        )
+    }
+
+    @Test
+    fun solHudBitrateSmoother_preventsAbruptZeroPointOneMbpsStaticFrameFlashes() {
+        // Cold start locks immediately to first valid reading
+        assertEquals(14.0f, SolHudAndQrRenderer.smoothHudBitrateMbps(0f, 14.0f), 1e-4f)
+
+        // Single static loading frame dipping to 0.1M is smoothly averaged (~9.1M) instead of flashing 0.1M
+        val afterDip = SolHudAndQrRenderer.smoothHudBitrateMbps(14.0f, 0.1f)
+        assertEquals(9.135f, afterDip, 0.01f)
+        assertTrue(afterDip > 8.5f)
+
+        // Recovers smoothly on next active frame
+        val afterRecovery = SolHudAndQrRenderer.smoothHudBitrateMbps(afterDip, 14.0f)
+        assertTrue(afterRecovery > 10.5f)
+
+        // NaN / negative inputs preserve previous smoothed value safely
+        assertEquals(12.5f, SolHudAndQrRenderer.smoothHudBitrateMbps(12.5f, Float.NaN), 1e-4f)
+        assertEquals(12.5f, SolHudAndQrRenderer.smoothHudBitrateMbps(12.5f, -3.0f), 1e-4f)
+    }
+
+    @Test
+    fun shortsLoupesPauseToggle_hidesLoupesWithoutMutatingSavedCropModes() {
+        val savedSettings = StreamSettings(
+            isVertical = true,
+            shortsScoreLoupe = "TOP_LEFT_FEED",
+            shortsMinimapLoupe = "TOP_RIGHT"
+        )
+        val activeLayout = SolHudAndQrRenderer.computeShortsTopLayout(
+            dstW = 1080,
+            dstH = 1920,
+            gameTopNdc = 0.350f,
+            hasScoreLoupe = savedSettings.shortsScoreLoupe != "OFF",
+            hasMinimapLoupe = savedSettings.shortsMinimapLoupe != "OFF",
+            loupesPaused = false,
+            shortsHeaderLayout = false,
+            hudEnabled = false,
+            qrEnabled = false,
+            pngTuberEnabled = false
+        )
+        val pausedLayout = SolHudAndQrRenderer.computeShortsTopLayout(
+            dstW = 1080,
+            dstH = 1920,
+            gameTopNdc = 0.350f,
+            hasScoreLoupe = savedSettings.shortsScoreLoupe != "OFF",
+            hasMinimapLoupe = savedSettings.shortsMinimapLoupe != "OFF",
+            loupesPaused = true,
+            shortsHeaderLayout = false,
+            hudEnabled = false,
+            qrEnabled = false,
+            pngTuberEnabled = false
+        )
+        assertTrue(activeLayout.hasLoupeBand)
+        assertFalse(pausedLayout.hasLoupeBand)
+        assertEquals("TOP_LEFT_FEED", savedSettings.shortsScoreLoupe)
+        assertEquals("TOP_RIGHT", savedSettings.shortsMinimapLoupe)
+
+        // Verify NdcRect.overlaps boundary accuracy
+        val a = SolHudAndQrRenderer.NdcRect(-0.5f, 0.0f, 0.0f, 0.5f)
+        val bTouching = SolHudAndQrRenderer.NdcRect(0.0f, 0.0f, 0.5f, 0.5f)
+        val cOverlapping = SolHudAndQrRenderer.NdcRect(-0.1f, 0.1f, 0.4f, 0.4f)
+        assertFalse(a.overlaps(bTouching))
+        assertTrue(a.overlaps(cOverlapping))
+    }
+
+    @Test
+    fun remoteVersionComparator_recognizesV161OverV160() {
+        assertTrue(DashboardDialogs.isRemoteVersionNewer("v1.6.1", "1.6.0"))
+        assertFalse(DashboardDialogs.isRemoteVersionNewer("v1.6.1", "1.6.1"))
+        assertFalse(DashboardDialogs.isRemoteVersionNewer("v1.6.0", "1.6.1"))
     }
 }
