@@ -1,9 +1,9 @@
 /*
- * ॐ नमः शिवाय (Om Namah Shivaya)
- * SolStream Studio — Ultra-Lightweight Mobile Gaming Broadcast Engine
- * Copyright (c) 2026 Sol (@Sol_CODM / github.com/PppP01). All rights reserved.
- * SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
- * Commercial redistribution, rebranding, or app-store monetization prohibited without written license.
+- ॐ नमः शिवाय (Om Namah Shivaya)
+- SolStream Studio — Ultra-Lightweight Mobile Gaming Broadcast Engine
+- Copyright (c) 2026 Sol (@Sol_CODM / github.com/PppP01). All rights reserved.
+- SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+- Commercial redistribution, rebranding, or app-store monetization prohibited without written license.
  */
 
 package com.solgaming.solstreamstudio
@@ -27,8 +27,8 @@ import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.min
 
 /**
- * Reflection bridge for Pedro RootEncoder 2.8.1 RtmpClient security, adaptive chunking,
- * ping RTT, and send-queue telemetry.
+- Reflection bridge for Pedro RootEncoder 2.8.x RtmpClient security, adaptive chunking,
+- ping RTT, and send-queue telemetry.
  */
 internal object SolRtmpTelemetryBridge {
     private var resolved = false
@@ -108,8 +108,8 @@ internal object SolRtmpTelemetryBridge {
     }
 
     /**
-     * Enables TLS Hostname Verification, active RTMP Ping RTT measurement, and
-     * Network-Adaptive RTMP Write Chunk Sizing (65535 Wi-Fi / 4096 Cellular & Custom) before connect().
+- Enables TLS Hostname Verification, active RTMP Ping RTT measurement, and
+- Network-Adaptive RTMP Write Chunk Sizing (65535 Wi-Fi / 4096 Cellular & Custom) before connect().
      */
     fun configureClientSecurityPingsAndChunkSize(client: RtmpClient, writeChunkSize: Int) {
         ensureResolved(client)
@@ -191,12 +191,12 @@ internal object SolRtmpTelemetryBridge {
 }
 
 /**
- * Bounded leased-slot pooled Simulcast & Companion RTMP sender:
- * - Exclusively leased PacketSlots (24 video + 32 audio) returned on completion or discard
- * - Per-client callback identity guard, atomic SPS/PPS/VPS header triple & pre-swap connected = false reset
- * - Guarantees SPS/PPS/VPS headers are applied on sendExecutor BEFORE connected flips true
- * - Auto-reconnects cleanly on both onConnectionFailed, onDisconnect, and sync connect errors (unless auth rejected)
- * - Interrupts stalled handshakes & drains queued slots immediately on stop()
+- Bounded leased-slot pooled Simulcast & Companion RTMP sender:
+- - Exclusively leased PacketSlots (24 video + 32 audio) returned on completion or discard
+- - Per-client callback identity guard, atomic SPS/PPS/VPS header triple & pre-swap connected = false reset
+- - Guarantees SPS/PPS/VPS headers are applied on sendExecutor BEFORE connected flips true
+- - Auto-reconnects cleanly on both onConnectionFailed, onDisconnect, and sync connect errors (unless auth rejected)
+- - Interrupts stalled handshakes & drains queued slots immediately on stop()
  */
 internal class SolAuxRtmpTarget(
     val name: String,
@@ -543,8 +543,10 @@ internal class SolAuxRtmpTarget(
                     }
                 }
             }
-            connected = true
-            postOnMain { onStateChanged() }
+            if (!stopped && sourceClient === client && isSessionStillValid(sessionGen, stopped)) {
+                connected = true
+                postOnMain { onStateChanged() }
+            }
         }
     }
 
@@ -578,7 +580,7 @@ internal class SolAuxRtmpTarget(
 }
 
 /**
- * Local 9-slot Session Report Archive store (uses applicationContext and defensive JSON parsing).
+- Local 9-slot Session Report Archive store (uses applicationContext and self-healing JSON parsing).
  */
 internal object SolReportArchiveStore {
     private const val PREFS_NAME = "solstream_overlay_ui_prefs"
@@ -587,7 +589,12 @@ internal object SolReportArchiveStore {
     fun saveReport(context: Context, header: String, body: String) {
         try {
             val prefs = (context.applicationContext ?: context).getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-            val arr = JSONArray(prefs.getString(KEY_ARCHIVE_JSON, "[]") ?: "[]")
+            val arr = try {
+                val raw = prefs.getString(KEY_ARCHIVE_JSON, null)
+                if (raw.isNullOrBlank()) JSONArray() else JSONArray(raw)
+            } catch (_: Exception) {
+                JSONArray()
+            }
             val entry = JSONObject().apply {
                 put("header", header)
                 put("body", body)
@@ -605,7 +612,9 @@ internal object SolReportArchiveStore {
     fun loadReports(context: Context): List<Pair<String, String>> {
         return try {
             val prefs = (context.applicationContext ?: context).getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-            val arr = JSONArray(prefs.getString(KEY_ARCHIVE_JSON, "[]") ?: "[]")
+            val raw = prefs.getString(KEY_ARCHIVE_JSON, null)
+            if (raw.isNullOrBlank()) return emptyList()
+            val arr = JSONArray(raw)
             val out = mutableListOf<Pair<String, String>>()
             for (i in 0 until arr.length()) {
                 val obj = arr.optJSONObject(i) ?: continue
