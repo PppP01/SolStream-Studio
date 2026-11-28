@@ -1,9 +1,9 @@
 /*
- * ॐ नमः शिवाय (Om Namah Shivaya)
- * SolStream Studio — Ultra-Lightweight Mobile Gaming Broadcast Engine
- * Copyright (c) 2026 Sol (@Sol_CODM / github.com/PppP01). All rights reserved.
- * SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
- * Commercial redistribution, rebranding, or app-store monetization prohibited without written license.
+- ॐ नमः शिवाय (Om Namah Shivaya)
+- SolStream Studio — Ultra-Lightweight Mobile Gaming Broadcast Engine
+- Copyright (c) 2026 Sol (@Sol_CODM / github.com/PppP01). All rights reserved.
+- SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+- Commercial redistribution, rebranding, or app-store monetization prohibited without written license.
  */
 
 package com.solgaming.solstreamstudio.ui
@@ -37,6 +37,7 @@ import com.solgaming.solstreamstudio.KeystoreVault
 import com.solgaming.solstreamstudio.SolStreamService
 import com.solgaming.solstreamstudio.SolVideoPipeline
 import com.solgaming.solstreamstudio.StreamSettings
+import com.solgaming.solstreamstudio.recorder.SolHudAndQrRenderer
 import org.json.JSONObject
 import java.net.InetAddress
 import java.net.InetSocketAddress
@@ -53,9 +54,9 @@ import kotlin.math.min
 import kotlin.math.roundToInt
 
 /**
- * Modular dashboard dialogs, visual user guide cards, YouTube Shorts 9:16 Safe-Zone Previewer,
- * Accessibility prominent disclosure, Session Reports / Saved Clips viewers,
- * 5-Metric Network Analyzer, and GitHub Update Checker.
+- Modular dashboard dialogs, visual user guide cards, YouTube Shorts 9:16 Safe-Zone Previewer,
+- Accessibility prominent disclosure, Session Reports / Saved Clips viewers,
+- 5-Metric Network Analyzer, and GitHub Update Checker.
  */
 object DashboardDialogs {
 
@@ -100,10 +101,10 @@ object DashboardDialogs {
     }
 
     /**
-     * In-App 9:16 YouTube Shorts Safe-Zone Visual Previewer (v1.6.0 SolShorts™ Studio).
-     * Mirrors SolVideoPipeline.kt's exact NDC math so users can inspect gameplay height,
-     * ABOVE_CHAT shift, Tactical Minimap & Score+Killfeed Loupes, and Shorts UI dead zones
-     * before tapping GO LIVE.
+- In-App 9:16 YouTube Shorts Safe-Zone Visual Previewer (v1.6.1 SolShorts™ Studio).
+- Mirrors SolHudAndQrRenderer.computeShortsTopLayout() and SolVideoPipeline.kt's exact NDC math
+- so users can inspect gameplay height, ABOVE_CHAT shift, 55%/38% Tactical Loupes,
+- Shorts Pro Header safe-stacking below YT's 15% top bar, and Shorts UI dead zones before going live.
      */
     fun showShortsSafeZonePreviewDialog(
         activity: Activity,
@@ -163,8 +164,10 @@ object DashboardDialogs {
         } else {
             "Capture Cooler: OFF (Full ${panelLong}×${panelShort} panel capture)"
         }
-        val loupeLine = "Loupes: Score=${settings.shortsScoreLoupe} • Minimap=" +
+        val loupeLine = "Loupes: Score(55%)=${settings.shortsScoreLoupe} • Minimap(38%)=" +
             if (mapSuppressed) "${settings.shortsMinimapLoupe} (Paused by Blur Shield)" else settings.shortsMinimapLoupe
+        val headerLine = "Shorts Pro Header: " +
+            if (settings.shortsHeaderLayout) "ON (Auto-stacked below 15% YT Top Bar)" else "OFF (Standard Corners)"
 
         val infoTv = TextView(activity).apply {
             text = buildString {
@@ -172,6 +175,7 @@ object DashboardDialogs {
                 if (framing == "SMART") append(" ($zoomPct% • ~${String.format(Locale.US, "%.0f%%", sideCropPct)} side crop)")
                 append(" • Anchor: ${settings.shortsVerticalAnchor}\n")
                 append("$loupeLine\n")
+                append("$headerLine\n")
                 append("$coolerLine\n")
                 append("Red zones = YouTube Shorts LIVE header (15%), Live Chat (35%) & Right Like/Share buttons (18%).")
             }
@@ -237,6 +241,11 @@ object DashboardDialogs {
             style = Paint.Style.FILL
             color = Color.parseColor("#4C1D95")
         }
+        private val overlayChipStrokePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.STROKE
+            color = Color.parseColor("#A78BFA")
+            strokeWidth = 1f * density
+        }
         private val labelPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             color = Color.parseColor("#F8FAFC")
             textAlign = Paint.Align.CENTER
@@ -256,6 +265,7 @@ object DashboardDialogs {
             textSize = 8.5f * density
         }
         private val tmpRect = RectF()
+        private val tmpMvp = FloatArray(16)
 
         override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
             val screenH = context.resources.displayMetrics.heightPixels
@@ -316,84 +326,123 @@ object DashboardDialogs {
             val mainText = if (framing == "SMART") "GAMEPLAY ($framing $zoomPct%)" else "GAMEPLAY ($framing)"
             canvas.drawText(mainText, w * 0.5f, gameCenterY + (3.5f * density), labelPaint)
 
-            // 3. Tactical HUD Loupes above gameplay (exact SolVideoPipeline math)
-            if (framing != "FILL") {
-                val scoreCrop = SolVideoPipeline.resolveShortsLoupeSourceCrop(settings.shortsScoreLoupe, isMinimap = false)
-                val mapSuppressed = SolVideoPipeline.isMinimapLoupeSuppressedByShield(
-                    settings.shortsMinimapLoupe,
-                    settings.minimapShieldEnabled,
-                    settings.minimapShieldCorner
-                )
-                val mapCrop = if (mapSuppressed) {
-                    null
-                } else {
-                    SolVideoPipeline.resolveShortsLoupeSourceCrop(settings.shortsMinimapLoupe, isMinimap = true)
-                }
-                val gameTopClamped = topNdc.coerceIn(-0.60f, 0.92f)
-                val slotBottomNdc = gameTopClamped + 0.018f
-                val slotTopNdc = min(0.86f, slotBottomNdc + 0.34f)
-                if (slotTopNdc - slotBottomNdc >= 0.08f) {
-                    if (scoreCrop != null) {
-                        val cropAspect = ((scoreCrop.x1 - scoreCrop.x0) * srcAspect) /
-                            max(0.05f, scoreCrop.yBot - scoreCrop.yTop)
-                        SolVideoPipeline.computeShortsLoupeDestNdc(
-                            slotLeftNdc = -0.94f,
-                            slotRightNdc = -0.02f,
-                            slotBottomNdc = slotBottomNdc,
-                            slotTopNdc = slotTopNdc,
-                            cropAspect = cropAspect,
-                            dstAspect = dstAspect,
-                            alignRight = false
-                        )?.let { dest ->
-                            tmpRect.set(ndcX(dest.left, w), ndcY(dest.top, h), ndcX(dest.right, w), ndcY(dest.bottom, h))
-                            canvas.drawRect(tmpRect, loupeFillPaint)
-                            canvas.drawRect(tmpRect, loupeStrokePaint)
-                            val lbl = if (settings.shortsScoreLoupe == "TOP_LEFT_FEED") "SCORE+FEED" else "SCORE"
-                            canvas.drawText(lbl, tmpRect.centerX(), tmpRect.centerY() + (3f * density), smallLabelPaint)
-                        }
+            // 3. Shared v1.6.1 Shorts Top-Area Safe Stack (Row 1 Pro Overlays + Row 2 55%/38% Loupes)
+            val scoreCrop = if (framing != "FILL") {
+                SolVideoPipeline.resolveShortsLoupeSourceCrop(settings.shortsScoreLoupe, isMinimap = false)
+            } else {
+                null
+            }
+            val mapSuppressed = SolVideoPipeline.isMinimapLoupeSuppressedByShield(
+                settings.shortsMinimapLoupe,
+                settings.minimapShieldEnabled,
+                settings.minimapShieldCorner
+            )
+            val mapCrop = if (framing != "FILL" && !mapSuppressed) {
+                SolVideoPipeline.resolveShortsLoupeSourceCrop(settings.shortsMinimapLoupe, isMinimap = true)
+            } else {
+                null
+            }
+            val hasQr = settings.qrOverlayEnabled && settings.qrOverlayText.isNotBlank()
+
+            val topLayout = SolHudAndQrRenderer.computeShortsTopLayout(
+                dstW = 1080,
+                dstH = 1920,
+                gameTopNdc = topNdc,
+                hasScoreLoupe = scoreCrop != null,
+                hasMinimapLoupe = mapCrop != null,
+                loupesPaused = false,
+                shortsHeaderLayout = settings.shortsHeaderLayout,
+                hudEnabled = settings.hudTelemetryEnabled,
+                qrEnabled = hasQr,
+                pngTuberEnabled = settings.pngTuberEnabled
+            )
+
+            // Draw Row 2 Tactical HUD Loupes
+            if (topLayout.hasLoupeBand) {
+                if (scoreCrop != null) {
+                    val cropAspect = ((scoreCrop.x1 - scoreCrop.x0) * srcAspect) /
+                        max(0.05f, scoreCrop.yBot - scoreCrop.yTop)
+                    SolVideoPipeline.computeShortsLoupeDestNdc(
+                        slotLeftNdc = topLayout.scoreSlotLeftNdc,
+                        slotRightNdc = topLayout.scoreSlotRightNdc,
+                        slotBottomNdc = topLayout.loupeBottomNdc,
+                        slotTopNdc = topLayout.loupeTopNdc,
+                        cropAspect = cropAspect,
+                        dstAspect = dstAspect,
+                        alignRight = false
+                    )?.let { dest ->
+                        tmpRect.set(ndcX(dest.left, w), ndcY(dest.top, h), ndcX(dest.right, w), ndcY(dest.bottom, h))
+                        canvas.drawRect(tmpRect, loupeFillPaint)
+                        canvas.drawRect(tmpRect, loupeStrokePaint)
+                        val lbl = if (settings.shortsScoreLoupe == "TOP_LEFT_FEED") "SCORE+FEED" else "SCORE"
+                        canvas.drawText(lbl, tmpRect.centerX(), tmpRect.centerY() + (3f * density), smallLabelPaint)
                     }
-                    if (mapCrop != null) {
-                        val cropAspect = ((mapCrop.x1 - mapCrop.x0) * srcAspect) /
-                            max(0.05f, mapCrop.yBot - mapCrop.yTop)
-                        SolVideoPipeline.computeShortsLoupeDestNdc(
-                            slotLeftNdc = 0.02f,
-                            slotRightNdc = 0.94f,
-                            slotBottomNdc = slotBottomNdc,
-                            slotTopNdc = slotTopNdc,
-                            cropAspect = cropAspect,
-                            dstAspect = dstAspect,
-                            alignRight = true
-                        )?.let { dest ->
-                            tmpRect.set(ndcX(dest.left, w), ndcY(dest.top, h), ndcX(dest.right, w), ndcY(dest.bottom, h))
-                            canvas.drawRect(tmpRect, loupeFillPaint)
-                            canvas.drawRect(tmpRect, loupeStrokePaint)
-                            canvas.drawText("MINIMAP", tmpRect.centerX(), tmpRect.centerY() + (3f * density), smallLabelPaint)
-                        }
+                }
+                if (mapCrop != null) {
+                    val cropAspect = ((mapCrop.x1 - mapCrop.x0) * srcAspect) /
+                        max(0.05f, mapCrop.yBot - mapCrop.yTop)
+                    SolVideoPipeline.computeShortsLoupeDestNdc(
+                        slotLeftNdc = topLayout.minimapSlotLeftNdc,
+                        slotRightNdc = topLayout.minimapSlotRightNdc,
+                        slotBottomNdc = topLayout.loupeBottomNdc,
+                        slotTopNdc = topLayout.loupeTopNdc,
+                        cropAspect = cropAspect,
+                        dstAspect = dstAspect,
+                        alignRight = true
+                    )?.let { dest ->
+                        tmpRect.set(ndcX(dest.left, w), ndcY(dest.top, h), ndcX(dest.right, w), ndcY(dest.bottom, h))
+                        canvas.drawRect(tmpRect, loupeFillPaint)
+                        canvas.drawRect(tmpRect, loupeStrokePaint)
+                        canvas.drawText("MINIMAP", tmpRect.centerX(), tmpRect.centerY() + (3f * density), smallLabelPaint)
                     }
                 }
             }
 
-            // 4. Active Pro Overlays indicator badges (SolHUD / QR / PNGTuber)
-            val useHeader = settings.shortsHeaderLayout
-            if (settings.hudTelemetryEnabled) {
-                val c = if (useHeader) "TOP_LEFT" else settings.hudTelemetryCorner
-                drawCornerPreviewBadge(canvas, w, h, c, "HUD", if (useHeader) 0.08f else 0.02f, 0.34f, 0.045f)
-            }
-            if (settings.qrOverlayEnabled && settings.qrOverlayText.isNotBlank()) {
-                val c = if (useHeader && settings.qrOverlayCorner.startsWith("BOTTOM_")) "TOP_RIGHT" else settings.qrOverlayCorner
-                drawCornerPreviewBadge(canvas, w, h, c, "QR", if (useHeader) 0.08f else 0.02f, 0.19f, 0.105f)
-            }
-            if (settings.pngTuberEnabled) {
-                val c = if (useHeader) {
-                    when (settings.pngTuberCorner) {
-                        "BOTTOM_RIGHT" -> "TOP_RIGHT"
-                        "BOTTOM_LEFT" -> "TOP_LEFT"
-                        else -> settings.pngTuberCorner
-                    }
-                } else {
-                    settings.pngTuberCorner
+            // 4. Active Pro Overlays (Exact Safe-Stack Rects when Shorts Pro Header ON; exact corners when OFF)
+            if (settings.shortsHeaderLayout) {
+                topLayout.hudRect?.let { drawNdcOverlayBadge(canvas, w, h, it, "HUD") }
+                topLayout.pngTuberRect?.let { drawNdcOverlayBadge(canvas, w, h, it, "AVATAR") }
+                topLayout.qrRect?.let { drawNdcOverlayBadge(canvas, w, h, it, "QR") }
+            } else {
+                if (settings.hudTelemetryEnabled) {
+                    SolHudAndQrRenderer.computeCornerQuadMvp(
+                        tmpMvp,
+                        SolHudAndQrRenderer.HUD_WIDTH_PX,
+                        SolHudAndQrRenderer.HUD_HEIGHT_PX,
+                        1080,
+                        1920,
+                        settings.hudTelemetryCorner,
+                        0.052f,
+                        0.46f
+                    )
+                    drawNdcOverlayBadge(canvas, w, h, mvpToNdcRect(tmpMvp), "HUD")
                 }
-                drawCornerPreviewBadge(canvas, w, h, c, "AVATAR", if (useHeader) 0.13f else 0.03f, 0.24f, 0.12f)
+                if (settings.pngTuberEnabled) {
+                    SolHudAndQrRenderer.computeCornerQuadMvp(
+                        tmpMvp,
+                        512,
+                        512,
+                        1080,
+                        1920,
+                        settings.pngTuberCorner,
+                        0.135f,
+                        0.26f
+                    )
+                    drawNdcOverlayBadge(canvas, w, h, mvpToNdcRect(tmpMvp), "AVATAR")
+                }
+                if (hasQr) {
+                    SolHudAndQrRenderer.computeCornerQuadMvp(
+                        tmpMvp,
+                        SolHudAndQrRenderer.QR_SIZE_PX,
+                        SolHudAndQrRenderer.QR_SIZE_PX,
+                        1080,
+                        1920,
+                        settings.qrOverlayCorner,
+                        0.115f,
+                        0.22f
+                    )
+                    drawNdcOverlayBadge(canvas, w, h, mvpToNdcRect(tmpMvp), "QR")
+                }
             }
 
             // 5. YouTube Shorts UI Dead Zones (Top 15%, Bottom 35%, Right 18% action buttons)
@@ -417,23 +466,29 @@ object DashboardDialogs {
             canvas.drawRect(tmpRect, frameStrokePaint)
         }
 
-        private fun drawCornerPreviewBadge(
+        private fun mvpToNdcRect(mvp: FloatArray): SolHudAndQrRenderer.NdcRect {
+            val sx = mvp[0]
+            val sy = mvp[5]
+            val tx = mvp[12]
+            val ty = mvp[13]
+            return SolHudAndQrRenderer.NdcRect(
+                left = tx - sx,
+                bottom = ty - sy,
+                right = tx + sx,
+                top = ty + sy
+            )
+        }
+
+        private fun drawNdcOverlayBadge(
             canvas: Canvas,
             w: Float,
             h: Float,
-            corner: String,
-            text: String,
-            topExtraFrac: Float,
-            wFrac: Float,
-            hFrac: Float
+            rect: SolHudAndQrRenderer.NdcRect,
+            text: String
         ) {
-            val bw = w * wFrac
-            val bh = h * hFrac
-            val margin = w * 0.03f
-            val left = if (corner.endsWith("RIGHT")) (w - bw - margin) else margin
-            val top = if (corner.startsWith("BOTTOM_")) (h - bh - h * 0.03f) else (h * topExtraFrac)
-            tmpRect.set(left, top, left + bw, top + bh)
+            tmpRect.set(ndcX(rect.left, w), ndcY(rect.top, h), ndcX(rect.right, w), ndcY(rect.bottom, h))
             canvas.drawRoundRect(tmpRect, 4f * density, 4f * density, overlayChipPaint)
+            canvas.drawRoundRect(tmpRect, 4f * density, 4f * density, overlayChipStrokePaint)
             canvas.drawText(text, tmpRect.centerX(), tmpRect.centerY() + (2.8f * density), smallLabelPaint)
         }
     }
@@ -523,9 +578,9 @@ object DashboardDialogs {
                 context = activity,
                 badgeText = "CARD 4 • SOLSHORTS™ STUDIO, PRO OVERLAYS & PILL",
                 titleText = "9:16 Tactical Loupes, Safe-Zone Anchor, SolHUD™ & Thumbnails",
-                bodyContent = "• SolShorts™ Studio (Opt-In, Zero Locks/Caps): Keep 135–150% zoomed gameplay big while optionally docking zero-copy Minimap & Score+Killfeed Loupes in the open space above gameplay, shift gameplay ABOVE CHAT (+10%), use the ~50%-lighter Shorts Capture Cooler, and verify your framing with the 👁️ 9:16 Safe-Zone Previewer in Card 3.\n" +
+                bodyContent = "• SolShorts™ Studio (Opt-In, Zero Locks/Caps): Keep 135–150% zoomed gameplay big while docking zero-copy Score+Killfeed (55%) & tight-cropped Minimap (38%) Loupes strictly below YouTube's 15% top bar. Use the 1-tap Loupes: ON/OFF button in the Floating Pill to hide both Loupes in lobbies without losing your chosen crops.\n" +
                     "• Floating Pill: Double-tap or hold the compact pill to open 3 tabs (Audio, Video, Bitrate/Net) with separate App CPU % and Android Thermal Pressure % telemetry. Tap 📸 Shot in Video tab to save a clean pill-free 1080p YouTube thumbnail to Pictures/SolStream/.\n" +
-                    "• Pro Overlays (Opt-In, 0 MB VRAM When OFF): Turn on SolHUD™ (live FPS • °C • Mbps visible even in Single-App Capture), offline Corner QR (UPI / YouTube / Discord), or zero-camera 2-PNG PNGTuber Avatar.\n" +
+                    "• Pro Overlays (Opt-In, 0 MB VRAM When OFF): Turn on SolHUD™ (smoothed live FPS • °C • Mbps visible even in Single-App Capture), offline Corner QR (UPI / YouTube / Discord), or zero-camera 2-PNG PNGTuber Avatar — Shorts Pro Header auto-stacks all three cleanly with zero overlap.\n" +
                     "• Safe Notification Shade: Exactly 3 quick actions (Mute Mic, Scene/BRB, ★ Clip) — Stop is safely locked inside the app & Floating Pill with 2-tap confirm.",
                 accentHex = "#38BDF8"
             )
@@ -1040,18 +1095,42 @@ object DashboardDialogs {
             Toast.makeText(activity, "Already checking GitHub releases...", Toast.LENGTH_SHORT).show()
             return
         }
-        Toast.makeText(activity, "Checking PppP01/SolStream-Studio releases...", Toast.LENGTH_SHORT).show()
+        Toast.makeText(activity, "Checking SolStream Studio releases...", Toast.LENGTH_SHORT).show()
         Thread({
-            var conn: HttpsURLConnection? = null
             try {
-                conn = (URL("https://api.github.com/repos/PppP01/SolStream-Studio/releases/latest")
-                    .openConnection() as HttpsURLConnection).apply {
-                    connectTimeout = 5000
-                    readTimeout = 5000
-                    setRequestProperty("Accept", "application/vnd.github+json")
-                    setRequestProperty("User-Agent", "SolStream-Studio/$appVersionName")
+                // Queries public releases mirror first (stays working after main code repo goes private),
+                // with automatic fallback to the original repo.
+                val candidateRepos = listOf(
+                    "PppP01/SolStream-Studio-Releases",
+                    "PppP01/SolStream-Studio"
+                )
+                var responseBody: String? = null
+                var matchedRepo: String = candidateRepos.first()
+
+                for (repo in candidateRepos) {
+                    var conn: HttpsURLConnection? = null
+                    try {
+                        conn = (URL("https://api.github.com/repos/$repo/releases/latest")
+                            .openConnection() as HttpsURLConnection).apply {
+                            connectTimeout = 5000
+                            readTimeout = 5000
+                            setRequestProperty("Accept", "application/vnd.github+json")
+                            setRequestProperty("User-Agent", "SolStream-Studio/$appVersionName")
+                        }
+                        if (conn.responseCode == 200) {
+                            responseBody = conn.inputStream.bufferedReader().use { it.readText() }
+                            matchedRepo = repo
+                            break
+                        }
+                    } catch (_: Exception) {
+                        // Try next candidate repo
+                    } finally {
+                        try { conn?.disconnect() } catch (_: Exception) {}
+                    }
                 }
-                if (conn.responseCode != 200) {
+
+                val body = responseBody
+                if (body.isNullOrBlank()) {
                     activity.runOnUiThread {
                         if (!activity.isFinishing && !activity.isDestroyed) {
                             Toast.makeText(
@@ -1063,10 +1142,10 @@ object DashboardDialogs {
                     }
                     return@Thread
                 }
-                val body = conn.inputStream.bufferedReader().use { it.readText() }
+
                 val json = JSONObject(body)
                 val latestTag = json.optString("tag_name", "").removePrefix("v")
-                val fallbackUrl = "https://github.com/PppP01/SolStream-Studio/releases"
+                val fallbackUrl = "https://github.com/$matchedRepo/releases"
                 var downloadUrl = json.optString("html_url", fallbackUrl)
                 val assets = json.optJSONArray("assets")
                 if (assets != null && assets.length() > 0) {
@@ -1093,7 +1172,7 @@ object DashboardDialogs {
                     if (latestTag.isNotBlank() && isRemoteVersionNewer(latestTag, appVersionName)) {
                         AlertDialog.Builder(activity)
                             .setTitle("Update Available: v$latestTag")
-                            .setMessage("You are on v$appVersionName. Download signed update from your GitHub Releases?")
+                            .setMessage("You are on v$appVersionName. Download signed update from official SolStream Releases?")
                             .setPositiveButton("Download APK") { _, _ ->
                                 try {
                                     activity.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(finalUrl)))
@@ -1115,7 +1194,6 @@ object DashboardDialogs {
                 }
             } finally {
                 updateCheckBusy.set(false)
-                try { conn?.disconnect() } catch (_: Exception) {}
             }
         }, "SolUpdateCheck").start()
     }
